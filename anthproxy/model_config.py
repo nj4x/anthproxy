@@ -104,6 +104,7 @@ _DEFAULTS: dict = {
             "opus[1m]": "gpt-5.6-sol",
             "sonnet": "gpt-5.6-terra",
             "haiku": "gpt-5.6-luna",
+            "claude-opus-5": "gpt-5.6-sol",
             "claude-opus-4-8": "gpt-5.6-sol",
             "claude-sonnet-4-6": "gpt-5.6-terra",
             "claude-haiku-4-5-20251001": "gpt-5.6-luna",
@@ -122,8 +123,10 @@ _DEFAULTS: dict = {
         },
         "openrouter": {
             "haiku": "deepseek/deepseek-v4-flash",
+            "claude-haiku-4-5-20251001": "deepseek/deepseek-v4-flash",
             "sonnet": "z-ai/glm-5.2",
             "opus": "moonshotai/kimi-k3",
+            "claude-opus-5": "moonshotai/kimi-k3",
             "default": "z-ai/glm-5.2",
         },
     },
