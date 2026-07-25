@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.egg
+.venv
+.wiki
+graphify-out
+.DS_Store
+.scratch
+.pytest_cache
+.idea
+.claude
+.data
+.ruff_cache
