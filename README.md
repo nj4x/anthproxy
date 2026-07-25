@@ -186,6 +186,8 @@ python -m anthproxy --enable-ui --port 8082
 # Then open http://127.0.0.1:8082/ui/ in your browser
 ```
 
+![anthproxy admin dashboard](docs/images/admin-dashboard.png)
+
 ## Development
 
 Install dev dependencies:
