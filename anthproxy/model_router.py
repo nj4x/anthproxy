@@ -1158,11 +1158,17 @@ def route_model(
     raw_model = payload.get('model')
 
     if not config.auto_model_routing:
+        # When routing is disabled, still apply baseline_model lock if set
+        routed = baseline_model if baseline_model else raw_model
+        routed_str = str(routed) if isinstance(routed, str) else repr(routed)
+        requested_str = str(raw_model) if isinstance(raw_model, str) else repr(raw_model)
+        if routed_str != requested_str:
+            payload['model'] = routed_str
         return ModelRoutingDecision(
-            requested_model=str(raw_model) if isinstance(raw_model, str) else repr(raw_model),
-            routed_model=str(raw_model) if isinstance(raw_model, str) else repr(raw_model),
+            requested_model=requested_str,
+            routed_model=routed_str,
             classification=None,
-            applied=False,
+            applied=(routed_str != requested_str),
             reason_code='disabled',
         )
 

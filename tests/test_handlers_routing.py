@@ -1433,8 +1433,8 @@ class TestSessionTierCache:
         # The reason_code='session_cached_tier_capped' indicates the cap fired.
         backend.send_classifier_message.assert_not_called()
 
-    def test_lock_requested_model_no_effect_when_routing_disabled(self, caplog):
-        """When auto_model_routing=False, lock_requested_model has no effect."""
+    def test_lock_requested_model_applied_even_when_routing_disabled(self, caplog):
+        """When auto_model_routing=False, lock_requested_model still applies."""
         import copy
         handler, registry, backend = self._make_handler(
             auto_routing=False)  # routing off
@@ -1447,9 +1447,10 @@ class TestSessionTierCache:
         with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
             handler._handle_messages()
 
-        # Routing is off, so model stays as client sent it
-        assert payload['model'] == 'haiku'
+        # Lock applies even when routing is disabled
+        assert payload['model'] == 'claude-sonnet-4-6'
         assert 'reason=disabled' in caplog.text
+        assert 'applied=True' in caplog.text
         backend.send_classifier_message.assert_not_called()
 
     # --- session-context floor (record + consume) ------------------------------
