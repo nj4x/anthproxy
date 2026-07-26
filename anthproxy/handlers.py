@@ -8,8 +8,8 @@ import uuid
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler
 
+from .backends_registry import backend_names as _backend_names
 from .constants import (
-    BACKEND_NAMES,
     HAPPY_BIRTHDAY_REPLY,
     HAPPY_NEW_YEAR_PREFIX,
     SESSION_SUBSCRIPTION_SENTINEL,
@@ -45,8 +45,9 @@ _STATS_PREFIX = 'proxy-stats'
 # command, and that suffix must not defeat command recognition. The inner group
 # is non-greedy so it stops at the first </session>.
 _SESSION_WRAP_RE = re.compile(r'\s*<session>(.*?)</session>', re.DOTALL)
-# Valid backend-filter tokens for proxy-stats: all backend names + 'subscription'
-_STATS_BACKEND_FILTERS = frozenset(BACKEND_NAMES) | {'subscription'}
+def _stats_backend_filters() -> frozenset:
+    """Return valid backend-filter tokens for proxy-stats: all registered names + sentinel."""
+    return frozenset(_backend_names()) | {SESSION_SUBSCRIPTION_SENTINEL}
 _BACKEND_HEADER = '## anthproxy backend\n\n'
 
 # SSE data line pattern for stats extraction
@@ -121,7 +122,7 @@ def _final_user_text(payload: dict) -> str | None:
 def _parse_stats_selector(raw: str) -> tuple[str, str | None]:
     """Split the suffix after 'proxy-stats:' into (period_token, backend_or_None).
 
-    The backend token (a member of _STATS_BACKEND_FILTERS) may appear in any
+    The backend token (a registered backend name or the subscription sentinel) may appear in any
     position among the colon-separated parts.  The first matching part becomes
     the backend filter; the remaining parts form the period token.  If no part
     matches, backend is None and the whole raw string is the period token.
@@ -136,7 +137,7 @@ def _parse_stats_selector(raw: str) -> tuple[str, str | None]:
     backend: str | None = None
     leftover: list[str] = []
     for part in (raw.split(':') if raw else []):
-        if backend is None and part in _STATS_BACKEND_FILTERS:
+        if backend is None and part in _stats_backend_filters():
             backend = part
         else:
             leftover.append(part)
@@ -185,7 +186,7 @@ def _parse_local_command(payload: dict) -> tuple[str, object | None] | None:
             arg = 'auto'
         elif target == 'subscription':
             arg = 'subscription'
-        elif target in BACKEND_NAMES:
+        elif target in _backend_names():
             arg = target
         else:
             arg = None
@@ -254,7 +255,7 @@ def _parse_override_header(raw: str | None) -> dict:
 
     Unknown directives and malformed values are silently ignored (fail-open).
     Multiple ``prefer:`` or ``route:`` directives: last one wins.  Backend
-    names not in ``BACKEND_NAMES`` are logged and ignored.  Unknown route
+    names not in the registry are logged and ignored.  Unknown route
     modes are silently ignored.  Task names preserve original case.
     """
     if not raw or not isinstance(raw, str):
@@ -275,7 +276,7 @@ def _parse_override_header(raw: str | None) -> dict:
             result['no_classifier'] = True
         elif directive.startswith('prefer:'):
             name = directive[len('prefer:'):].strip()
-            if name in BACKEND_NAMES:
+            if name in _backend_names():
                 result['prefer_backend'] = name
             else:
                 logger.warning(
@@ -1712,7 +1713,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, _local_message(HAPPY_BIRTHDAY_REPLY, model))
 
     def _help_markdown(self) -> str:
-        available = ', '.join(f'`{n}`' for n in BACKEND_NAMES)
+        available = ', '.join(f'`{n}`' for n in _backend_names())
         subscription = '/'.join(SUBSCRIPTION_BACKENDS)
         auto_row = ''
         subscription_row = ''
@@ -1913,7 +1914,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return '## anthproxy stats\n\nStats information is temporarily unavailable.'
 
     def _set_backend_markdown(self, arg: str | None) -> str:
-        available = ', '.join(f'`{n}`' for n in BACKEND_NAMES)
+        available = ', '.join(f'`{n}`' for n in _backend_names())
 
         # proxy-set-backend:auto → resume auto-selection
         if arg == 'auto':
@@ -1984,7 +1985,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _session_set_backend_markdown(self, arg: str | None, sess_key: str | None) -> str:
-        available = ', '.join(f'`{n}`' for n in BACKEND_NAMES)
+        available = ', '.join(f'`{n}`' for n in _backend_names())
 
         if sess_key is None:
             return (

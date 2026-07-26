@@ -1,31 +1,21 @@
-"""Single source of truth for backend names and related constants.
+"""Inert constants shared across anthproxy modules.
 
-Imported by config.py, server.py, handlers.py, and selector.py so the list
-is never declared more than once.
+Backend names are no longer declared here; use ``backend_names()`` from
+``backends_registry`` for the runtime list.  This module is an import-time leaf
+— it may not import from ``backends_registry``.
 """
 
-from .backends_registry import list_backends
-
-
-def _get_backend_names() -> tuple[str, ...]:
-    """Return all registered backend names, or defaults if registry is empty."""
-    names = list_backends()
-    return names if names else ("bedrock", "codex", "anthropic", "local", "openrouter")
-
-
-BACKEND_NAMES: tuple[str, ...] = (
-    "bedrock",
-    "codex",
-    "anthropic",
-    "local",
-    "openrouter",
-)
 SUBSCRIPTION_BACKENDS: tuple[str, ...] = ("anthropic", "codex", "openrouter")
 
 # Sentinel stored in BackendRegistry._session_overrides to represent a
-# per-session subscription lock.  Not a member of BACKEND_NAMES so it can
-# never collide with a real backend override.
+# per-session subscription lock.  Not a real backend name; backends_registry
+# RESERVED_NAMES ensures nothing may register under this key.
 SESSION_SUBSCRIPTION_SENTINEL = "subscription"
+
+# Valid non-backend modes accepted by --backend and the admin API.
+# Moved here from admin.py so backends_registry can derive RESERVED_NAMES
+# without importing admin.
+VALID_BACKEND_MODES: tuple[str, ...] = ('auto', 'subscription')
 
 HAPPY_NEW_YEAR_PREFIX = 'You are a security monitor for autonomous AI coding agents.'
 HAPPY_BIRTHDAY_REPLY = '<block>no</block>'

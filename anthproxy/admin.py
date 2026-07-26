@@ -17,13 +17,13 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
-from .constants import BACKEND_NAMES
+from .backends_registry import backend_names as _backend_names
+from .constants import VALID_BACKEND_MODES
 from .model_tier import model_tier_rank
 
 logger = logging.getLogger(__name__)
 
 VALID_TIERS = ('haiku', 'sonnet', 'opus', 'fable')
-VALID_BACKEND_MODES = ('auto', 'subscription')
 TIME_RANGE_MAP = {'1d': '-1 days', '7d': '-7 days', '30d': '-30 days'}
 
 
@@ -402,7 +402,12 @@ def _build_backends_list(status: dict) -> list:
 def _get_backends(registry) -> tuple[int, dict]:
     status = registry.backend_status()
     active = next((name for name, b in status.items() if b.get('active')), '')
-    return 200, {'backends': _build_backends_list(status), 'active': active}
+    return 200, {
+        'backends': _build_backends_list(status),
+        'active': active,
+        'known': list(registry.list_backends()),
+        'modes': list(VALID_BACKEND_MODES),
+    }
 
 
 def _get_config(registry) -> tuple[int, dict]:
@@ -602,7 +607,7 @@ def _post_global_backend(body: dict, registry, db, *, selector=None) -> tuple[in
     prefer = body.get('prefer')
     if prefer is None:
         return _err(400, 'BAD_REQUEST', '"prefer" is required')
-    valid = tuple(VALID_BACKEND_MODES) + tuple(BACKEND_NAMES)
+    valid = tuple(VALID_BACKEND_MODES) + tuple(_backend_names())
     if prefer not in valid:
         return _err(
             400, 'INVALID_BACKEND_MODE',

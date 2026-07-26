@@ -3,7 +3,7 @@ import sys
 
 from . import model_config
 from .config import parse_args
-from .server import BackendRegistry, _load_public_backends, build_backend, create_server
+from .server import BackendRegistry, build_backend, create_server, discover_backends
 
 
 class _ShortNameFormatter(logging.Formatter):
@@ -31,7 +31,7 @@ logger = logging.getLogger('anthproxy')
 
 
 def main():
-    _load_public_backends()
+    discover_backends()
 
     config = parse_args()
 

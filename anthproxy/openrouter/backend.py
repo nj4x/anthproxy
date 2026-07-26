@@ -226,6 +226,12 @@ class OpenRouterBackend(SubscriptionBackend, Backend):
     def __init__(self):
         super().__init__()
 
+    @classmethod
+    def summary_credentials(cls, snapshot) -> dict | None:
+        if getattr(snapshot.config, 'openrouter_api_key', None):
+            return snapshot.backend.parse_credentials('')
+        return None
+
     def _fetch_usage_data(self, config: Config) -> dict:
         return _fetch_credits(self._get_api_key(config))
 

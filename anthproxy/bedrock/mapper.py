@@ -20,30 +20,9 @@ from ..mapper import (
 logger = logging.getLogger(__name__)
 
 
-# Model alias mapping: Anthropic API model names -> AWS Bedrock model IDs.
-#
-# This map was built by cross-referencing two sources in the Cline codebase
-# (~/projects/cline/src/shared/api.ts):
-#
-#   1. `anthropicModels` / `claudeCodeModels` — the model IDs that Cline sends
-#      in the Anthropic-format request body (e.g. "claude-opus-4-6", "sonnet").
-#   2. `bedrockModels` — the corresponding AWS Bedrock model IDs
-#      (e.g. "anthropic.claude-opus-4-6-v1").
-#
-# To update when new models are added:
-#   a) Open ~/projects/cline/src/shared/api.ts
-#   b) Find new keys in `anthropicModels` or `claudeCodeModels`
-#   c) Find the matching Bedrock ID in `bedrockModels`
-#   d) Add the mapping below:  '<anthropic_alias>': '<bedrock_model_id>'
-#   e) If the Bedrock model requires a cross-region inference profile,
-#      also add it to INFERENCE_PROFILE_REQUIRED_MODELS below.
-#
-# Model alias tables are now driven by ~/.anthproxy/config.json (or built-in defaults
-# in anthproxy/model_config.py).  The names are kept for backward compatibility with
-# any code/tests that import them directly.
-MODEL_ALIASES = _model_config.model_aliases('bedrock')
+# Model aliases are driven by model_config.model_aliases('bedrock') and the user's
+# ~/.anthproxy/config.json.  Update that file to add or override mappings.
 INFERENCE_PROFILE_REQUIRED_MODELS = _model_config.inference_profile_models()
-
 
 _DATE_SUFFIX_RE = re.compile(r'-\d{8}$')
 _CONTEXT_SUFFIX_RE = re.compile(r'(:\d+m|\[\d+m\])$', re.IGNORECASE)
@@ -81,8 +60,9 @@ def normalize_model_id(model):
     if not isinstance(model, str) or not model:
         raise AnthropicRequestError('model is required')
 
-    if model in MODEL_ALIASES:
-        return MODEL_ALIASES[model]
+    model_aliases = _model_config.model_aliases('bedrock')
+    if model in model_aliases:
+        return model_aliases[model]
 
     bedrock_prefixes = ('anthropic.', 'amazon.', 'openai.', 'qwen.', 'deepseek.', 'meta.', 'arn:')
     inference_profile_prefixes = ('us.', 'eu.', 'apac.', 'jp.', 'global.')
@@ -93,7 +73,7 @@ def normalize_model_id(model):
         bedrock_id = _guess_bedrock_model_id(model)
         logger.warning(
             'Unknown Claude model alias %r — guessing Bedrock ID %r. '
-            'Add to MODEL_ALIASES if incorrect.',
+            'Update model_aliases in ~/.anthproxy/config.json if incorrect.',
             model, bedrock_id,
         )
         return bedrock_id

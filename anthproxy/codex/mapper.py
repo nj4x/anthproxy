@@ -21,13 +21,11 @@ from ..mapper import (
     sse_event,
 )
 
-CODEX_MODEL_ALIASES: dict[str, str] = _model_config.model_aliases('codex')
-
 logger = logging.getLogger(__name__)
 
 
 def _resolve_model(model: str) -> str:
-    return _resolve_alias(model, CODEX_MODEL_ALIASES, prefix_match=True)
+    return _resolve_alias(model, _model_config.model_aliases('codex'), prefix_match=True)
 
 
 def _encode_reasoning_signature(item_id: str, encrypted_content: str) -> str:

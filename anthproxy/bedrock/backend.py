@@ -136,6 +136,10 @@ def _map_client_error(exc):
 
 
 class BedrockBackend(Backend):
+    @classmethod
+    def from_config(cls, config):
+        return cls(config)
+
     def __init__(self, config: Config | None = None):
         self._home = _bedrock_home(config)
         self._lock = threading.Lock()

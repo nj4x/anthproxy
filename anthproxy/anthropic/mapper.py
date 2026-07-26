@@ -11,11 +11,8 @@ REQUIRED_BETAS = ('claude-code-20250219', 'oauth-2025-04-20')
 _CLAUDE_CLI_VERSION = '2.1.88'
 _CC_SYSTEM_PREFIX = 'You are Claude Code, Anthropic\'s official CLI for Claude.'
 MAX_CACHE_CONTROL_BLOCKS = 4
-ANTHROPIC_MODEL_ALIASES: dict[str, str] = _model_config.model_aliases('anthropic')
-
-
 def _resolve_model(model: str) -> str:
-    return _resolve_alias(model, ANTHROPIC_MODEL_ALIASES)
+    return _resolve_alias(model, _model_config.model_aliases('anthropic'))
 
 
 def _supports_effort(model_id: str) -> bool:

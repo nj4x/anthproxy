@@ -253,6 +253,10 @@ class AnthropicBackend(SubscriptionBackend, Backend):
         self._lock = threading.Lock()
         super().__init__()
 
+    @classmethod
+    def summary_credentials(cls, snapshot) -> dict:
+        return snapshot.backend.parse_credentials('')
+
     def _fetch_usage_data(self, config) -> dict:
         return _fetch_usage(config, self._lock)
 

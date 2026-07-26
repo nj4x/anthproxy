@@ -128,6 +128,10 @@ class LocalBackend(Backend):
     or the ``--backend local`` CLI flag.
     """
 
+    @classmethod
+    def summary_credentials(cls, snapshot) -> dict:
+        return {}
+
     def parse_credentials(self, api_key: str) -> dict:
         """LM Studio does not require authentication — ignore the api key."""
         return {}

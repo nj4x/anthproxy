@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from .constants import BACKEND_NAMES
+from .backends_registry import backend_names as _backend_names
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -130,7 +130,7 @@ def parse_args(argv=None) -> Config:
                    action='store_true', default=False,
                    help='Use global. prefix instead of region-based prefix')
     p.add_argument('--backend', default=os.environ.get('ANTHPROXY_BACKEND', 'bedrock'),
-                   choices=list(BACKEND_NAMES),
+                   choices=list(_backend_names()),
                    help='LLM backend (default: bedrock)')
     p.add_argument('--codex-home',
                    default=os.environ.get('CODEX_HOME', ''),

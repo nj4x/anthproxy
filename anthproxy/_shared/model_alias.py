@@ -1,8 +1,7 @@
-"""Shared model-alias resolution for Codex and Anthropic backends.
+"""Shared model-alias resolution used by all backend mappers.
 
-Each backend keeps its own alias **dict** (``CODEX_MODEL_ALIASES``,
-``ANTHROPIC_MODEL_ALIASES``); only the resolution algorithm and the
-``CONTEXT_SUFFIXES`` constant are shared here.
+Alias dicts are resolved at call time via ``model_config.model_aliases(backend)``;
+only the resolution algorithm and the ``CONTEXT_SUFFIXES`` constant live here.
 
 Public API:
     CONTEXT_SUFFIXES

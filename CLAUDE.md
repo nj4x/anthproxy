@@ -10,6 +10,7 @@ Use `README.md` for setup, run, test, and UI development commands. The Python pa
 
 - `README.md`: user-facing overview, setup, CLI usage, local commands, session behavior, and examples
 - `anthproxy/config.py`: server CLI options, environment variables, and `Config` defaults
+- `anthproxy/backends_registry.py`: backend discovery convention, registration contract, hook API (`from_config`, `model_aliases`, `summary_credentials`), and `backend_names()`; the authoritative source for which backends are loaded at runtime
 - `anthproxy/model_config.py`: model aliases, pricing, labels, and external model configuration; do not duplicate concrete values
 - `anthproxy/model_router.py`: routing modes, routing decisions, and routing behavior
 
@@ -23,13 +24,13 @@ Use `README.md` for setup, run, test, and UI development commands. The Python pa
 
 `anthproxy.__main__` loads `Config`, prepares the initial backend, creates `BackendRegistry`, `StatsCollector`, and optional `SessionDB`, then starts the server. `server.py` owns backend construction, immutable dispatch snapshots, runtime switching, selector integration, and handler-class wiring. `ProxyRequestHandler` in `handlers.py` intercepts local commands, applies routing, takes one registry snapshot, dispatches to a provider backend, translates errors and streams, records usage and session data, and emits Anthropic-compatible responses.
 
-Each provider package follows the same boundary: `backend.py` owns transport and provider runtime behavior, `mapper.py` converts between Anthropic Messages shapes and provider protocol shapes, and `auth.py` owns credentials where needed. Shared SSE builders and content normalization live under `anthproxy/mapper/`; shared OAuth refresh and persistence live under `anthproxy/_shared/`.
+Each provider package follows the same boundary: `backend.py` (alongside `__init__.py`) marks a directory as a discoverable backend — do not create `backend.py` inside `anthproxy/_shared/` or `anthproxy/mapper/`. `backend.py` owns transport and provider runtime behavior, `mapper.py` converts between Anthropic Messages shapes and provider protocol shapes, and `auth.py` owns credentials where needed. Shared SSE builders and content normalization live under `anthproxy/mapper/`; shared OAuth refresh and persistence live under `anthproxy/_shared/`.
 
 The admin UI is a React/Vite SPA under `anthproxy/ui/src`; its checked-in production bundle is served from `anthproxy/ui/dist`. `SessionDB` persists request, session, and trace data; `StatsCollector` maintains usage and routing economics. UI, DB, and stats consume normalized usage fields, so provider mappers must translate provider-specific token semantics into the Anthropic convention before data reaches handlers. Admin/UI endpoints are unauthenticated and may expose conversation history or routing controls; UI-enabled servers must remain loopback-bound unless protected by an external access-control layer.
 
 ## Detailed guidance
 
-Module ownership and who-may-touch-what boundaries:
+Module ownership, who-may-touch-what boundaries, the two-file discovery convention, and the reserved-filename rule for `backend.py`:
 @docs/agents/architecture-boundaries.md
 
 Auto-routing rules, classifier isolation, tier-cache behavior, and session-key semantics:

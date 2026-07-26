@@ -22,8 +22,8 @@ from anthproxy.anthropic.backend import (
     _handle_error_response,
     _max_weekly_utilization,
 )
+from anthproxy import model_config as _model_config
 from anthproxy.anthropic.mapper import (
-    ANTHROPIC_MODEL_ALIASES,
     REQUIRED_BETAS,
     _CC_SYSTEM_PREFIX,
     _build_body,
@@ -140,13 +140,13 @@ class TestAnthropicUsage:
 
 class TestResolveModel:
     def test_short_alias_opus(self):
-        assert _resolve_model('opus') == ANTHROPIC_MODEL_ALIASES['opus']
+        assert _resolve_model('opus') == _model_config.model_aliases('anthropic')['opus']
 
     def test_short_alias_sonnet(self):
-        assert _resolve_model('sonnet') == ANTHROPIC_MODEL_ALIASES['sonnet']
+        assert _resolve_model('sonnet') == _model_config.model_aliases('anthropic')['sonnet']
 
     def test_short_alias_haiku(self):
-        assert _resolve_model('haiku') == ANTHROPIC_MODEL_ALIASES['haiku']
+        assert _resolve_model('haiku') == _model_config.model_aliases('anthropic')['haiku']
 
     def test_full_anthropic_id_pass_through(self):
         model = 'claude-opus-4-8'
@@ -155,12 +155,12 @@ class TestResolveModel:
     def test_context_suffix_1m_stripped(self):
         base = 'opus'
         result = _resolve_model(f'{base}:1m')
-        assert result == ANTHROPIC_MODEL_ALIASES[base]
+        assert result == _model_config.model_aliases('anthropic')[base]
 
     def test_context_suffix_bracket_stripped(self):
         base = 'sonnet'
         result = _resolve_model(f'{base}[1m]')
-        assert result == ANTHROPIC_MODEL_ALIASES[base]
+        assert result == _model_config.model_aliases('anthropic')[base]
 
     def test_unknown_model_passes_through(self):
         model = 'gpt-5-custom'
@@ -398,7 +398,7 @@ class TestBuildBody:
             'messages': [],
         }
         body = json.loads(_build_body(payload))
-        assert body['model'] == ANTHROPIC_MODEL_ALIASES['opus']
+        assert body['model'] == _model_config.model_aliases('anthropic')['opus']
 
     def test_system_prefix_injected_when_absent(self):
         payload = {

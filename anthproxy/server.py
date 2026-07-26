@@ -5,9 +5,16 @@ import time
 from collections import OrderedDict
 from http.server import ThreadingHTTPServer
 
-from .backends_registry import get_backend, list_backends  # noqa: F401
+from .backends_registry import (  # noqa: F401
+    BackendDiscoveryError,
+    backend_names,
+    class_hook,
+    discover_backends,
+    get_backend,
+    list_backends,
+)
 from .config import Config
-from .constants import BACKEND_NAMES, SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
+from .constants import SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
 from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
@@ -17,17 +24,8 @@ class BackendError(Exception):
     """Raised when a backend cannot be constructed or prepared for activation."""
 
 
-def _load_public_backends():
-    """Load and register all public backends."""
-    import anthproxy.anthropic  # noqa: F401
-    import anthproxy.bedrock  # noqa: F401
-    import anthproxy.codex  # noqa: F401
-    import anthproxy.local  # noqa: F401
-    import anthproxy.openrouter  # noqa: F401
-
-
 def build_backend(name: str, config: Config):
-    """Construct a backend instance by canonical name.
+    """Construct a backend instance by canonical name via the from_config hook.
 
     Codex credential preparation is intentionally NOT performed here — startup
     handles interactive login, and runtime switches use a non-interactive
@@ -36,13 +34,14 @@ def build_backend(name: str, config: Config):
     backend_class = get_backend(name)
     if backend_class is None:
         raise BackendError(f'Unknown backend: {name}')
-
-    if name == 'codex':
-        return backend_class()
-    elif name == 'bedrock':
-        return backend_class(config)
-    else:
-        return backend_class()
+    factory = class_hook(backend_class, 'from_config')
+    if factory is None:
+        raise BackendError(
+            f'{backend_class.__module__}.{backend_class.__qualname__}: missing or '
+            f'malformed from_config hook — inherit anthproxy._shared.Backend or '
+            f'declare a classmethod named from_config'
+        )
+    return factory(config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -261,7 +260,7 @@ class BackendRegistry:
             # current mode.
             if (
                 prefer_backend is not None
-                and prefer_backend in BACKEND_NAMES
+                and prefer_backend in backend_names()
                 and not session_pinned
                 and not session_subscription
                 and not (self._config.auto_backend_mode == 'subscription'
@@ -354,7 +353,7 @@ class BackendRegistry:
         Used by ``AutoSelector`` to call ``five_hour_status()`` without
         triggering a full switch.  Raises ``BackendError`` for unknown names.
         """
-        if name not in BACKEND_NAMES:
+        if name not in backend_names():
             raise BackendError(f'Unknown backend: {name}')
         return self._get_or_create(name)
 
@@ -377,7 +376,7 @@ class BackendRegistry:
         return self._get_or_create(name)
 
     def switch(self, name: str, reason: str = '') -> SwitchResult:
-        if name not in BACKEND_NAMES:
+        if name not in backend_names():
             return SwitchResult(kind='invalid', previous=self.active_name(),
                                 current=self.active_name())
 
@@ -420,7 +419,7 @@ class BackendRegistry:
         Returns a ``SwitchResult`` whose ``previous`` is the prior override for
         this session (or the current global active when no override existed).
         """
-        if name not in BACKEND_NAMES:
+        if name not in backend_names():
             return SwitchResult(kind='invalid', previous=self.active_name(),
                                 current=self.active_name())
 
@@ -653,7 +652,7 @@ class BackendRegistry:
 
     def list_backends(self) -> tuple:
         """Return all known backend names."""
-        return BACKEND_NAMES
+        return backend_names()
 
     @property
     def config(self):

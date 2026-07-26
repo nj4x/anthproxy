@@ -3,8 +3,6 @@ import useSWR from 'swr';
 import { api } from '../api/client';
 import type { Config, BackendsResponse, Backend, SetBackendResponse } from '../api/types';
 
-const BACKEND_OPTIONS = ['auto', 'subscription', 'anthropic', 'bedrock', 'codex', 'openrouter', 'local'];
-
 export default function Settings() {
   const { data: config, error: configError, mutate: mutateConfig } = useSWR<Config>(
     'config',
@@ -123,7 +121,7 @@ export default function Settings() {
             onChange={(e) => setBackendPref(e.target.value)}
             className="border border-gray-300 rounded px-2 py-1.5 text-sm"
           >
-            {BACKEND_OPTIONS.map((b) => (
+            {[...(backendsData?.modes ?? []), ...(backendsData?.known ?? [])].map((b) => (
               <option key={b} value={b}>{b}</option>
             ))}
           </select>

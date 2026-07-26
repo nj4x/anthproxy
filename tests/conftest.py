@@ -16,9 +16,9 @@ _ORIGINAL_CONFIG = os.environ.get('ANTHPROXY_CONFIG')
 _COLLECTION_CONFIG = str(Path(tempfile.gettempdir()) / f'anthproxy-test-{os.getpid()}.json')
 os.environ['ANTHPROXY_CONFIG'] = _COLLECTION_CONFIG
 
-# Load public backends once at collection time so registry is populated
-from anthproxy.server import _load_public_backends  # noqa: E402
-_load_public_backends()
+# Discover and register all backends once at collection time so the registry is populated
+from anthproxy.server import discover_backends  # noqa: E402
+discover_backends()
 
 
 @pytest.fixture(autouse=True)

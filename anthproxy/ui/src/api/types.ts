@@ -158,6 +158,8 @@ export interface RoutingResponse {
 export interface BackendsResponse {
   backends: Backend[];
   active: string;
+  known: string[];
+  modes: string[];
 }
 
 export interface ConfigChangesResponse {

@@ -162,3 +162,18 @@ class Backend(ABC):
 
     def store_cached_credential(self, key: str, value: str) -> None:
         pass
+
+    @classmethod
+    def from_config(cls, config):
+        """Construct a backend instance from config.  Default: zero-argument constructor."""
+        return cls()
+
+    @classmethod
+    def model_aliases(cls) -> dict:
+        """Return a dict[str, str] of alias → provider-model-id mappings.  Default: {}."""
+        return {}
+
+    @classmethod
+    def summary_credentials(cls, snapshot) -> dict | None:
+        """Return credentials for the admin summary, or None if ineligible.  Default: None."""
+        return None

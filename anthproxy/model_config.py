@@ -230,9 +230,41 @@ def load() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _plugin_model_aliases(backend: str) -> dict:
+    """Return the model_aliases() hook result for *backend*, or {} on any failure.
+
+    Imports class_hook/get_backend locally to keep model_config → backends_registry
+    acyclic at module import time.  Wraps the call so that temporary_registry fakes
+    that raise do not surface as request-path errors.
+    """
+    try:
+        from .backends_registry import class_hook, get_backend
+        backend_class = get_backend(backend)
+        if backend_class is None:
+            return {}
+        hook = class_hook(backend_class, 'model_aliases')
+        if hook is None:
+            return {}
+        result = hook()
+        if not isinstance(result, dict):
+            logger.warning('model_aliases() for %r returned non-dict %r — ignored', backend, type(result))
+            return {}
+        return dict(result)
+    except Exception:  # noqa: BLE001
+        logger.warning('model_aliases() for %r raised — ignored', backend, exc_info=True)
+        return {}
+
+
 def model_aliases(backend: str) -> dict:
-    """Return the model-alias dict for *backend*."""
-    return load()["model_aliases"].get(backend, {})
+    """Return merged model-alias dict for *backend*.
+
+    Precedence: configured file overlays plugin hook result (file wins on conflict).
+    """
+    merged = _plugin_model_aliases(backend)
+    configured = load()["model_aliases"].get(backend, {})
+    if isinstance(configured, dict):
+        merged.update(configured)
+    return merged
 
 
 def inference_profile_models() -> frozenset:

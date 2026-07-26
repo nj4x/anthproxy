@@ -224,26 +224,9 @@ class SummaryDaemon:
 
     def _get_credentials(self, snapshot) -> dict | None:
         """Return credentials for the active backend, or None if ineligible."""
-        backend_name = snapshot.name
+        from .backends_registry import class_hook
 
-        # Bedrock requires request-scoped AWS credentials; skip it.
-        if backend_name == 'bedrock':
+        credentials_method = class_hook(type(snapshot.backend), 'summary_credentials')
+        if credentials_method is None:
             return None
-
-        # Anthropic, Codex: parse_credentials('') returns {} (proxy-owned credentials).
-        if backend_name in ('anthropic', 'codex'):
-            return snapshot.backend.parse_credentials('')
-
-        # OpenRouter: check configured API key.
-        if backend_name == 'openrouter':
-            if snapshot.config.openrouter_api_key:
-                return snapshot.backend.parse_credentials('')
-            return None
-
-        # Local: credential-free.
-        if backend_name == 'local':
-            return {}
-
-        # Unknown backend; skip safely.
-        logger.debug('Skipping summary: unknown backend %s', backend_name)
-        return None
+        return credentials_method(snapshot)

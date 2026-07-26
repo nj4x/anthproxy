@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from anthproxy.local.backend import LocalBackend
 from anthproxy.summary import SummaryDaemon
 
 
@@ -104,5 +105,5 @@ class TestGetCredentials:
     def test_local_credential_free(self):
         db = MagicMock()
         daemon = _make_daemon(db)
-        snapshot = SimpleNamespace(name='local', backend=MagicMock(), config=MagicMock())
+        snapshot = SimpleNamespace(name='local', backend=LocalBackend(), config=MagicMock())
         assert daemon._get_credentials(snapshot) == {}
