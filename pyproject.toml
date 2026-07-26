@@ -15,6 +15,18 @@ dev = ["ruff>=0.8.0"]
 [project.scripts]
 anthproxy = "anthproxy.__main__:main"
 
+[tool.setuptools.packages.find]
+include = [
+    "anthproxy",
+    "anthproxy._shared*",
+    "anthproxy.anthropic*",
+    "anthproxy.bedrock*",
+    "anthproxy.codex*",
+    "anthproxy.local*",
+    "anthproxy.mapper*",
+    "anthproxy.openrouter*",
+]
+
 [tool.ruff]
 target-version = "py310"
 
