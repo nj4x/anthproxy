@@ -4,8 +4,6 @@ Each backend keeps its own alias **dict** (``CODEX_MODEL_ALIASES``,
 ``ANTHROPIC_MODEL_ALIASES``); only the resolution algorithm and the
 ``CONTEXT_SUFFIXES`` constant are shared here.
 
-Not used by Gauss (frozen, keeps its own private copies).
-
 Public API:
     CONTEXT_SUFFIXES
     resolve_alias(model, alias_dict, *, prefix_match=False)
@@ -15,7 +13,6 @@ from ..mapper import AnthropicRequestError
 
 # Context-window variant suffixes that should be stripped before alias lookup.
 # Declared once here; codex.py and anthropic.py import this constant.
-# Gauss's private copy (gauss.py line 365) stays untouched.
 CONTEXT_SUFFIXES: tuple[str, ...] = (':1m', '[1m]')
 
 

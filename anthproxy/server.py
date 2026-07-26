@@ -5,7 +5,7 @@ import time
 from collections import OrderedDict
 from http.server import ThreadingHTTPServer
 
-from .backends_registry import get_backend, list_backends
+from .backends_registry import get_backend, list_backends  # noqa: F401
 from .config import Config
 from .constants import BACKEND_NAMES, SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
 from .handlers import ProxyRequestHandler
@@ -174,7 +174,7 @@ class BackendRegistry:
     """Process-wide owner of the active backend and cached instances.
 
     One instance per backend is cached for the lifetime of the server so that
-    backend-local state (Bedrock credential cache, Gauss history/kill-switch,
+    backend-local state (Bedrock credential cache,
     Codex OAuth/usage cache) survives switching away and back.
 
     The state lock guards only the active-name/config commit, the instance

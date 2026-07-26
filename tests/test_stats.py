@@ -46,7 +46,7 @@ class TestClassifyModel:
     def test_unknown_returns_other(self):
         assert _classify_model('') == 'other'
         assert _classify_model('gpt-5.5') == 'other'
-        assert _classify_model('GaussO5') == 'other'
+        assert _classify_model('plugin-model-1') == 'other'
         assert _classify_model(None) == 'other'
 
     def test_case_insensitive(self):
@@ -343,7 +343,7 @@ class TestStatsCollectorStorage:
             with open(p, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(entry) + '\n')
 
-        _write(f'{day_a}.jsonl', _record_for(ts_a, 'gauss', 'haiku', input_tokens=1))
+        _write(f'{day_a}.jsonl', _record_for(ts_a, 'plugin', 'haiku', input_tokens=1))
         _write(f'{day_b}.jsonl', _record_for(ts_b, 'codex', 'sonnet', input_tokens=2))
 
         sc = StatsCollector(stats_dir=stats_dir)
@@ -470,7 +470,7 @@ class TestFormatStatsMarkdown:
         assert 'Opus' in md
 
     def test_quarter_groups_by_month(self):
-        records = [_record_for(_ts_days_ago(0), 'gauss', 'sonnet', input_tokens=100)]
+        records = [_record_for(_ts_days_ago(0), 'plugin', 'sonnet', input_tokens=100)]
         md = format_stats_markdown(records, _period('this quarter', 'month'))
         assert __import__('re').search(r'[A-Z][a-z]+ \d{4}', md)
         assert 'Sonnet' in md
@@ -504,7 +504,7 @@ class TestFormatStatsMarkdown:
         assert 'Total' in md
 
     def test_other_model_shows_zero_cost(self):
-        records = [_record_for(_ts_today_at(9), 'gauss', 'GaussO5', input_tokens=9_999_999)]
+        records = [_record_for(_ts_today_at(9), 'plugin', 'plugin-model-1', input_tokens=9_999_999)]
         md = format_stats_markdown(records, _period('today', 'hour'))
         assert 'Other' in md
         assert '$0.00' in md
@@ -586,7 +586,7 @@ class TestMatchesBackendFilter:
         assert _matches_backend_filter('bedrock', 'bedrock') is True
 
     def test_exact_no_match(self):
-        assert _matches_backend_filter('gauss', 'bedrock') is False
+        assert _matches_backend_filter('plugin', 'bedrock') is False
 
     def test_subscription_matches_anthropic(self):
         assert _matches_backend_filter('anthropic', 'subscription') is True
@@ -600,8 +600,8 @@ class TestMatchesBackendFilter:
     def test_subscription_excludes_bedrock(self):
         assert _matches_backend_filter('bedrock', 'subscription') is False
 
-    def test_subscription_excludes_gauss(self):
-        assert _matches_backend_filter('gauss', 'subscription') is False
+    def test_subscription_excludes_non_subscription_backend(self):
+        assert _matches_backend_filter('plugin', 'subscription') is False
 
     def test_subscription_excludes_local(self):
         assert _matches_backend_filter('local', 'subscription') is False
@@ -859,7 +859,7 @@ class TestRoutingEconomics:
         """Unknown routed model → pricing_available=False, no raise."""
         econ = routing_economics(
             requested_model='opus',
-            routed_model='GaussO5',
+            routed_model='plugin-model-1',
             classifier_model='haiku',
             input_tokens=500_000,
             output_tokens=100_000,

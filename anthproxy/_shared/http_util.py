@@ -3,7 +3,7 @@
 Contains byte-identical (or trivially parameterizable) HTTP scaffolding that
 was previously duplicated between ``codex.py`` and ``anthropic.py``.
 
-Not used by Gauss (frozen, keeps its own private copies).
+Plugin backends may define their own private copies.
 
 Public API:
     MAX_RETRIES, RETRYABLE_STATUSES, RETRY_BASE_DELAY, RETRY_MAX_DELAY

@@ -60,7 +60,7 @@ class TestClassifyModelTier:
     @pytest.mark.parametrize("model,expected", [
         ('gpt-4o',  'other'),
         ('',        'other'),
-        ('GaussO5', 'other'),
+        ('plugin-model-1', 'other'),
         ('codex',   'other'),
     ])
     def test_unknown_models(self, model, expected):
@@ -115,7 +115,7 @@ class TestModelTierRank:
         for tier, rank in TIER_RANK.items():
             assert model_tier_rank(tier) == rank
 
-    @pytest.mark.parametrize("model", ['gpt-4o', '', 'GaussO5', 'codex'])
+    @pytest.mark.parametrize("model", ['gpt-4o', '', 'plugin-model-1', 'codex'])
     def test_unknown_models_return_none(self, model):
         """Unknown / non-tier models return None (fail-open, not -1)."""
         assert model_tier_rank(model) is None

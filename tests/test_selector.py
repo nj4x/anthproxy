@@ -934,7 +934,7 @@ class TestCurrentSubscriptionBackend(unittest.TestCase):
         result = sel.current_subscription_backend()
         self.assertIn(result, list(_PRIORITY) + [None])
         self.assertNotEqual(result, 'bedrock')
-        self.assertNotEqual(result, 'gauss')
+        self.assertNotEqual(result, 'plugin')
         self.assertNotEqual(result, 'local')
 
     def test_prefers_not_exhausted_backend(self):

@@ -1379,10 +1379,10 @@ class TestSessionPins:
         """set_session_backend should create the session row if absent."""
         db, path = _make_db()
         try:
-            db.set_session_backend('brand-new', 'gauss')
+            db.set_session_backend('brand-new', 'plugin')
             meta = db.get_session_metadata('brand-new')
             assert meta is not None
-            assert meta['pinned_backend'] == 'gauss'
+            assert meta['pinned_backend'] == 'plugin'
         finally:
             db.close()
             os.unlink(path)
@@ -1760,7 +1760,7 @@ class TestTierFromModel:
         ('opus:1m', 'opus'),
         ('CLAUDE-OPUS-4-8', 'opus'),   # uppercase
         ('gpt-5.4', None),
-        ('GaussO5', None),
+        ('plugin-model-1', None),
         ('', None),
         ('fable', 'fable'),            # fable is now rank 3
     ])
@@ -2330,12 +2330,12 @@ class TestGetSessionOverrides:
         db, path = _make_db()
         try:
             _insert(db, session_id='s')
-            db.set_session_backend('s', 'gauss')
+            db.set_session_backend('s', 'plugin')
             result = db.get_session_overrides()
             assert len(result) == 1
             row = result[0]
             assert row['session_id'] == 's'
-            assert row['pinned_backend'] == 'gauss'
+            assert row['pinned_backend'] == 'plugin'
             assert row['pinned_tier'] is None
             assert 'display_name' in row
         finally:

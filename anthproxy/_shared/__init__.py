@@ -150,7 +150,7 @@ class Backend(ABC):
 
         The default implementation routes through the normal non-streaming
         ``send_message`` path.  Backends with session-specific side effects
-        (e.g. Gauss, which maintains a request history and kill switch) should
+        (e.g. a backend that maintains a request history and kill switch) should
         override this method to use a fresh isolated context so classifier calls
         are invisible to the user session.
 

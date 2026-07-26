@@ -165,7 +165,7 @@ def parse_args(argv=None) -> Config:
     p.add_argument('--no-prompt-translate', dest='no_prompt_translate',
                    action='store_true',
                    default=_env_bool('ANTHPROXY_NO_PROMPT_TRANSLATE', False),
-                   help='Disable system-prompt and tool-name translation for Gauss backend'
+                   help='Disable system-prompt and tool-name translation'
                         ' (env: ANTHPROXY_NO_PROMPT_TRANSLATE)')
     p.add_argument('--request-history-size', type=int,
                    default=int(os.environ.get('ANTHPROXY_REQUEST_HISTORY_SIZE', '5')),

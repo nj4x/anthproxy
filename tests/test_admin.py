@@ -18,7 +18,7 @@ def _make_registry(*, backend_names=None, active='bedrock', switch_result=None):
     registry = MagicMock()
     registry.active_name.return_value = active
     registry.list_backends.return_value = list(
-        backend_names or ['bedrock', 'gauss', 'codex', 'anthropic', 'local', 'openrouter']
+        backend_names or ['bedrock', 'plugin', 'codex', 'anthropic', 'local', 'openrouter']
     )
     _switch_result = switch_result or SwitchResult(kind='changed', previous=active, current='bedrock')
     registry.switch.return_value = _switch_result

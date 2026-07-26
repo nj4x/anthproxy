@@ -1,7 +1,7 @@
 """Unit tests for the Codex backend — translation, auth helpers, and streaming.
 
 All tests are network-free; live refresh() and login() calls are not covered
-here.  Follow the patterns established by tests/test_gauss.py.
+here.  Follow the patterns established by the other backend test modules.
 """
 
 import base64

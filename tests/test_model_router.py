@@ -1647,7 +1647,7 @@ class TestTierRank:
     def test_unknown_models_rank_none(self):
         from anthproxy.model_tier import model_tier_rank
         assert model_tier_rank('gpt-5.5') is None
-        assert model_tier_rank('GaussO5') is None
+        assert model_tier_rank('plugin-model-1') is None
         assert model_tier_rank('') is None
 
     def test_non_string_rank_none(self):

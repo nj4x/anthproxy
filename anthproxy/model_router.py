@@ -9,7 +9,7 @@ and then rewritten to one of three tiers before the main backend dispatch:
   deep     →  opus    (architecture, large refactor, complex reasoning)
 
 Any non-empty string model value is eligible for routing — ``sonnet``,
-``opus``, ``haiku``, ``fable``, full Anthropic IDs, Bedrock/Codex/Gauss native
+``opus``, ``haiku``, ``fable``, full Anthropic IDs, Bedrock/Codex native
 IDs, ARNs, inference-profile IDs, and 1m variants are all rewritten to the
 corresponding short tier alias.  Missing, non-string, or whitespace-only model
 values are forwarded unchanged.
@@ -50,7 +50,6 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from ._shared.model_alias import CONTEXT_SUFFIXES
 from .mapper import estimate_input_tokens
 from .model_tier import model_tier_rank
 from .request_text import (
@@ -81,7 +80,7 @@ _TIER_DEEP: Literal['opus'] = 'opus'  # superseded by config.auto_model_routing_
 # Long-context deep tier forced by the size floor (see route_model).  Resolves to
 # the 1m-window opus on backends that have one (anthropic via the context-1m beta
 # below; bedrock via the distinct ":1m" inference profile) and collapses to plain
-# opus on backends without a 1m variant (gauss/codex), which is benign.
+# opus on backends without a 1m variant (e.g. codex), which is benign.
 _TIER_DEEP_LONG_CONTEXT: Literal['opus[1m]'] = 'opus[1m]'  # superseded by config.auto_model_routing_long; kept for reference only
 
 # Tier ranks (canonical, from model_tier.py): haiku=0, sonnet=1, opus=2, fable=3.
@@ -400,7 +399,7 @@ def _ensure_long_context_beta(payload: dict) -> None:
     beta.  No-op if any ``context-1m*`` token is already present (dedupe by
     prefix, tolerant of dated revisions).  Copy-on-write: assigns a fresh list
     rather than mutating one the caller may share.  Harmless for backends that
-    ignore ``_anthropic_beta`` (bedrock/gauss/codex/local).
+    ignore ``_anthropic_beta`` (bedrock/codex/local).
     """
     raw = payload.get('_anthropic_beta')
     existing = [b for b in raw if isinstance(b, str)] if isinstance(raw, list) else []

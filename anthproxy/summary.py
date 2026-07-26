@@ -240,12 +240,6 @@ class SummaryDaemon:
                 return snapshot.backend.parse_credentials('')
             return None
 
-        # Gauss: check server-owned UMS_TOKEN.
-        if backend_name == 'gauss':
-            if snapshot.config.gauss_ums_token:
-                return snapshot.backend.parse_credentials('')
-            return None
-
         # Local: credential-free.
         if backend_name == 'local':
             return {}
