@@ -64,6 +64,7 @@ def _fake_snapshot(name, backend, session_pinned=False, session_subscription=Fal
     snapshot.config.auto_model_routing_confidence_bump = False
     snapshot.config.auto_model_routing_min_confidence = 0.0
     snapshot.config.auto_model_routing_mode = 'classifier'
+    snapshot.config.lock_requested_model = 'off'
     snapshot.session_pinned = session_pinned
     snapshot.session_subscription = session_subscription
     return snapshot
@@ -1376,6 +1377,79 @@ class TestSessionTierCache:
         assert payload['model'] == 'sonnet'
         assert 'reason=session_cached_walkback_tool_result' in caplog.text
         assert 'applied=True' in caplog.text
+        backend.send_classifier_message.assert_not_called()
+
+    def test_lock_requested_model_baseline_for_routing(self, caplog):
+        """When lock_requested_model is set, routing uses the locked baseline for tier
+        decisions while preserving the client's original model for response echo and applied flag."""
+        import copy
+        handler, registry, backend = self._make_handler(
+            auto_routing=True, cached_tier=None)
+        payload = copy.deepcopy(self._TEXT_PAYLOAD)  # client model='sonnet'
+        payload['model'] = 'haiku'  # client requests haiku
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value=payload)
+        # Classifier will say 'deep' (should route to opus)
+        handler.registry.snapshot.return_value.config.lock_requested_model = 'claude-sonnet-4-6'
+        backend.send_classifier_message.return_value = {
+            'content': [{'type': 'text', 'text': 'deep'}],
+        }
+
+        with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
+            handler._handle_messages()
+
+        # Routing used sonnet baseline: 'deep' → opus, not haiku
+        assert payload['model'] == 'opus'
+        # applied=True: routed (opus) != requested (haiku)
+        assert 'applied=True' in caplog.text
+        # The log should show the lock was applied
+        assert 'Model lock: forcing routing baseline from haiku to claude-sonnet-4-6' in caplog.text
+        backend.send_classifier_message.assert_called_once()
+
+    def test_lock_requested_model_missing_text_cap_uses_lock_baseline(self, caplog):
+        """When lock_requested_model is set and missing_final_user_text fires,
+        the cached-tier no-upgrade cap uses the lock baseline, not the client model."""
+        import copy
+        # Cache holds 'opus' but client requested 'haiku' and lock='sonnet'
+        handler, registry, backend = self._make_handler(
+            auto_routing=True, cached_tier='opus')
+        payload = copy.deepcopy(self._TOOL_RESULT_PAYLOAD)  # tool-result-only (no text)
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value=payload)
+        handler.registry.snapshot.return_value.config.lock_requested_model = 'claude-sonnet-4-6'
+
+        with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
+            handler._handle_messages()
+
+        # Cached opus is capped against sonnet baseline: sonnet < opus, so return sonnet
+        assert payload['model'] == 'claude-sonnet-4-6'
+        assert 'reason=session_cached_tier_capped' in caplog.text
+        # applied=False: routed (sonnet) == requested (sonnet)... wait, requested is the
+        # client's original model from the payload. Let's check:
+        # The payload from _TOOL_RESULT_PAYLOAD has model='sonnet', but we don't change it.
+        # The lock only affects routing; applied compares routed vs requested (client model).
+        # Since routed is capped to the lock baseline (sonnet) and requested is the client's
+        # 'sonnet', applied=False. But the cap WAS applied (cached opus → sonnet).
+        # The reason_code='session_cached_tier_capped' indicates the cap fired.
+        backend.send_classifier_message.assert_not_called()
+
+    def test_lock_requested_model_no_effect_when_routing_disabled(self, caplog):
+        """When auto_model_routing=False, lock_requested_model has no effect."""
+        import copy
+        handler, registry, backend = self._make_handler(
+            auto_routing=False)  # routing off
+        payload = copy.deepcopy(self._TEXT_PAYLOAD)
+        payload['model'] = 'haiku'
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value=payload)
+        handler.registry.snapshot.return_value.config.lock_requested_model = 'claude-sonnet-4-6'
+
+        with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
+            handler._handle_messages()
+
+        # Routing is off, so model stays as client sent it
+        assert payload['model'] == 'haiku'
+        assert 'reason=disabled' in caplog.text
         backend.send_classifier_message.assert_not_called()
 
     # --- session-context floor (record + consume) ------------------------------

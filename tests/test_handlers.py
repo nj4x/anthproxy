@@ -442,6 +442,7 @@ def _fake_snapshot(name, backend, session_pinned=False, session_subscription=Fal
     snapshot.name = name
     snapshot.backend = backend
     snapshot.config = MagicMock()
+    snapshot.config.lock_requested_model = 'off'
     snapshot.session_pinned = session_pinned
     snapshot.session_subscription = session_subscription
     return snapshot

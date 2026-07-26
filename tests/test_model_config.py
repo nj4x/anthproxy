@@ -407,7 +407,7 @@ class TestAutoModelRoutingConfig:
     def test_long_default(self):
         from anthproxy.config import parse_args
         cfg = parse_args([])
-        assert cfg.auto_model_routing_long == 'opus[1m]'
+        assert cfg.auto_model_routing_long == 'off'
 
     def test_long_model_override(self):
         from anthproxy.config import parse_args

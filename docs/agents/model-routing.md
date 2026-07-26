@@ -6,6 +6,7 @@ Refer to `config.py`, `model_config.py`, and `model_router.py` for mutable confi
 
 - Auto routing applies only to message requests; all other endpoints and local commands bypass it.
 - Any non-empty string model is eligible; missing or non-string model values pass through unchanged.
+- **Model baseline lock** (`--lock-requested-model <model>` or env `ANTHPROXY_LOCK_REQUESTED_MODEL`): when set to a non-`off` value, that model becomes the baseline for routing decisions (tier eligibility, caps, classifier log context) instead of the client's arbitrary requested model. The client's original model is still echoed in responses, statistics, and the `applied` flag; the lock affects only routing logic internally. Default: `off` (no lock).
 - Routing failures, invalid classifier output, unknown task tags, and malformed payloads must preserve the original requested model.
 - Routed responses transparently echo the originally requested model; non-routed responses are byte-for-byte passthrough. Statistics retain the routed model.
 - Classifier payloads carry `_anthproxy_internal_classifier`; `route_model()` must no-op for them, and mappers must remove the sentinel before outbound transport.

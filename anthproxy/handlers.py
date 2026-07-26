@@ -699,12 +699,20 @@ def prepare_routing(handler, payload, sess_key):
             estimated_input_tokens=est_tokens,
         )
     else:
+        _lock = snapshot.config.lock_requested_model
+        baseline_model = _lock if _lock != 'off' else None
+        if baseline_model:
+            logger.info(
+                '%s Model lock: forcing routing baseline from %s to %s',
+                handler._log_tag(), payload.get('model'), baseline_model,
+            )
         routing = _route_model(payload, snapshot, credentials, cached_tier,
                                session_floor, session_ratio,
                                log_tag=handler._log_tag(),
                                override_mode=getattr(handler, '_override_mode', None),
                                task_tag=getattr(handler, '_task_tag', None),
-                               ctx_key=ctx_key)
+                               ctx_key=ctx_key,
+                               baseline_model=baseline_model)
     route_est = routing.estimated_input_tokens
 
     # Session tier cache (last-resort fallback): persist each fresh
@@ -722,11 +730,11 @@ def prepare_routing(handler, payload, sess_key):
             cached = handler.registry.session_routed_tier(ctx_key)
             if cached is not None:
                 # No-upgrade cap: never replay a cached tier above the
-                # tier this turn requested (same guard as the router's
-                # walk-back branch).
+                # effective routing baseline (lock if active, else client model).
+                _cap_baseline = baseline_model or routing.requested_model
                 capped = _cap_cached_tier(
                     cached,
-                    routing.requested_model,
+                    _cap_baseline,
                     label_map=snapshot.config.auto_model_routing_classification,
                 )
                 payload['model'] = capped

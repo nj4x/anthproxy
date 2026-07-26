@@ -1119,6 +1119,7 @@ def route_model(
     override_mode: str | None = None,
     task_tag: str | None = None,
     ctx_key: str | None = None,
+    baseline_model: str | None = None,
 ) -> ModelRoutingDecision:
     """Classify the request and rewrite ``payload['model']`` in place.
 
@@ -1178,6 +1179,12 @@ def route_model(
     # Capture the actual incoming model string; fail-closed branches return this.
     requested = raw_model  # guaranteed str and non-empty by is_model_auto_routable
 
+    # When a baseline_model lock is active, routing decisions (tier caps, classifier
+    # log context) operate against the locked baseline rather than the client's
+    # arbitrary model.  The client-sent model is preserved in `requested` for
+    # response echoing, the `applied` flag, and ModelRoutingDecision.requested_model.
+    routing_baseline = baseline_model if baseline_model else requested
+
     # --- Long-context size floor (deterministic, pre-classifier).  When the
     # estimated total request size is near the 200K window, force the long-context
     # opus tier and inject the context-1m beta so the only model that can serve the
@@ -1226,12 +1233,15 @@ def route_model(
     # --- Build routing summary
     summary = build_routing_summary(payload)
     if summary is None:
-        # Malformed or no final user text — fail-closed: keep original model
+        # Malformed or no final user text — fail-closed: use baseline lock if active,
+        # otherwise keep the originally requested model.
+        fallback = routing_baseline if baseline_model else requested
+        payload['model'] = fallback
         return ModelRoutingDecision(
             requested_model=requested,
-            routed_model=requested,
+            routed_model=fallback,
             classification=None,
-            applied=False,
+            applied=(fallback != requested),
             reason_code='missing_final_user_text',
             estimated_input_tokens=est_tokens,
         )
@@ -1243,13 +1253,21 @@ def route_model(
         if summary.final_is_tool_result_only:
             # Agentic tool_result continuation: the client sends the base model
             # on every turn unconditionally; 'requested' carries no downgrade intent.
-            # Bypass the no-upgrade cap and replay the cached tier directly.
-            payload['model'] = cached_session_tier
+            # Bypass the no-upgrade cap, but when baseline_model lock is active,
+            # cap against the baseline to enforce the lock.
+            if baseline_model:
+                capped = _cap_cached_tier(
+                    cached_session_tier, routing_baseline,
+                    label_map=config.auto_model_routing_classification,
+                )
+            else:
+                capped = cached_session_tier
+            payload['model'] = capped
             return ModelRoutingDecision(
                 requested_model=requested,
-                routed_model=cached_session_tier,
+                routed_model=capped,
                 classification=None,
-                applied=(cached_session_tier != requested),
+                applied=(capped != requested),
                 reason_code='session_cached_walkback_tool_result',
                 estimated_input_tokens=est_tokens,
                 classifier_mode='walkback_cache',
@@ -1258,7 +1276,7 @@ def route_model(
         # Apply the no-upgrade cap so a prior expensive task cannot hijack
         # a new simpler request via walkback (the production session_cached_walkback bug).
         capped = _cap_cached_tier(
-            cached_session_tier, requested,
+            cached_session_tier, routing_baseline,
             label_map=config.auto_model_routing_classification,
         )
         payload['model'] = capped
@@ -1293,23 +1311,37 @@ def route_model(
     if (config.auto_model_routing_affirmation_inherit
             and summary.is_short_affirmation):
         if cached_session_tier is not None:
-            payload['model'] = cached_session_tier
+            if baseline_model:
+                capped = _cap_cached_tier(
+                    cached_session_tier, routing_baseline,
+                    label_map=config.auto_model_routing_classification,
+                )
+            else:
+                capped = cached_session_tier
+            payload['model'] = capped
             return ModelRoutingDecision(
                 requested_model=requested,
-                routed_model=cached_session_tier,
+                routed_model=capped,
                 classification=None,
-                applied=(cached_session_tier != requested),
+                applied=(capped != requested),
                 reason_code='affirmation_inherited',
                 estimated_input_tokens=est_tokens,
                 classifier_mode='affirmation',
             )
         standard_tier = config.auto_model_routing_classification['standard']
-        payload['model'] = standard_tier
+        if baseline_model:
+            capped = _cap_cached_tier(
+                standard_tier, routing_baseline,
+                label_map=config.auto_model_routing_classification,
+            )
+        else:
+            capped = standard_tier
+        payload['model'] = capped
         return ModelRoutingDecision(
             requested_model=requested,
-            routed_model=standard_tier,
+            routed_model=capped,
             classification=None,
-            applied=(standard_tier != requested),
+            applied=(capped != requested),
             reason_code='affirmation_floored_standard',
             estimated_input_tokens=est_tokens,
             classifier_mode='affirmation',
@@ -1323,12 +1355,19 @@ def route_model(
     # complexity signal is preserved.
     if summary.final_user_text and is_title_generation(summary.final_user_text):
         trivial_model = config.auto_model_routing_classification['trivial']
-        payload['model'] = trivial_model
+        if baseline_model:
+            capped = _cap_cached_tier(
+                trivial_model, routing_baseline,
+                label_map=config.auto_model_routing_classification,
+            )
+        else:
+            capped = trivial_model
+        payload['model'] = capped
         return ModelRoutingDecision(
             requested_model=requested,
-            routed_model=trivial_model,
+            routed_model=capped,
             classification=None,
-            applied=(trivial_model != requested),
+            applied=(capped != requested),
             reason_code='rule_title_generation',
             estimated_input_tokens=est_tokens,
             classifier_mode='rules',
@@ -1345,7 +1384,7 @@ def route_model(
     (label_or_tier, dispatch_reason, parsed_confidence, clf_in_tokens, clf_out_tokens,
      clf_model, clf_summary_json, clf_raw_response, clf_format) = _dispatch_classifier_mode(
         effective_mode, summary, config, snapshot, credentials,
-        est_tokens, requested, log_tag, task_tag,
+        est_tokens, routing_baseline, log_tag, task_tag,
     )
 
     if label_or_tier is None:

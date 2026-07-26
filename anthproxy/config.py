@@ -99,11 +99,12 @@ class Config:
     auto_model_routing_classification: dict[str, str] = dataclasses.field(
         default_factory=lambda: dict(_DEFAULT_CLASSIFICATION)
     )
-    auto_model_routing_long: str = 'opus[1m]'
+    auto_model_routing_long: str = 'off'
     auto_model_routing_confidence_bump: bool = False
     auto_model_routing_min_confidence: float = 0.0
     auto_model_routing_mode: str = 'classifier'
     auto_model_routing_task_tiers: dict[str, str] | None = None
+    lock_requested_model: str = 'claude-sonnet-4-6'      # Model baseline lock for routing; 'off' disables
     sse_keepalive_interval: float = 10.0
     db_path: str | None = None   # Path to SQLite DB file; None disables DB recording
     enable_ui: bool = False       # Whether /admin/* and /ui/* endpoints are active
@@ -251,10 +252,9 @@ def parse_args(argv=None) -> Config:
     p.add_argument(
         '--auto-model-routing-long',
         dest='auto_model_routing_long',
-        default=os.environ.get('ANTHPROXY_AUTO_MODEL_ROUTING_LONG', 'opus[1m]'),
+        default=os.environ.get('ANTHPROXY_AUTO_MODEL_ROUTING_LONG', 'off'),
         help='Model forced by the long-context size floor under --auto-model-routing '
-             '(default: opus[1m]). Pass "off" to disable the floor entirely '
-             'regardless of --auto-model-routing-long-context-threshold. '
+             '(default: off). Pass "opus[1m]" or other model to enable the floor. '
              '(env: ANTHPROXY_AUTO_MODEL_ROUTING_LONG)',
     )
     p.add_argument('--auto-model-routing-confidence-bump',
@@ -297,6 +297,13 @@ def parse_args(argv=None) -> Config:
              'Unknown task names fail-closed to the requested model. '
              '(env: ANTHPROXY_AUTO_MODEL_ROUTING_TASK_TIERS)',
     )
+    p.add_argument('--lock-requested-model', dest='lock_requested_model',
+                   default=os.environ.get('ANTHPROXY_LOCK_REQUESTED_MODEL', 'off'),
+                   help='Override the incoming request model with a fixed baseline before'
+                        ' auto-routing fires. The classifier still runs and routes relative'
+                        ' to this baseline (trivial→haiku, deep→opus). "off" disables the'
+                        ' lock and passes the client\'s model through unchanged (default: off,'
+                        ' env: ANTHPROXY_LOCK_REQUESTED_MODEL)')
     p.add_argument('--sse-keepalive-interval', dest='sse_keepalive_interval', type=float,
                    default=float(os.environ.get('ANTHPROXY_SSE_KEEPALIVE_INTERVAL', '10.0')),
                    help='Seconds between SSE keepalive comment lines (": keepalive\\n\\n") sent to'
@@ -344,6 +351,9 @@ def parse_args(argv=None) -> Config:
             p.error(f'--auto-model-routing-task-tiers: invalid JSON: {exc}')
     else:
         args.auto_model_routing_task_tiers = None
+
+    # Normalise lock_requested_model
+    args.lock_requested_model = (args.lock_requested_model or '').strip() or 'off'
 
     # Validate classifier model
     cfg = Config(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Config)})
