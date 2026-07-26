@@ -68,6 +68,7 @@ def _config(routing=True, classifier_model='haiku', long_context_threshold=190_0
     cfg.auto_model_routing_min_confidence = 0.0
     cfg.auto_model_routing_mode = 'classifier'
     cfg.auto_model_routing_task_tiers = None
+    cfg.lock_requested_model = 'off'
     return cfg
 
 

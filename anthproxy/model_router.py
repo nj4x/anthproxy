@@ -1157,6 +1157,12 @@ def route_model(
 
     raw_model = payload.get('model')
 
+    # Apply baseline_model lock at input: substitute the client's model with the
+    # locked baseline so all downstream paths (classifier, routing summary, cache)
+    # see a consistent input. Preserve the original in 'requested' for response echo.
+    if baseline_model:
+        payload['model'] = baseline_model
+
     if not config.auto_model_routing:
         return ModelRoutingDecision(
             requested_model=str(raw_model) if isinstance(raw_model, str) else repr(raw_model),
