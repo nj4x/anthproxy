@@ -29,18 +29,29 @@ function resetSecs(w: UsageWindow): number | null {
 
 function formatResetDateTime(resetAt: string, includeMinutes: boolean): string {
   const date = new Date(resetAt);
-  const weekday = date.toLocaleDateString('en-US', { weekday: 'short' });
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
   const hour = date.getHours();
   const minute = date.getMinutes();
   const isPm = hour >= 12;
   const displayHour = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
   const meridiem = isPm ? 'p.m.' : 'a.m.';
 
+  let timeStr: string;
   if (includeMinutes) {
     const paddedMinute = String(minute).padStart(2, '0');
-    return `${weekday}, ${displayHour}:${paddedMinute} ${meridiem}`;
+    timeStr = `${displayHour}:${paddedMinute} ${meridiem}`;
+  } else {
+    timeStr = `${displayHour} ${meridiem}`;
   }
-  return `${weekday}, ${displayHour} ${meridiem}`;
+
+  if (sameDay) return timeStr;
+  const weekday = date.toLocaleDateString('en-US', { weekday: 'short' });
+  return `${weekday}, ${timeStr}`;
 }
 
 function formatCountdown(w: UsageWindow, format: 'hm' | 'dhm'): string {
