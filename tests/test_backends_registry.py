@@ -266,7 +266,7 @@ class TestDiscovery:
         backends_registry.discover_backends()  # must not raise
         assert get_backend('incomplete') is None
 
-    def test_import_failure_raises(self, discovery_isolation):
+    def test_import_failure_raises(self, discovery_isolation, monkeypatch):
         write = discovery_isolation
         write(
             'badimport',
@@ -276,6 +276,7 @@ class TestDiscovery:
         orig = backends_registry._DECLARED_ORDER
         for name in orig:
             backends_registry._BACKENDS.setdefault(name, object)  # type: ignore[assignment]
+        monkeypatch.setattr(backends_registry, '_DECLARED_ORDER', orig)
         with pytest.raises(BackendDiscoveryError, match='Failed to import'):
             backends_registry.discover_backends()
 
@@ -288,7 +289,7 @@ class TestDiscovery:
         with pytest.raises(BackendDiscoveryError, match='imported but did not register'):
             backends_registry.discover_backends()
 
-    def test_fail_fast_on_second_package(self, discovery_isolation):
+    def test_fail_fast_on_second_package(self, discovery_isolation, monkeypatch):
         write = discovery_isolation
         write(
             'aagood',
@@ -308,28 +309,24 @@ class TestDiscovery:
         write('zzfail', init_body='raise RuntimeError("oops")', backend_body='')
 
         orig = backends_registry._DECLARED_ORDER
-        backends_registry._DECLARED_ORDER = orig + ('aagood',)
+        monkeypatch.setattr(backends_registry, '_DECLARED_ORDER', orig + ('aagood',))
         for name in orig:
             backends_registry._BACKENDS.setdefault(name, object)  # type: ignore[assignment]
-        try:
-            with pytest.raises(BackendDiscoveryError, match='Failed to import'):
-                backends_registry.discover_backends()
-            # 'aagood' was imported and registered before the failure
-            assert get_backend('aagood') is not None
-        finally:
-            backends_registry._DECLARED_ORDER = orig
+        with pytest.raises(BackendDiscoveryError, match='Failed to import'):
+            backends_registry.discover_backends()
+        # 'aagood' was imported and registered before the failure
+        assert get_backend('aagood') is not None
 
-    def test_missing_declared_builtin_fails(self, discovery_isolation):
+    def test_missing_declared_builtin_fails(self, discovery_isolation, monkeypatch):
         """Built-in completeness check fires when a declared backend isn't registered."""
         orig = backends_registry._DECLARED_ORDER
-        backends_registry._DECLARED_ORDER = orig + ('missingbuiltin',)
+        monkeypatch.setattr(
+            backends_registry, '_DECLARED_ORDER', orig + ('missingbuiltin',)
+        )
         for name in orig:
             backends_registry._BACKENDS.setdefault(name, object)  # type: ignore[assignment]
-        try:
-            with pytest.raises(BackendDiscoveryError, match="'missingbuiltin'.*not registered"):
-                backends_registry.discover_backends()
-        finally:
-            backends_registry._DECLARED_ORDER = orig
+        with pytest.raises(BackendDiscoveryError, match="'missingbuiltin'.*not registered"):
+            backends_registry.discover_backends()
 
     def test_repeat_discovery_is_harmless(self, monkeypatch):
         """Second discover_backends() call against intact registry must not raise."""
@@ -700,6 +697,7 @@ class TestHookContract:
             with caplog.at_level(logging.WARNING, logger='anthproxy.model_config'):
                 result = model_config.model_aliases('raiser')
         assert result == {}
+        assert any('model_aliases' in r.message for r in caplog.records)
 
     def test_model_aliases_non_dict_fails_discovery(self, discovery_isolation):
         write = discovery_isolation

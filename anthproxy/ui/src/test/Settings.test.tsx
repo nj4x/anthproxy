@@ -52,7 +52,11 @@ describe('Settings backend dropdown', () => {
     const select = await screen.findByRole('combobox');
     const options = Array.from(select.querySelectorAll('option')).map((o) => o.textContent);
 
-    // modes must come first
+    // modes must be present
+    expect(options).toContain('auto');
+    expect(options).toContain('subscription');
+
+    // modes must come before known backends
     expect(options.indexOf('auto')).toBeLessThan(options.indexOf('anthropic'));
     expect(options.indexOf('subscription')).toBeLessThan(options.indexOf('anthropic'));
 

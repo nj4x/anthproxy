@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from .backends_registry import backend_names as _backend_names
+from .constants import VALID_BACKEND_MODES
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -181,7 +182,7 @@ def parse_args(argv=None) -> Config:
                         ' --no-auto-backend to disable, env: ANTHPROXY_AUTO_BACKEND=0)')
     p.add_argument('--auto-backend-mode', dest='auto_backend_mode',
                    default=os.environ.get('ANTHPROXY_AUTO_BACKEND_MODE', 'subscription'),
-                   choices=['auto', 'subscription'],
+                   choices=list(VALID_BACKEND_MODES),
                    help='Initial auto-selection routing mode at startup: "subscription" restricts'
                         ' selection to subscription backends (anthropic, codex, openrouter) and never falls'
                         ' back to bedrock; "auto" allows bedrock as a fallback. Overridable at'

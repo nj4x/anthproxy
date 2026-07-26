@@ -136,8 +136,9 @@ def _parse_stats_selector(raw: str) -> tuple[str, str | None]:
     """
     backend: str | None = None
     leftover: list[str] = []
+    filters = _stats_backend_filters()
     for part in (raw.split(':') if raw else []):
-        if backend is None and part in _stats_backend_filters():
+        if backend is None and part in filters:
             backend = part
         else:
             leftover.append(part)
