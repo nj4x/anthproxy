@@ -27,21 +27,48 @@ function resetSecs(w: UsageWindow): number | null {
   return secs == null || secs < 0 ? null : secs;
 }
 
+function formatResetDateTime(resetAt: string, includeMinutes: boolean): string {
+  const date = new Date(resetAt);
+  const weekday = date.toLocaleDateString('en-US', { weekday: 'short' });
+  const hour = date.getHours();
+  const minute = date.getMinutes();
+  const isPm = hour >= 12;
+  const displayHour = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+  const meridiem = isPm ? 'p.m.' : 'a.m.';
+
+  if (includeMinutes) {
+    const paddedMinute = String(minute).padStart(2, '0');
+    return `${weekday}, ${displayHour}:${paddedMinute} ${meridiem}`;
+  }
+  return `${weekday}, ${displayHour} ${meridiem}`;
+}
+
 function formatCountdown(w: UsageWindow, format: 'hm' | 'dhm'): string {
   const secs = resetSecs(w);
   if (secs == null) return 'soon';
+
+  let countdownStr = '';
   if (format === 'dhm') {
     const d = Math.floor(secs / 86400);
     const h = Math.floor((secs % 86400) / 3600);
-    if (d > 0) return `reset in ${d}d ${h}h`;
+    if (d > 0) countdownStr = `reset in ${d}d ${h}h`;
+    else {
+      const m = Math.floor((secs % 3600) / 60);
+      if (h > 0) countdownStr = `reset in ${h}h ${m}m`;
+      else countdownStr = `reset in ${m}m`;
+    }
+  } else {
+    const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
-    if (h > 0) return `reset in ${h}h ${m}m`;
-    return `reset in ${m}m`;
+    if (h > 0) countdownStr = `reset in ${h}h ${m}m`;
+    else countdownStr = `reset in ${m}m`;
   }
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  if (h > 0) return `reset in ${h}h ${m}m`;
-  return `reset in ${m}m`;
+
+  if (w.reset_at != null) {
+    const exactTime = formatResetDateTime(w.reset_at, format === 'hm');
+    return `${countdownStr} (${exactTime})`;
+  }
+  return countdownStr;
 }
 
 function UsageSection({ title, window: w, format, windowHours }: {
