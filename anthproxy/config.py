@@ -298,11 +298,11 @@ def parse_args(argv=None) -> Config:
              '(env: ANTHPROXY_AUTO_MODEL_ROUTING_TASK_TIERS)',
     )
     p.add_argument('--lock-requested-model', dest='lock_requested_model',
-                   default=os.environ.get('ANTHPROXY_LOCK_REQUESTED_MODEL', 'off'),
+                   default=os.environ.get('ANTHPROXY_LOCK_REQUESTED_MODEL', 'claude-sonnet-4-6'),
                    help='Override the incoming request model with a fixed baseline before'
                         ' auto-routing fires. The classifier still runs and routes relative'
                         ' to this baseline (trivial→haiku, deep→opus). "off" disables the'
-                        ' lock and passes the client\'s model through unchanged (default: off,'
+                        ' lock and passes the client\'s model through unchanged (default: claude-sonnet-4-6,'
                         ' env: ANTHPROXY_LOCK_REQUESTED_MODEL)')
     p.add_argument('--sse-keepalive-interval', dest='sse_keepalive_interval', type=float,
                    default=float(os.environ.get('ANTHPROXY_SSE_KEEPALIVE_INTERVAL', '10.0')),
