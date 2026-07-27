@@ -75,6 +75,13 @@ def _config(
     cfg.auto_model_routing_mode = 'classifier'
     cfg.auto_model_routing_task_tiers = None
     cfg.auto_model_routing_prior_response_summary_limit = 1000
+    # ADR 0010/0012: weighted blend config — concrete values so comparisons work.
+    cfg.auto_model_routing_system_prompt_weight = 0.30
+    cfg.auto_model_routing_user_prompt_weight = 0.70
+    cfg.auto_model_routing_trivial_threshold = 0.75
+    cfg.auto_model_routing_standard_threshold = 1.50
+    cfg.auto_model_routing_system_prompt_cache_size = 256
+    cfg.auto_model_routing_system_prompt_preview_limit = 500
     return cfg
 
 

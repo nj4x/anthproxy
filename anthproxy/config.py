@@ -105,6 +105,12 @@ class Config:
     auto_model_routing_mode: str = 'classifier'
     auto_model_routing_task_tiers: dict[str, str] | None = None
     auto_model_routing_prior_response_summary_limit: int = 1000
+    auto_model_routing_system_prompt_weight: float = 0.30
+    auto_model_routing_user_prompt_weight: float = 0.70
+    auto_model_routing_trivial_threshold: float = 0.75
+    auto_model_routing_standard_threshold: float = 1.50
+    auto_model_routing_system_prompt_cache_size: int = 256
+    auto_model_routing_system_prompt_preview_limit: int = 500
     lock_requested_model: str = 'claude-sonnet-4-6'      # Model baseline lock for routing; 'off' disables
     sse_keepalive_interval: float = 10.0
     db_path: str | None = None   # Path to SQLite DB file; None disables DB recording
@@ -308,6 +314,61 @@ def parse_args(argv=None) -> Config:
              'Valid range: [50, 32000]. '
              '(default: 1000, env: ANTHPROXY_AUTO_MODEL_ROUTING_PRIOR_RESPONSE_SUMMARY_LIMIT)',
     )
+    p.add_argument(
+        '--auto-model-routing-system-prompt-weight',
+        dest='auto_model_routing_system_prompt_weight', type=float,
+        default=float(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_WEIGHT', '0.30')),
+        help='Weight applied to the system-prompt tier score in the weighted blend '
+             '(must sum to 1.0 with --auto-model-routing-user-prompt-weight; both > 0). '
+             '(default: 0.30, env: ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_WEIGHT)',
+    )
+    p.add_argument(
+        '--auto-model-routing-user-prompt-weight',
+        dest='auto_model_routing_user_prompt_weight', type=float,
+        default=float(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_USER_PROMPT_WEIGHT', '0.70')),
+        help='Weight applied to the user-prompt tier score in the weighted blend '
+             '(must sum to 1.0 with --auto-model-routing-system-prompt-weight; both > 0). '
+             '(default: 0.70, env: ANTHPROXY_AUTO_MODEL_ROUTING_USER_PROMPT_WEIGHT)',
+    )
+    p.add_argument(
+        '--auto-model-routing-trivial-threshold',
+        dest='auto_model_routing_trivial_threshold', type=float,
+        default=float(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD', '0.75')),
+        help='Weighted-score threshold below which the blended tier is "trivial". '
+             'Must be strictly less than --auto-model-routing-standard-threshold. '
+             '(default: 0.75, env: ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD)',
+    )
+    p.add_argument(
+        '--auto-model-routing-standard-threshold',
+        dest='auto_model_routing_standard_threshold', type=float,
+        default=float(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD', '1.50')),
+        help='Weighted-score threshold at/above which the blended tier is "deep"; '
+             'between trivial_threshold and this value is "standard". '
+             'Must be strictly greater than --auto-model-routing-trivial-threshold. '
+             '(default: 1.50, env: ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD)',
+    )
+    p.add_argument(
+        '--auto-model-routing-system-prompt-cache-size',
+        dest='auto_model_routing_system_prompt_cache_size', type=int,
+        default=int(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_CACHE_SIZE', '256')),
+        help='Maximum number of system-prompt SHA256 → tier-score entries in the '
+             'in-memory LRU cache (evicts oldest on overflow). Must be >= 1. '
+             '(default: 256, env: ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_CACHE_SIZE)',
+    )
+    p.add_argument(
+        '--auto-model-routing-system-prompt-preview-limit',
+        dest='auto_model_routing_system_prompt_preview_limit', type=int,
+        default=int(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_PREVIEW_LIMIT', '500')),
+        help='Maximum characters of the system prompt sent to the system-prompt '
+             'classifier (head-capped). Must be >= 1. '
+             '(default: 500, env: ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_PREVIEW_LIMIT)',
+    )
     p.add_argument('--lock-requested-model', dest='lock_requested_model',
                    default=os.environ.get('ANTHPROXY_LOCK_REQUESTED_MODEL', 'claude-sonnet-4-6'),
                    help='Override the incoming request model with a fixed baseline before'
@@ -381,6 +442,39 @@ def parse_args(argv=None) -> Config:
         raise ValueError(
             f'auto_model_routing_prior_response_summary_limit must be in [50, 32000], '
             f'got {prior_limit}'
+        )
+    # Weighted blend validation (ADR 0010)
+    sys_w = cfg.auto_model_routing_system_prompt_weight
+    usr_w = cfg.auto_model_routing_user_prompt_weight
+    if abs(sys_w + usr_w - 1.0) >= 1e-9:
+        raise ValueError(
+            f'auto_model_routing_system_prompt_weight + auto_model_routing_user_prompt_weight '
+            f'must equal 1.0, got {sys_w} + {usr_w} = {sys_w + usr_w}'
+        )
+    if sys_w <= 0:
+        raise ValueError(
+            f'auto_model_routing_system_prompt_weight must be > 0, got {sys_w}'
+        )
+    if usr_w <= 0:
+        raise ValueError(
+            f'auto_model_routing_user_prompt_weight must be > 0, got {usr_w}'
+        )
+    trivial_t = cfg.auto_model_routing_trivial_threshold
+    standard_t = cfg.auto_model_routing_standard_threshold
+    if trivial_t >= standard_t:
+        raise ValueError(
+            f'auto_model_routing_trivial_threshold must be < auto_model_routing_standard_threshold, '
+            f'got {trivial_t} >= {standard_t}'
+        )
+    if cfg.auto_model_routing_system_prompt_cache_size < 1:
+        raise ValueError(
+            f'auto_model_routing_system_prompt_cache_size must be >= 1, '
+            f'got {cfg.auto_model_routing_system_prompt_cache_size}'
+        )
+    if cfg.auto_model_routing_system_prompt_preview_limit < 1:
+        raise ValueError(
+            f'auto_model_routing_system_prompt_preview_limit must be >= 1, '
+            f'got {cfg.auto_model_routing_system_prompt_preview_limit}'
         )
     # Default db_path when enable_ui is set and no explicit path was given
     if cfg.enable_ui and cfg.db_path is None:

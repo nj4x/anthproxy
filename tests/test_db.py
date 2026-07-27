@@ -2814,3 +2814,108 @@ class TestBusySecsWindow:
         finally:
             db.close()
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011: Schema migration and record_request for weighted-blend columns
+# ---------------------------------------------------------------------------
+
+class TestWeightedBlendMigration:
+    """_apply_migration_7 adds 5 new columns; record_request stores them."""
+
+    def test_schema_version_is_8(self):
+        assert _SCHEMA_VERSION == 8
+
+    def test_migration_7_adds_columns(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            # Apply migrations 0–6 so we land at v7, then apply migration 7.
+            from anthproxy.db import _apply_migration_7
+            for i in range(7):
+                from anthproxy.db import _MIGRATIONS
+                with conn:
+                    _MIGRATIONS[i](conn)
+                    conn.execute(f"PRAGMA user_version = {i + 1};")
+            with conn:
+                _apply_migration_7(conn)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+            assert 'system_prompt_tier' in cols
+            assert 'system_prompt_score' in cols
+            assert 'user_prompt_score' in cols
+            assert 'routing_weighted_score' in cols
+            assert 'system_prompt_classification_failed' in cols
+            conn.close()
+        finally:
+            os.unlink(path)
+
+    def test_record_request_stores_blend_fields(self):
+        db, path = _make_db()
+        try:
+            decision = _make_decision()
+            row_id = db.record_request(
+                session_id='sess-blend',
+                conversation_anchor=None,
+                routing_decision=decision,
+                stats_dict=dict(_DEFAULT_STATS),
+                duration_ms=100,
+                backend='anthropic',
+                status='success',
+                system_prompt_tier='trivial',
+                system_prompt_score=0.0,
+                user_prompt_score=2.0,
+                routing_weighted_score=1.40,
+                system_prompt_classification_failed=False,
+            )
+            row = db.get_request(row_id)
+            assert row is not None
+            assert row['system_prompt_tier'] == 'trivial'
+            assert row['system_prompt_score'] == pytest.approx(0.0)
+            assert row['user_prompt_score'] == pytest.approx(2.0)
+            assert row['routing_weighted_score'] == pytest.approx(1.40)
+            assert row['system_prompt_classification_failed'] == 0
+        finally:
+            db.close()
+            os.unlink(path)
+
+    def test_record_request_blend_fields_default_null(self):
+        db, path = _make_db()
+        try:
+            row_id = _insert(db)
+            row = db.get_request(row_id)
+            assert row is not None
+            assert row['system_prompt_tier'] is None
+            assert row['system_prompt_score'] is None
+            assert row['user_prompt_score'] is None
+            assert row['routing_weighted_score'] is None
+            assert row['system_prompt_classification_failed'] == 0
+        finally:
+            db.close()
+            os.unlink(path)
+
+    def test_record_request_classification_failed_stored_as_int(self):
+        db, path = _make_db()
+        try:
+            decision = _make_decision()
+            row_id = db.record_request(
+                session_id='sess-blend-fail',
+                conversation_anchor=None,
+                routing_decision=decision,
+                stats_dict=dict(_DEFAULT_STATS),
+                duration_ms=100,
+                backend='anthropic',
+                status='success',
+                system_prompt_tier='standard',
+                system_prompt_score=1.0,
+                user_prompt_score=1.0,
+                routing_weighted_score=1.0,
+                system_prompt_classification_failed=True,
+            )
+            row = db.get_request(row_id)
+            assert row is not None
+            assert row['system_prompt_classification_failed'] == 1
+        finally:
+            db.close()
+            os.unlink(path)

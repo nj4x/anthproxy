@@ -1623,6 +1623,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             classifier_confidence = getattr(_routing, 'classifier_confidence', None)
             classifier_format = getattr(_routing, 'classifier_format', None)
 
+            # 7. ADR 0010/0011: weighted blend fields from ModelRoutingDecision.
+            system_prompt_tier = getattr(_routing, 'system_prompt_tier', None)
+            system_prompt_score = getattr(_routing, 'system_prompt_score', None)
+            user_prompt_score = getattr(_routing, 'user_prompt_score', None)
+            routing_weighted_score = getattr(_routing, 'routing_weighted_score', None)
+            system_prompt_classification_failed = getattr(
+                _routing, 'system_prompt_classification_failed', False
+            )
+
             return {
                 'user_prompt_text': user_prompt_text,
                 'system_prompt_sha256': system_prompt_sha256,
@@ -1634,6 +1643,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 'classifier_raw_response': classifier_raw_response,
                 'classifier_confidence': classifier_confidence,
                 'classifier_format': classifier_format,
+                'system_prompt_tier': system_prompt_tier,
+                'system_prompt_score': system_prompt_score,
+                'user_prompt_score': user_prompt_score,
+                'routing_weighted_score': routing_weighted_score,
+                'system_prompt_classification_failed': system_prompt_classification_failed,
             }
         except Exception:
             logger.warning('%s prompt capture extraction failed', self._log_tag(), exc_info=True)

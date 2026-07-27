@@ -1,6 +1,6 @@
 """SQLite persistence layer for the anthproxy web UI.
 
-Schema version: 7
+Schema version: 8
 Thread safety: threading.Lock() for all writes; WAL mode for concurrent reads.
 Migrations: PRAGMA user_version tracks applied schema version (no Alembic).
 """
@@ -18,7 +18,7 @@ from .stats import MODEL_PRICING, _classify_model
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +281,18 @@ ALTER TABLE sessions_v7 RENAME TO sessions;
             raise RuntimeError(f'FK check failed after migration 6: {orphans}')
 
 
+def _apply_migration_7(conn: sqlite3.Connection) -> None:
+    """Add 5 weighted-blend columns to requests (v7 → v8, ADR 0010/0011)."""
+    conn.execute("ALTER TABLE requests ADD COLUMN system_prompt_tier TEXT")
+    conn.execute("ALTER TABLE requests ADD COLUMN system_prompt_score REAL")
+    conn.execute("ALTER TABLE requests ADD COLUMN user_prompt_score REAL")
+    conn.execute("ALTER TABLE requests ADD COLUMN routing_weighted_score REAL")
+    conn.execute(
+        "ALTER TABLE requests ADD COLUMN system_prompt_classification_failed "
+        "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
 _MIGRATIONS: dict[int, object] = {
     0: _apply_migration_0,
     1: _apply_migration_1,
@@ -289,6 +301,7 @@ _MIGRATIONS: dict[int, object] = {
     4: _apply_migration_4,
     5: _apply_migration_5,
     6: _apply_migration_6,
+    7: _apply_migration_7,
 }
 
 
@@ -427,6 +440,12 @@ class SessionDB:
         classifier_format: str | None = None,
         prompt_store_entries: dict[str, tuple[str, str]] | None = None,
         response_text: str | None = None,
+        # ADR 0010/0011: weighted blend columns
+        system_prompt_tier: str | None = None,
+        system_prompt_score: float | None = None,
+        user_prompt_score: float | None = None,
+        routing_weighted_score: float | None = None,
+        system_prompt_classification_failed: bool = False,
     ) -> int:
         """Insert one request row and upsert the owning session row.
 
@@ -485,10 +504,13 @@ class SessionDB:
                         classifier_summary_json, classifier_raw_response,
                         classifier_confidence, classifier_format, cache_savings_usd,
                         parent_conversation_anchor, response_text,
-                        user_prompt_search, response_search
+                        user_prompt_search, response_search,
+                        system_prompt_tier, system_prompt_score, user_prompt_score,
+                        routing_weighted_score, system_prompt_classification_failed
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -525,6 +547,11 @@ class SessionDB:
                         response_text,
                         user_prompt_search,
                         response_search,
+                        system_prompt_tier,
+                        system_prompt_score,
+                        user_prompt_score,
+                        routing_weighted_score,
+                        1 if system_prompt_classification_failed else 0,
                     ),
                 )
                 rowid: int = cur.lastrowid  # type: ignore[assignment]

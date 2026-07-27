@@ -66,6 +66,13 @@ def _fake_snapshot(name, backend, session_pinned=False, session_subscription=Fal
     snapshot.config.auto_model_routing_mode = 'classifier'
     snapshot.config.lock_requested_model = 'off'
     snapshot.config.auto_model_routing_prior_response_summary_limit = 1000
+    # ADR 0010/0012: weighted blend config — concrete values so comparisons work.
+    snapshot.config.auto_model_routing_system_prompt_weight = 0.30
+    snapshot.config.auto_model_routing_user_prompt_weight = 0.70
+    snapshot.config.auto_model_routing_trivial_threshold = 0.75
+    snapshot.config.auto_model_routing_standard_threshold = 1.50
+    snapshot.config.auto_model_routing_system_prompt_cache_size = 256
+    snapshot.config.auto_model_routing_system_prompt_preview_limit = 500
     snapshot.session_pinned = session_pinned
     snapshot.session_subscription = session_subscription
     return snapshot

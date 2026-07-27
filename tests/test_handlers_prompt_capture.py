@@ -275,6 +275,55 @@ class TestExtractPromptCaptureClassifierFields:
         assert result['classifier_confidence'] == 0.95
         assert result['classifier_format'] == 'json'
 
+    def test_blend_fields_from_routing_decision(self):
+        """5 ADR 0010/0011 blend fields pass through from ModelRoutingDecision."""
+        routing = _decision(
+            classification='standard',
+            applied=True,
+            reason_code='classifier_standard',
+            system_prompt_tier='trivial',
+            system_prompt_score=0.0,
+            user_prompt_score=1.0,
+            routing_weighted_score=0.70,
+            system_prompt_classification_failed=False,
+        )
+        handler = _make_handler(routing=routing)
+        payload = {'model': 'sonnet', 'messages': [{'role': 'user', 'content': 'hi'}]}
+        result = handler._extract_prompt_capture(payload)
+        assert result['system_prompt_tier'] == 'trivial'
+        assert result['system_prompt_score'] == 0.0
+        assert result['user_prompt_score'] == 1.0
+        assert result['routing_weighted_score'] == 0.70
+        assert result['system_prompt_classification_failed'] is False
+
+    def test_blend_fields_defaults_when_no_routing(self):
+        """Blend fields are None / False when routing=None."""
+        handler = _make_handler(routing=None)
+        payload = {'model': 'sonnet', 'messages': [{'role': 'user', 'content': 'hi'}]}
+        result = handler._extract_prompt_capture(payload)
+        assert result['system_prompt_tier'] is None
+        assert result['system_prompt_score'] is None
+        assert result['user_prompt_score'] is None
+        assert result['routing_weighted_score'] is None
+        assert result['system_prompt_classification_failed'] is False
+
+    def test_blend_classification_failed_true(self):
+        """system_prompt_classification_failed=True passes through correctly."""
+        routing = _decision(
+            classification='standard',
+            applied=False,
+            reason_code='classifier_standard',
+            system_prompt_tier='standard',
+            system_prompt_score=1.0,
+            user_prompt_score=1.0,
+            routing_weighted_score=1.0,
+            system_prompt_classification_failed=True,
+        )
+        handler = _make_handler(routing=routing)
+        payload = {'model': 'sonnet', 'messages': [{'role': 'user', 'content': 'hi'}]}
+        result = handler._extract_prompt_capture(payload)
+        assert result['system_prompt_classification_failed'] is True
+
 
 # ---------------------------------------------------------------------------
 # _extract_prompt_capture — routing_recovered_via_walkback

@@ -44,10 +44,12 @@ recursive classification.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -164,6 +166,49 @@ _WALKBACK_TAIL_LIMIT = _TRANSCRIPT_FALLBACK_LIMIT
 # Maximum final-user text length echoed into the INFO classification log line.
 _LOG_PROMPT_LIMIT = 200
 
+
+# Numeric tier scores for the weighted blend (ADR 0010).
+# Maps the three classifier labels to scalar scores; missing labels get 1.0 (standard).
+_LABEL_SCORES: dict[str, float] = {'trivial': 0.0, 'standard': 1.0, 'deep': 2.0}
+
+# Specialized system prompt for system-prompt tier inference (ADR 0012).
+# Distinct from _CLASSIFIER_SYSTEM (which classifies user prompts) — teaches the
+# classifier to judge role complexity, not task complexity.
+_CLASSIFIER_SYSTEM_PROMPT_TIER = (
+    'You are a one-word complexity classifier for AI agent system prompts. '
+    'Read the system prompt preview and reply with EXACTLY one of these three labels and nothing else:\n'
+    '\n'
+    'trivial  — a narrow specialist role with low cognitive complexity: file browsing, '
+    'simple retrieval, formatting, mechanical data tasks, or any role that mostly reads '
+    'and summarises with minimal reasoning.\n'
+    '\n'
+    'standard — a general-purpose assistant, software engineer, or analyst role that '
+    'handles a mix of coding, explanation, debugging, and planning tasks.\n'
+    '\n'
+    'deep     — a research architect, system designer, or expert-level specialist role '
+    'that implies complex reasoning, architectural decisions, multi-domain synthesis, '
+    'or security-sensitive work.\n'
+    '\n'
+    'Judge complexity from the ROLE implied by the system prompt, not from any specific '
+    'user task. A "file search specialist" is trivial by role even for a hard task; '
+    'a "research architect" is deep by role even for a simple task.\n'
+    '\n'
+    'Examples:\n'
+    '"You are a file search and retrieval assistant." → trivial\n'
+    '"You are a helpful assistant." → standard\n'
+    '"You are Claude, an AI assistant." → standard\n'
+    '"You are a senior software engineer helping with code review." → standard\n'
+    '"You are a security researcher and penetration testing expert." → deep\n'
+    '"You are a research architect responsible for designing distributed systems." → deep\n'
+    '\n'
+    'Reply with ONLY the single label word. No punctuation, no explanation.'
+)
+
+# Module-level LRU cache: system_prompt_sha256 → (tier_label, score_float).
+# Thread-safe: _sys_prompt_cache_lock is held only for short dict operations,
+# never across classifier network calls (satisfies concurrency.md invariant).
+_sys_prompt_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+_sys_prompt_cache_lock = threading.Lock()
 
 # In-flight sentinel for concurrent affirmation mitigation.  When two
 # simultaneous affirmation turns on the same session both read an empty cache,
@@ -363,6 +408,18 @@ class ModelRoutingDecision:
     # The handler writes this (not routed_model) to the tier cache so subsequent
     # turns can apply their own cap.  None on all other paths.
     cache_tier: str | None = None
+    # ADR 0010/0011: weighted system-prompt + user-prompt blend fields.
+    # All four numeric fields are None when routing is disabled, when a cached
+    # tier is inherited (affirmation_inherited path), or when the blend is not
+    # applied (rules/tag mode, size floor, early returns).
+    # system_prompt_classification_failed is True only when classification was
+    # attempted and failed; False in all other cases (success, no-system-prompt,
+    # disabled, cached).
+    system_prompt_tier: str | None = None
+    system_prompt_score: float | None = None
+    user_prompt_score: float | None = None
+    routing_weighted_score: float | None = None
+    system_prompt_classification_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -388,6 +445,11 @@ class RoutingSummary:
     # and recovered_via_walkback are excluded from to_classifier_json(): both are
     # routing-internal signals, not classifier complexity signals.
     is_short_affirmation: bool = False
+    # SHA-256 of payload['system'] (or None when absent); used as the LRU cache
+    # key for system-prompt tier classification (ADR 0010/0012).  Not a prompt
+    # content field — just a stable hash for cache lookup and audit queries.
+    # Excluded from to_classifier_json() (never sent to the user-prompt classifier).
+    system_prompt_sha256: str | None = None
 
     def to_classifier_json(self, prior_response_summary: str | None = None) -> str:
         d: dict = {
@@ -643,6 +705,22 @@ def build_routing_summary(payload: dict) -> RoutingSummary | None:
             + final_user_text[-tail_len:]
         )
 
+    # Compute system prompt SHA256 for the LRU cache key (ADR 0010).
+    # Uses same serialization as handlers.py _extract_prompt_capture() for consistency.
+    # The SHA is a cache key — not prompt content — so it does not violate the
+    # classifier-input privacy contract.
+    system_prompt_sha256: str | None = None
+    system = payload.get('system')
+    if system:
+        try:
+            if isinstance(system, str):
+                sha_bytes = system.encode('utf-8')
+            else:
+                sha_bytes = json.dumps(system, sort_keys=True, ensure_ascii=False).encode('utf-8')
+            system_prompt_sha256 = hashlib.sha256(sha_bytes).hexdigest()
+        except Exception:
+            pass  # fail-open: leave as None
+
     return RoutingSummary(
         final_user_text=final_user_text,
         text_truncated=truncated,
@@ -658,6 +736,7 @@ def build_routing_summary(payload: dict) -> RoutingSummary | None:
         is_short_affirmation=(
             text_from_final_message_directly and is_short_affirmation(final_user_text)
         ),
+        system_prompt_sha256=system_prompt_sha256,
     )
 
 
@@ -711,6 +790,173 @@ def _extract_prior_response_summary(
         if text:
             return _truncate_prior_response(text, limit)
     return None
+
+
+# ---------------------------------------------------------------------------
+# System-prompt tier classification helpers (ADR 0010 / ADR 0012)
+# ---------------------------------------------------------------------------
+
+def _extract_system_prompt_preview(payload: dict, limit: int) -> str:
+    """Extract and head-cap system prompt text for the system-prompt classifier.
+
+    Returns empty string when no system prompt is present or text is empty.
+    ADR 0012: if system is a str, use directly; if a list, collect 'text' blocks
+    (with isinstance(dict) guard), concatenate with '\\n', then head-cap to limit.
+    """
+    system = payload.get('system')
+    if not system:
+        return ''
+    if isinstance(system, str):
+        return system[:limit]
+    if isinstance(system, list):
+        parts: list[str] = []
+        for element in system:
+            if not isinstance(element, dict):
+                continue
+            if element.get('type') == 'text':
+                text = element.get('text', '')
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return '\n'.join(parts)[:limit]
+    return ''
+
+
+def build_system_prompt_classifier_payload(system_preview: str, config: 'Config') -> dict:
+    """Build a classifier payload for system-prompt role-complexity inference.
+
+    Uses _CLASSIFIER_SYSTEM_PROMPT_TIER (role-focused prompt, not task-focused)
+    and the standard one-word response format.  The same configured classifier
+    model is reused; no separate model config.
+    """
+    return {
+        _SENTINEL_KEY: True,
+        'model': config.auto_model_routing_classifier_model,
+        'max_tokens': _CLASSIFIER_MAX_TOKENS,
+        'temperature': _CLASSIFIER_TEMPERATURE,
+        'system': _CLASSIFIER_SYSTEM_PROMPT_TIER,
+        'messages': [
+            {
+                'role': 'user',
+                'content': system_preview,
+            }
+        ],
+    }
+
+
+def _classify_system_prompt(
+    system_preview: str,
+    system_prompt_sha256: str | None,
+    cache_size: int,
+    config: 'Config',
+    snapshot,
+    credentials: dict,
+    log_tag: str,
+) -> tuple[str, float, bool]:
+    """Return (tier_label, score, classification_failed) for a system prompt.
+
+    Cache hit path: reads from _sys_prompt_cache under a short lock, returns cached result.
+    Cache miss path: calls the system-prompt classifier, writes to cache on success only.
+    Failed classifications are not cached so future requests can retry.
+
+    When system_preview is empty (no system prompt), returns ('standard', 1.0, False)
+    per ADR 0010 default.
+
+    Thread safety: _sys_prompt_cache_lock is held only for short dict operations,
+    never across the classifier network call (satisfies concurrency.md invariant).
+    """
+    if not system_preview:
+        return 'standard', 1.0, False
+
+    # Cache lookup (short lock, no I/O)
+    if system_prompt_sha256:
+        with _sys_prompt_cache_lock:
+            if system_prompt_sha256 in _sys_prompt_cache:
+                _sys_prompt_cache.move_to_end(system_prompt_sha256)
+                tier, score = _sys_prompt_cache[system_prompt_sha256]
+                return tier, score, False
+
+    # Cache miss — classify (no lock held across network call)
+    clf_payload = build_system_prompt_classifier_payload(system_preview, config)
+    try:
+        send_fn = getattr(
+            snapshot.backend, 'send_classifier_message', snapshot.backend.send_message
+        )
+        response = send_fn(clf_payload, credentials, config)
+        label = parse_classifier_label(response)
+        if label is None:
+            logger.warning(
+                '%s System-prompt classifier returned invalid label — using standard: raw=%r',
+                log_tag,
+                _classifier_raw_text_preview(response),
+            )
+            return 'standard', 1.0, True  # fail-open; do NOT cache
+        score = _LABEL_SCORES.get(label, 1.0)
+        # Write to cache on success only; do not cache failures.
+        if system_prompt_sha256:
+            with _sys_prompt_cache_lock:
+                _sys_prompt_cache[system_prompt_sha256] = (label, score)
+                _sys_prompt_cache.move_to_end(system_prompt_sha256)
+                while len(_sys_prompt_cache) > cache_size:
+                    _sys_prompt_cache.popitem(last=False)
+        logger.debug(
+            '%s System-prompt classifier: sha=%s → %s (score=%.1f)',
+            log_tag, (system_prompt_sha256 or '')[:8], label, score,
+        )
+        return label, score, False
+    except Exception as exc:
+        logger.warning(
+            '%s System-prompt classifier call failed — using standard: %s',
+            log_tag, exc,
+        )
+        return 'standard', 1.0, True  # fail-open; do NOT cache
+
+
+def _apply_weighted_blend(
+    user_label: str,
+    system_prompt_sha256: str | None,
+    payload: dict,
+    config: 'Config',
+    snapshot,
+    credentials: dict,
+    log_tag: str,
+) -> tuple[str, str, float, float, float, bool]:
+    """Apply weighted system-prompt + user-prompt tier blend (ADR 0010).
+
+    Returns (final_tier_label, sys_tier, sys_score, user_score, weighted_score, sys_failed).
+
+    ``user_label`` is the post-bump classifier label (trivial/standard/deep).
+    The system prompt is classified (with LRU caching) and blended with the
+    user score using the configured weights and thresholds.
+
+    Only called in 'classifier' mode after a successful user-prompt label is
+    produced (including the affirmation_classified path).
+    """
+    cache_size = getattr(config, 'auto_model_routing_system_prompt_cache_size', 256)
+    preview_limit = getattr(config, 'auto_model_routing_system_prompt_preview_limit', 500)
+    sys_weight = getattr(config, 'auto_model_routing_system_prompt_weight', 0.30)
+    user_weight = getattr(config, 'auto_model_routing_user_prompt_weight', 0.70)
+    trivial_threshold = getattr(config, 'auto_model_routing_trivial_threshold', 0.75)
+    standard_threshold = getattr(config, 'auto_model_routing_standard_threshold', 1.50)
+
+    sys_preview = _extract_system_prompt_preview(payload, preview_limit)
+    sys_tier, sys_score, sys_failed = _classify_system_prompt(
+        sys_preview, system_prompt_sha256, cache_size, config, snapshot, credentials, log_tag,
+    )
+    user_score = _LABEL_SCORES.get(user_label, 1.0)
+    weighted_score = sys_weight * sys_score + user_weight * user_score
+
+    if weighted_score < trivial_threshold:
+        final_label = 'trivial'
+    elif weighted_score < standard_threshold:
+        final_label = 'standard'
+    else:
+        final_label = 'deep'
+
+    logger.debug(
+        '%s Weighted blend: user=%s(%.1f) sys=%s(%.1f) score=%.3f → %s',
+        log_tag, user_label, user_score, sys_tier, sys_score, weighted_score, final_label,
+    )
+    return final_label, sys_tier, sys_score, user_score, weighted_score, sys_failed
 
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1710,11 @@ def route_model(
         aff_routed: str | None = None
         aff_cache_tier: str | None = None
         aff_summary_json: str | None = None
+        aff_sys_tier: str | None = None
+        aff_sys_score: float | None = None
+        aff_user_score: float | None = None
+        aff_weighted_score: float | None = None
+        aff_sys_failed: bool = False
         try:
             use_json = getattr(config, 'auto_model_routing_confidence_bump', False)
             aff_summary_json = summary.to_classifier_json(
@@ -1505,7 +1756,23 @@ def route_model(
                     _classifier_raw_text_preview(response),
                 )
             else:
-                uncapped_tier = config.auto_model_routing_classification[label]
+                # Apply weighted blend (ADR 0010) to produce the final tier.
+                # Mode guard mirrors the main dispatch path: blend only in 'classifier'
+                # mode; 'rules' avoids LLM calls by design, 'tag' uses direct strings.
+                aff_effective_mode = (
+                    override_mode
+                    or getattr(config, 'auto_model_routing_mode', None)
+                    or 'classifier'
+                )
+                if aff_effective_mode == 'classifier':
+                    (blend_label, aff_sys_tier, aff_sys_score,
+                     aff_user_score, aff_weighted_score, aff_sys_failed) = _apply_weighted_blend(
+                        label, summary.system_prompt_sha256, payload, config,
+                        snapshot, credentials, log_tag,
+                    )
+                else:
+                    blend_label = label
+                uncapped_tier = config.auto_model_routing_classification[blend_label]
                 capped_tier = (
                     _cap_cached_tier(
                         uncapped_tier, routing_baseline,
@@ -1540,6 +1807,11 @@ def route_model(
                 estimated_input_tokens=est_tokens,
                 classifier_mode='affirmation',
                 classifier_summary_json=aff_summary_json,
+                system_prompt_tier=aff_sys_tier,
+                system_prompt_score=aff_sys_score,
+                user_prompt_score=aff_user_score,
+                routing_weighted_score=aff_weighted_score,
+                system_prompt_classification_failed=aff_sys_failed,
             )
         return _affirmation_floor()
 
@@ -1621,6 +1893,22 @@ def route_model(
             dispatch_reason = 'classifier_standard_bumped'
         tier_bumped = True
 
+    # --- Weighted blend (ADR 0010): applies in 'classifier' mode after confidence bump.
+    # For 'rules' and 'tag' modes the system-prompt classifier is not called —
+    # 'rules' avoids LLM calls by design; 'tag' produces a direct model string.
+    blend_sys_tier: str | None = None
+    blend_sys_score: float | None = None
+    blend_user_score: float | None = None
+    blend_weighted_score: float | None = None
+    blend_sys_failed: bool = False
+
+    if effective_mode == 'classifier' and label_or_tier in _LABEL_SCORES:
+        (label_or_tier, blend_sys_tier, blend_sys_score,
+         blend_user_score, blend_weighted_score, blend_sys_failed) = _apply_weighted_blend(
+            label_or_tier, summary.system_prompt_sha256, payload, config,
+            snapshot, credentials, log_tag,
+        )
+
     # Map result to the final model string
     if effective_mode == 'tag':
         # label_or_tier is already the model/tier string from the task map
@@ -1651,4 +1939,9 @@ def route_model(
         classifier_summary_json=clf_summary_json,
         classifier_raw_response=clf_raw_response,
         classifier_format=clf_format,
+        system_prompt_tier=blend_sys_tier,
+        system_prompt_score=blend_sys_score,
+        user_prompt_score=blend_user_score,
+        routing_weighted_score=blend_weighted_score,
+        system_prompt_classification_failed=blend_sys_failed,
     )

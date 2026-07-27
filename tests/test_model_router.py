@@ -28,8 +28,13 @@ import pytest
 from anthproxy.model_router import (
     _CLASSIFIER_SYSTEM,
     RoutingSummary,
+    _classify_system_prompt,
+    _extract_system_prompt_preview,
+    _sys_prompt_cache,
+    _sys_prompt_cache_lock,
     build_classifier_payload,
     build_routing_summary,
+    build_system_prompt_classifier_payload,
     classify_by_rules,
     is_model_auto_routable,
     parse_classifier_label,
@@ -70,6 +75,13 @@ def _config(routing=True, classifier_model='haiku', long_context_threshold=190_0
     cfg.auto_model_routing_task_tiers = None
     cfg.auto_model_routing_prior_response_summary_limit = 1000
     cfg.lock_requested_model = 'off'
+    # ADR 0010/0012: weighted blend config — concrete values so comparisons work.
+    cfg.auto_model_routing_system_prompt_weight = 0.30
+    cfg.auto_model_routing_user_prompt_weight = 0.70
+    cfg.auto_model_routing_trivial_threshold = 0.75
+    cfg.auto_model_routing_standard_threshold = 1.50
+    cfg.auto_model_routing_system_prompt_cache_size = 256
+    cfg.auto_model_routing_system_prompt_preview_limit = 500
     return cfg
 
 
@@ -3738,3 +3750,596 @@ class TestClassifierTransparencyFields:
         assert replaced.classifier_summary_json == '{"final_user_text":"redesign"}'
         assert replaced.classifier_raw_response == 'deep'
         assert replaced.classifier_format == 'standard'
+
+
+# ---------------------------------------------------------------------------
+# ADR 0010/0011/0012: Weighted system-prompt + user-prompt tier blend
+# ---------------------------------------------------------------------------
+
+
+def _blend_snapshot(sys_label='standard', user_label='standard',
+                    has_sys_classifier=True):
+    """Snapshot where first send returns user label, second returns sys label."""
+    backend = MagicMock()
+    if has_sys_classifier:
+        # send_classifier_message used for BOTH calls when available
+        backend.send_classifier_message = MagicMock(
+            side_effect=[_text_response(user_label), _text_response(sys_label)]
+        )
+    else:
+        del backend.send_classifier_message
+        backend.send_message = MagicMock(
+            side_effect=[_text_response(user_label), _text_response(sys_label)]
+        )
+    return _snapshot(backend=backend, routing=True)
+
+
+class TestWeightedBlendConfig:
+    """Config validation for ADR 0010 weighted blend options."""
+
+    def test_weights_must_sum_to_one(self):
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from anthproxy.config import parse_args; parse_args(['
+             '"--auto-model-routing",'
+             '"--auto-model-routing-system-prompt-weight=0.50",'
+             '"--auto-model-routing-user-prompt-weight=0.60"'
+             '])'],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    def test_zero_system_weight_rejected(self):
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from anthproxy.config import parse_args; parse_args(['
+             '"--auto-model-routing",'
+             '"--auto-model-routing-system-prompt-weight=0.0",'
+             '"--auto-model-routing-user-prompt-weight=1.0"'
+             '])'],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    def test_inverted_thresholds_rejected(self):
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from anthproxy.config import parse_args; parse_args(['
+             '"--auto-model-routing",'
+             '"--auto-model-routing-trivial-threshold=1.50",'
+             '"--auto-model-routing-standard-threshold=0.75"'
+             '])'],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    def test_zero_cache_size_rejected(self):
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from anthproxy.config import parse_args; parse_args(['
+             '"--auto-model-routing",'
+             '"--auto-model-routing-system-prompt-cache-size=0"'
+             '])'],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    def test_zero_preview_limit_rejected(self):
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'from anthproxy.config import parse_args; parse_args(['
+             '"--auto-model-routing",'
+             '"--auto-model-routing-system-prompt-preview-limit=0"'
+             '])'],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+
+class TestExtractSystemPromptPreview:
+    """_extract_system_prompt_preview extraction and head-capping."""
+
+    def test_string_system_returned_directly(self):
+        payload = {'system': 'You are a helpful assistant.'}
+        assert _extract_system_prompt_preview(payload, 500) == 'You are a helpful assistant.'
+
+    def test_string_system_head_capped(self):
+        payload = {'system': 'A' * 600}
+        assert _extract_system_prompt_preview(payload, 100) == 'A' * 100
+
+    def test_list_system_text_blocks_concatenated(self):
+        payload = {'system': [
+            {'type': 'text', 'text': 'Block one.'},
+            {'type': 'text', 'text': 'Block two.'},
+        ]}
+        assert _extract_system_prompt_preview(payload, 500) == 'Block one.\nBlock two.'
+
+    def test_list_system_non_text_blocks_skipped(self):
+        payload = {'system': [
+            {'type': 'text', 'text': 'Role: assistant.'},
+            {'type': 'image', 'source': {}},
+        ]}
+        assert _extract_system_prompt_preview(payload, 500) == 'Role: assistant.'
+
+    def test_list_non_dict_items_skipped(self):
+        payload = {'system': ['bare string', {'type': 'text', 'text': 'ok'}]}
+        assert _extract_system_prompt_preview(payload, 500) == 'ok'
+
+    def test_empty_system_returns_empty(self):
+        assert _extract_system_prompt_preview({}, 500) == ''
+        assert _extract_system_prompt_preview({'system': ''}, 500) == ''
+        assert _extract_system_prompt_preview({'system': None}, 500) == ''
+
+    def test_list_head_capped_after_concatenation(self):
+        payload = {'system': [
+            {'type': 'text', 'text': 'A' * 300},
+            {'type': 'text', 'text': 'B' * 300},
+        ]}
+        result = _extract_system_prompt_preview(payload, 400)
+        assert len(result) == 400
+
+
+class TestSystemPromptClassifier:
+    """_classify_system_prompt: LRU cache, classifier calls, failure handling."""
+
+    def _make_config(self):
+        cfg = MagicMock()
+        cfg.auto_model_routing_classifier_model = 'haiku'
+        cfg.auto_model_routing_confidence_bump = False
+        return cfg
+
+    def _make_snap(self, label='standard'):
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = _text_response(label)
+        snap = MagicMock()
+        snap.backend = backend
+        snap.name = 'anthropic'
+        return snap
+
+    def setup_method(self):
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+    def test_no_preview_returns_standard_default(self):
+        cfg = self._make_config()
+        snap = self._make_snap()
+        tier, score, failed = _classify_system_prompt(
+            '', None, 256, cfg, snap, {}, ''
+        )
+        assert tier == 'standard'
+        assert score == 1.0
+        assert failed is False
+        snap.backend.send_message.assert_not_called()
+
+    def test_cache_miss_calls_classifier(self):
+        cfg = self._make_config()
+        snap = self._make_snap('deep')
+        tier, score, failed = _classify_system_prompt(
+            'You are a research architect.', 'sha-abc', 256, cfg, snap, {}, ''
+        )
+        assert tier == 'deep'
+        assert score == 2.0
+        assert failed is False
+        snap.backend.send_message.assert_called_once()
+
+    def test_cache_hit_skips_classifier(self):
+        cfg = self._make_config()
+        snap = self._make_snap('deep')
+        sha = 'sha-cached'
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache[sha] = ('trivial', 0.0)
+        tier, score, failed = _classify_system_prompt(
+            'You are a research architect.', sha, 256, cfg, snap, {}, ''
+        )
+        assert tier == 'trivial'
+        assert score == 0.0
+        assert failed is False
+        snap.backend.send_message.assert_not_called()
+
+    def test_successful_result_cached(self):
+        cfg = self._make_config()
+        snap = self._make_snap('deep')
+        sha = 'sha-write-test'
+        _classify_system_prompt('You are a research architect.', sha, 256, cfg, snap, {}, '')
+        with _sys_prompt_cache_lock:
+            assert sha in _sys_prompt_cache
+            assert _sys_prompt_cache[sha] == ('deep', 2.0)
+
+    def test_failed_classification_not_cached(self):
+        cfg = self._make_config()
+        snap = MagicMock()
+        del snap.send_classifier_message
+        snap.backend = MagicMock()
+        del snap.backend.send_classifier_message
+        snap.backend.send_message.side_effect = RuntimeError('network down')
+        snap.name = 'anthropic'
+        sha = 'sha-fail'
+        tier, score, failed = _classify_system_prompt(
+            'You are an agent.', sha, 256, cfg, snap, {}, ''
+        )
+        assert tier == 'standard'
+        assert score == 1.0
+        assert failed is True
+        with _sys_prompt_cache_lock:
+            assert sha not in _sys_prompt_cache
+
+    def test_invalid_label_not_cached(self):
+        cfg = self._make_config()
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = {'content': [{'type': 'text', 'text': 'definitely invalid multi word'}]}
+        snap = MagicMock()
+        snap.backend = backend
+        snap.name = 'anthropic'
+        sha = 'sha-invalid'
+        tier, score, failed = _classify_system_prompt(
+            'You are an agent.', sha, 256, cfg, snap, {}, ''
+        )
+        assert tier == 'standard'
+        assert score == 1.0
+        assert failed is True
+        with _sys_prompt_cache_lock:
+            assert sha not in _sys_prompt_cache
+
+    def test_lru_eviction(self):
+        cfg = self._make_config()
+        snap = self._make_snap('standard')
+        for i in range(3):
+            sha = f'sha-{i}'
+            with _sys_prompt_cache_lock:
+                _sys_prompt_cache[sha] = ('standard', 1.0)
+        # Cache size = 2; next write should evict oldest
+        _classify_system_prompt('Some prompt.', 'sha-new', 2, cfg, snap, {}, '')
+        with _sys_prompt_cache_lock:
+            assert 'sha-new' in _sys_prompt_cache
+            # sha-0 evicted (oldest), sha-1 and sha-2 or sha-new remain
+            assert len(_sys_prompt_cache) <= 2
+
+    def test_none_sha_skips_cache(self):
+        cfg = self._make_config()
+        snap = self._make_snap('deep')
+        tier, score, failed = _classify_system_prompt(
+            'You are a research architect.', None, 256, cfg, snap, {}, ''
+        )
+        assert tier == 'deep'
+        # No sha → cache stays empty
+        with _sys_prompt_cache_lock:
+            assert None not in _sys_prompt_cache
+
+
+class TestWeightedBlendRouting:
+    """route_model() applies weighted blend in classifier mode."""
+
+    def setup_method(self):
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+    def _snap_with_two_calls(self, user_label: str, sys_label: str):
+        """Snapshot whose classifier returns user_label first, sys_label second."""
+        backend = MagicMock()
+        backend.send_classifier_message = MagicMock(
+            side_effect=[_text_response(user_label), _text_response(sys_label)]
+        )
+        return _snapshot(backend=backend, routing=True)
+
+    def _snap_no_sys(self, user_label: str):
+        """Snapshot with no system prompt — sys classifier never called."""
+        backend = MagicMock()
+        backend.send_classifier_message = MagicMock(
+            return_value=_text_response(user_label)
+        )
+        return _snapshot(backend=backend, routing=True)
+
+    def test_no_system_prompt_uses_standard_default(self):
+        """No system prompt → sys_score=1.0; blend = 0.3*1 + 0.7*user_score."""
+        snap = self._snap_no_sys('deep')
+        payload = _payload(model='sonnet', content='redesign the auth system')
+        decision = route_model(payload, snap, {})
+        # user_score=2.0, sys_score=1.0 → weighted=0.3*1+0.7*2=1.70 → deep
+        assert decision.routed_model == 'opus'
+        assert decision.system_prompt_tier == 'standard'
+        assert decision.system_prompt_score == 1.0
+        assert decision.user_prompt_score == 2.0
+        assert abs(decision.routing_weighted_score - 1.70) < 1e-9
+        assert decision.system_prompt_classification_failed is False
+
+    def test_trivial_user_trivial_sys_stays_trivial(self):
+        """trivial user + trivial sys: 0.3*0 + 0.7*0 = 0.0 < 0.75 → trivial."""
+        snap = self._snap_with_two_calls('trivial', 'trivial')
+        payload = _payload(model='sonnet', content='hi', system='You are a file browser.')
+        decision = route_model(payload, snap, {})
+        assert decision.routed_model == 'haiku'
+        assert decision.system_prompt_tier == 'trivial'
+        assert abs(decision.routing_weighted_score - 0.0) < 1e-9
+
+    def test_deep_user_trivial_sys_moderates_to_standard(self):
+        """deep user(2) + trivial sys(0): 0.3*0 + 0.7*2 = 1.40 < 1.50 → standard."""
+        snap = self._snap_with_two_calls('deep', 'trivial')
+        payload = _payload(model='sonnet', content='redesign the auth system',
+                           system='You are a file browser.')
+        decision = route_model(payload, snap, {})
+        assert decision.routed_model == 'sonnet'  # standard
+        assert abs(decision.routing_weighted_score - 1.40) < 1e-9
+
+    def test_trivial_user_deep_sys_elevates_to_standard(self):
+        """trivial user(0) + deep sys(2): 0.3*2 + 0.7*0 = 0.60 < 0.75 → trivial."""
+        snap = self._snap_with_two_calls('trivial', 'deep')
+        payload = _payload(model='sonnet', content='hi',
+                           system='You are a research architect.')
+        decision = route_model(payload, snap, {})
+        # 0.3*2 + 0.7*0 = 0.60 < 0.75 → still trivial
+        assert decision.routed_model == 'haiku'
+        assert abs(decision.routing_weighted_score - 0.60) < 1e-9
+
+    def test_standard_user_standard_sys_stays_standard(self):
+        """standard user(1) + standard sys(1): 0.3*1 + 0.7*1 = 1.0 → standard."""
+        snap = self._snap_with_two_calls('standard', 'standard')
+        payload = _payload(model='sonnet', content='implement auth',
+                           system='You are a helpful assistant.')
+        decision = route_model(payload, snap, {})
+        assert decision.routed_model == 'sonnet'
+        assert abs(decision.routing_weighted_score - 1.0) < 1e-9
+
+    def test_deep_user_deep_sys_stays_deep(self):
+        """deep user(2) + deep sys(2): 0.3*2 + 0.7*2 = 2.0 → deep."""
+        snap = self._snap_with_two_calls('deep', 'deep')
+        payload = _payload(model='sonnet', content='redesign the auth system',
+                           system='You are a research architect.')
+        decision = route_model(payload, snap, {})
+        assert decision.routed_model == 'opus'
+        assert abs(decision.routing_weighted_score - 2.0) < 1e-9
+
+    def test_blend_fields_populated_on_success(self):
+        """All 5 blend fields are populated on a successful classifier path."""
+        snap = self._snap_no_sys('standard')
+        payload = _payload(model='sonnet', content='implement auth')
+        decision = route_model(payload, snap, {})
+        assert decision.system_prompt_tier == 'standard'
+        assert decision.system_prompt_score == 1.0
+        assert decision.user_prompt_score == 1.0
+        assert decision.routing_weighted_score is not None
+        assert decision.system_prompt_classification_failed is False
+
+    def test_blend_fields_none_on_disabled_routing(self):
+        """Blend fields are None when routing is disabled."""
+        snap = _snapshot(routing=False)
+        payload = _payload(model='sonnet', content='implement auth')
+        decision = route_model(payload, snap, {})
+        assert decision.system_prompt_tier is None
+        assert decision.system_prompt_score is None
+        assert decision.user_prompt_score is None
+        assert decision.routing_weighted_score is None
+        assert decision.system_prompt_classification_failed is False
+
+    def test_blend_fields_none_on_rules_mode(self):
+        """Blend fields are None when effective mode is 'rules'."""
+        snap = _snapshot(routing=True)
+        snap.config.auto_model_routing_mode = 'rules'
+        payload = _payload(model='sonnet', content='hi')
+        decision = route_model(payload, snap, {})
+        assert decision.system_prompt_tier is None
+        assert decision.routing_weighted_score is None
+
+    def test_sys_classif_failure_uses_standard_fallback(self):
+        """System prompt classifier failure: sys_score=1.0, classification_failed=True."""
+        backend = MagicMock()
+        # First call = user prompt → standard
+        # Second call (sys prompt) → exception
+        backend.send_classifier_message = MagicMock(
+            side_effect=[_text_response('standard'), RuntimeError('timeout')]
+        )
+        snap = _snapshot(backend=backend, routing=True)
+        payload = _payload(model='sonnet', content='implement auth',
+                           system='You are a helpful assistant.')
+        decision = route_model(payload, snap, {})
+        assert decision.system_prompt_classification_failed is True
+        assert decision.system_prompt_score == 1.0
+        assert decision.system_prompt_tier == 'standard'
+
+    def test_sys_classif_result_cached_for_next_request(self):
+        """A successful sys-prompt classification is cached so the next request skips it."""
+        sys_content = 'You are a file browser.'
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+        backend = MagicMock()
+        backend.send_classifier_message = MagicMock(
+            side_effect=[
+                _text_response('standard'),  # user prompt 1st request
+                _text_response('trivial'),   # sys prompt 1st request
+            ]
+        )
+        snap = _snapshot(backend=backend, routing=True)
+        snap.backend = backend
+
+        payload = _payload(model='sonnet', content='implement auth', system=sys_content)
+        route_model(payload, snap, {})
+        assert backend.send_classifier_message.call_count == 2
+
+        # Second request: sys prompt cached → only user prompt call
+        backend.send_classifier_message.reset_mock()
+        backend.send_classifier_message.side_effect = [_text_response('standard')]
+        payload2 = _payload(model='sonnet', content='another task', system=sys_content)
+        route_model(payload2, snap, {})
+        assert backend.send_classifier_message.call_count == 1
+
+    def test_affirmation_classified_populates_blend_fields(self):
+        """affirmation_classified path also populates the 5 blend fields."""
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+        # Two calls: first for affirmation user-prompt, second for sys-prompt
+        backend = MagicMock()
+        backend.send_classifier_message = MagicMock(
+            side_effect=[
+                _text_response('standard'),  # affirmation classifier
+                _text_response('standard'),  # system prompt classifier
+            ]
+        )
+        snap = _snapshot(backend=backend, routing=True)
+        payload = {
+            'model': 'sonnet',
+            'messages': [
+                {'role': 'assistant', 'content': 'I will implement the auth module.'},
+                {'role': 'user', 'content': 'yes'},
+            ],
+        }
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.system_prompt_tier is not None
+        assert decision.routing_weighted_score is not None
+
+    def test_affirmation_inherited_blend_fields_none(self):
+        """affirmation_inherited path has no blend (cached tier, no classifier call)."""
+        snap = _snapshot(routing=True)
+        payload = {
+            'model': 'sonnet',
+            'messages': [{'role': 'user', 'content': 'yes'}],
+        }
+        decision = route_model(payload, snap, {}, cached_session_tier='sonnet')
+        assert decision.reason_code == 'affirmation_inherited'
+        assert decision.system_prompt_tier is None
+        assert decision.routing_weighted_score is None
+        assert decision.system_prompt_classification_failed is False
+
+    def test_classification_raw_label_preserved_after_blend(self):
+        """decision.classification holds the raw user-prompt label, not the blended tier."""
+        snap = self._snap_with_two_calls('deep', 'trivial')
+        payload = _payload(model='sonnet', content='redesign the auth system',
+                           system='You are a file browser.')
+        decision = route_model(payload, snap, {})
+        # classification field must be the raw user label
+        assert decision.classification == 'deep'
+
+    def test_score_at_trivial_threshold_routes_standard(self):
+        """weighted_score == trivial_threshold: < is False, so result is standard not trivial."""
+        # With threshold=0.30: sys=standard(1), user=trivial(0) → 0.30*1 + 0.70*0 = 0.30 exactly
+        snap = self._snap_with_two_calls('trivial', 'standard')
+        snap.config.auto_model_routing_trivial_threshold = 0.30
+        payload = _payload(model='sonnet', content='hi', system='You are a helpful assistant.')
+        decision = route_model(payload, snap, {})
+        import pytest
+        assert decision.routing_weighted_score == pytest.approx(0.30)
+        assert decision.routed_model == 'sonnet'  # standard (not trivial)
+
+    def test_score_at_standard_threshold_routes_deep(self):
+        """weighted_score == standard_threshold: < is False, so result is deep not standard."""
+        # With threshold=1.40: deep(2)*0.70 + trivial(0)*0.30 = 1.40 exactly
+        snap = self._snap_with_two_calls('deep', 'trivial')
+        snap.config.auto_model_routing_standard_threshold = 1.40
+        payload = _payload(model='sonnet', content='redesign', system='You are a file browser.')
+        decision = route_model(payload, snap, {})
+        import pytest
+        assert decision.routing_weighted_score == pytest.approx(1.40)
+        assert decision.routed_model == 'opus'  # deep (not standard)
+
+    def test_affirmation_rules_mode_skips_sys_prompt_classifier(self):
+        """In rules mode the affirmation path must not call the system-prompt classifier."""
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+        backend = MagicMock()
+        # Only one call allowed: the affirmation user-prompt classifier
+        backend.send_classifier_message = MagicMock(
+            side_effect=[_text_response('standard')]
+        )
+        snap = _snapshot(backend=backend, routing=True)
+        snap.config.auto_model_routing_mode = 'rules'
+
+        payload = {
+            'model': 'sonnet',
+            'messages': [
+                {'role': 'assistant', 'content': 'Here is the plan.'},
+                {'role': 'user', 'content': 'yes'},
+            ],
+            'system': 'You are a helpful assistant.',
+        }
+        route_model(payload, snap, {}, cached_session_tier=None)
+        # Exactly one call (affirmation user-prompt classifier); system-prompt
+        # classifier must not have been invoked.
+        assert backend.send_classifier_message.call_count == 1
+
+
+class TestSystemPromptShaInRoutingSummary:
+    """build_routing_summary() computes system_prompt_sha256."""
+
+    def test_sha_computed_for_string_system(self):
+        import hashlib
+        content = 'You are a helpful assistant.'
+        payload = _payload(content='hello', system=content)
+        summary = build_routing_summary(payload)
+        assert summary is not None
+        expected_sha = hashlib.sha256(content.encode()).hexdigest()
+        assert summary.system_prompt_sha256 == expected_sha
+
+    def test_sha_computed_for_list_system(self):
+        import hashlib
+        import json as _json
+        system = [{'type': 'text', 'text': 'Role: assistant.'}]
+        payload = _payload(content='hello', system=system)
+        summary = build_routing_summary(payload)
+        assert summary is not None
+        expected_sha = hashlib.sha256(
+            _json.dumps(system, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+        assert summary.system_prompt_sha256 == expected_sha
+
+    def test_sha_none_when_no_system(self):
+        payload = _payload(content='hello')
+        summary = build_routing_summary(payload)
+        assert summary is not None
+        assert summary.system_prompt_sha256 is None
+
+    def test_sha_none_for_empty_system(self):
+        payload = _payload(content='hello', system='')
+        summary = build_routing_summary(payload)
+        assert summary is not None
+        assert summary.system_prompt_sha256 is None
+
+
+class TestBuildSystemPromptClassifierPayload:
+    """build_system_prompt_classifier_payload() structure."""
+
+    def test_uses_sentinel_key(self):
+        cfg = MagicMock()
+        cfg.auto_model_routing_classifier_model = 'haiku'
+        p = build_system_prompt_classifier_payload('You are a file browser.', cfg)
+        assert p.get('_anthproxy_internal_classifier') is True
+
+    def test_uses_correct_system_prompt(self):
+        from anthproxy.model_router import _CLASSIFIER_SYSTEM_PROMPT_TIER
+        cfg = MagicMock()
+        cfg.auto_model_routing_classifier_model = 'haiku'
+        p = build_system_prompt_classifier_payload('You are a file browser.', cfg)
+        assert p['system'] == _CLASSIFIER_SYSTEM_PROMPT_TIER
+
+    def test_system_preview_in_user_message(self):
+        cfg = MagicMock()
+        cfg.auto_model_routing_classifier_model = 'haiku'
+        preview = 'You are a file browser.'
+        p = build_system_prompt_classifier_payload(preview, cfg)
+        assert p['messages'][0]['content'] == preview
+
+    def test_max_tokens_is_small(self):
+        from anthproxy.model_router import _CLASSIFIER_MAX_TOKENS
+        cfg = MagicMock()
+        cfg.auto_model_routing_classifier_model = 'haiku'
+        p = build_system_prompt_classifier_payload('preview', cfg)
+        assert p['max_tokens'] == _CLASSIFIER_MAX_TOKENS
+
+    def test_temperature_zero(self):
+        cfg = MagicMock()
+        cfg.auto_model_routing_classifier_model = 'haiku'
+        p = build_system_prompt_classifier_payload('preview', cfg)
+        assert p['temperature'] == 0.0
