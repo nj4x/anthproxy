@@ -36,9 +36,13 @@ function reasonDescription(reasonCode: string | null): string {
     case 'size_forced_long_context':
       return 'No classifier call: long-context size floor applied';
     case 'affirmation_inherited':
-      return 'No classifier call: short-affirmation (tier inherited)';
+      return 'No classifier call: short-affirmation (tier inherited from cache)';
     case 'affirmation_floored_standard':
-      return 'No classifier call: short-affirmation (floored to standard)';
+      return 'No classifier call: short-affirmation (floored to standard, no cache)';
+    case 'affirmation_classified':
+      return 'Affirmation classified with prior-response context';
+    case 'affirmation_classifier_failed':
+      return 'Affirmation floored to standard (no prior assistant text or classifier failed)';
     case 'session_cached_tier':
     case 'session_cached_walkback':
       return 'No classifier call: cached tier replayed';
@@ -403,6 +407,20 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                               {parsedSummary.final_user_text.slice(0, 500)}
                               {parsedSummary.text_truncated === true && (
                                 <span className="text-gray-400"> … (truncated)</span>
+                              )}
+                            </blockquote>
+                          </div>
+                        )}
+                        {parsedSummary.prior_response_summary && (
+                          <div>
+                            <div className="text-gray-400 mb-1 flex items-center">
+                              Prior response (affirmation context)
+                              <CopyButton text={parsedSummary.prior_response_summary} title="Copy prior response summary" />
+                            </div>
+                            <blockquote className="border-l-2 border-blue-300 pl-3 text-gray-700 font-mono whitespace-pre-wrap break-words">
+                              {parsedSummary.prior_response_summary.slice(0, 500)}
+                              {parsedSummary.prior_response_summary.length > 500 && (
+                                <span className="text-gray-400"> … (truncated in display)</span>
                               )}
                             </blockquote>
                           </div>

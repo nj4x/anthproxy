@@ -254,6 +254,7 @@ export interface StatsResponse {
 /** Typed view of the classifier_summary_json blob stored per request. */
 export interface ClassifierSummary {
   final_user_text?: string;
+  prior_response_summary?: string;
   total_messages?: number;
   prior_user_messages?: number;
   prior_assistant_messages?: number;
