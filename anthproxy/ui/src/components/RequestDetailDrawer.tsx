@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import useSWR from 'swr';
 import { api } from '../api/client';
 import type { RequestDetail, ClassifierSummary } from '../api/types';
@@ -128,7 +129,7 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
     data.routed_model != null &&
     data.routed_model !== data.requested_model;
 
-  return (
+  return createPortal(
     <>
       <div
         className={`fixed inset-0 bg-black z-40 transition-opacity duration-200 ${isOpen ? 'opacity-25' : 'opacity-0 pointer-events-none'}`}
@@ -512,6 +513,7 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
           )}
         </div>
       </div>
-    </>
+    </>,
+    document.body,
   );
 }
