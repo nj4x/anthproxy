@@ -1,0 +1,16 @@
+# Store system-prompt tier denormalized on each request row, not in a separate table
+
+The system-prompt classification result (`system_prompt_tier`, `system_prompt_score`) must be recorded per-request for auditability — to answer "why did this request land at standard?" without reconstructing the weighted arithmetic from scratch.
+
+Two options were considered: a normalized `system_prompt_classifications` table keyed by SHA256, or denormalized columns on `requests`. We chose denormalization because system-prompt classification is ephemeral (in-memory cache, not persisted between restarts), so the table would be empty after every restart and would not serve as a reliable lookup. Denormalizing the result onto the request row is simple, survives restarts correctly, and keeps all routing signals for a request in one row.
+
+The `prompt_store` table already holds the system prompt content keyed by SHA256 (established in `db.py` schema migrations 0 and 1); the `requests.system_prompt_sha256` foreign key gives the prompt text. The new columns add only the classification outcome, not the prompt itself.
+
+## Consequences
+
+- Schema migration adds `system_prompt_tier TEXT`, `system_prompt_score REAL`, `user_prompt_score REAL`, `routing_weighted_score REAL`, and `system_prompt_classification_failed BOOLEAN NOT NULL DEFAULT 0` to `requests`.
+- If the same system prompt was classified differently across restarts (e.g. due to a classifier model change), each request row carries the classification that was actually used for its routing decision — correct by design.
+- When system prompt classification is skipped because routing is disabled, all four columns (`system_prompt_tier`, `system_prompt_score`, `user_prompt_score`, `routing_weighted_score`) are NULL. The `system_prompt_classification_failed` column is 0 (per its DEFAULT) — no classification was attempted.
+- When a cached tier is inherited on the affirmation path (ADR 0013 step 1 early return), all four columns (`system_prompt_tier`, `system_prompt_score`, `user_prompt_score`, `routing_weighted_score`) are recorded as NULL. No weighted blend is computed in this branch; only the cached tier is applied to routing. The `system_prompt_classification_failed` column is 0 — system-prompt classification was not attempted.
+- When no system prompt is present (routing is active but `payload['system']` is absent or empty), `system_prompt_tier='standard'` and `system_prompt_score=1.0` are recorded (per ADR 0010). The `user_prompt_score` and `routing_weighted_score` are computed normally based on the user-prompt classification.
+- When system prompt classification fails (e.g., classifier network error, invalid response) and the fail-open default applies, `system_prompt_tier='standard'` and `system_prompt_score=1.0` are recorded to reflect what the weighted blending arithmetic actually used. The `user_prompt_score` and `routing_weighted_score` are computed normally based on the user-prompt classification. A `system_prompt_classification_failed BOOLEAN NOT NULL DEFAULT 0` column is added in the same schema migration to distinguish failure cases from genuine standard outcomes; it is set to `1` only when classification was attempted but failed, `0` in all other cases (no system prompt, cached result, or successful classification).
