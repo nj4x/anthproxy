@@ -387,6 +387,11 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                     </div>
 
                     <div className="text-xs">
+                      <span className="text-gray-400">System prompt: </span>
+                      <span className="text-gray-500 italic">excluded — not sent to classifier</span>
+                    </div>
+
+                    <div className="text-xs">
                       <span className="text-gray-400">Walk-back: </span>
                       <span className="text-gray-700">
                         {data.routing_recovered_via_walkback === 1
@@ -411,10 +416,10 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                             </blockquote>
                           </div>
                         )}
-                        {parsedSummary.prior_response_summary && (
+                        {parsedSummary.prior_response_summary ? (
                           <div>
                             <div className="text-gray-400 mb-1 flex items-center">
-                              Prior response (affirmation context)
+                              Last LLM response used (affirmation context)
                               <CopyButton text={parsedSummary.prior_response_summary} title="Copy prior response summary" />
                             </div>
                             <blockquote className="border-l-2 border-blue-300 pl-3 text-gray-700 font-mono whitespace-pre-wrap break-words">
@@ -424,7 +429,11 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                               )}
                             </blockquote>
                           </div>
-                        )}
+                        ) : (parsedSummary.prior_assistant_messages ?? 0) > 0 ? (
+                          <div className="text-gray-500 italic">
+                            Last LLM response: not used (history counts only, not content)
+                          </div>
+                        ) : null}
                         <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                           {([
                             ['Total Messages', parsedSummary.total_messages],
