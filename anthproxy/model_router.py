@@ -323,12 +323,11 @@ _CLASSIFIER_SYSTEM_JSON = (
 # {"label":"standard","confidence":0.87} is ~14 tokens; 40 gives ample headroom.
 _CLASSIFIER_MAX_TOKENS_JSON = 40
 
-# Appended to _CLASSIFIER_SYSTEM_JSON when an affirmation call includes
+# Appended to _CLASSIFIER_SYSTEM_JSON when the classifier payload includes
 # prior_response_summary so the classifier knows to weight that context.
 _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX = (
-    '\n\nWhen prior_response_summary is provided, judge complexity from the '
-    'context in prior_response_summary; it describes what the user is '
-    'agreeing to proceed with.'
+    '\n\nWhen prior_response_summary is provided, use it as additional context '
+    'about the ongoing task to inform your complexity assessment.'
 )
 
 # ---------------------------------------------------------------------------
@@ -963,7 +962,11 @@ def _apply_weighted_blend(
 # Classifier payload construction
 # ---------------------------------------------------------------------------
 
-def build_classifier_payload(summary: RoutingSummary, config: 'Config') -> dict:
+def build_classifier_payload(
+    summary: RoutingSummary,
+    config: 'Config',
+    prior_response_summary: str | None = None,
+) -> dict:
     """Build a synthetic, non-streaming classifier request.
 
     The payload uses the configured classifier model, tiny max_tokens,
@@ -975,18 +978,24 @@ def build_classifier_payload(summary: RoutingSummary, config: 'Config') -> dict:
     system prompt (``_CLASSIFIER_SYSTEM_JSON``) and a larger ``max_tokens``
     budget to accommodate the structured response.  The existing one-word prompt
     and four-token budget are untouched when confidence bump is off.
+
+    When ``prior_response_summary`` is provided it is injected into the routing
+    summary JSON and the system prompt is extended with the prior-context suffix.
     """
     use_json = getattr(config, 'auto_model_routing_confidence_bump', False)
+    system = _CLASSIFIER_SYSTEM_JSON if use_json else _CLASSIFIER_SYSTEM
+    if use_json and prior_response_summary is not None:
+        system = system + _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX
     return {
         _SENTINEL_KEY: True,
         'model': config.auto_model_routing_classifier_model,
         'max_tokens': _CLASSIFIER_MAX_TOKENS_JSON if use_json else _CLASSIFIER_MAX_TOKENS,
         'temperature': _CLASSIFIER_TEMPERATURE,
-        'system': _CLASSIFIER_SYSTEM_JSON if use_json else _CLASSIFIER_SYSTEM,
+        'system': system,
         'messages': [
             {
                 'role': 'user',
-                'content': summary.to_classifier_json(),
+                'content': summary.to_classifier_json(prior_response_summary=prior_response_summary),
             }
         ],
     }
@@ -1275,6 +1284,7 @@ def _dispatch_classifier_mode(
     requested: str,
     log_tag: str,
     task_tag: str | None = None,
+    prior_response_summary: str | None = None,
 ) -> tuple[str | None, str, float | None, int, int, str | None, str | None, str | None, str | None]:
     """Dispatch to the appropriate classification mode.
 
@@ -1364,12 +1374,12 @@ def _dispatch_classifier_mode(
         '%s Model router: classifier prompt (backend=%s requested=%s) full=%r',
         log_tag, snapshot.name, requested, summary.final_user_text,
     )
-    classifier_payload = build_classifier_payload(summary, config)
+    classifier_payload = build_classifier_payload(summary, config, prior_response_summary)
     use_confidence_bump = getattr(config, 'auto_model_routing_confidence_bump', False)
     # Transparency fields captured before the call so they're available even when
     # the response is available (raw_response captured after).
     clf_model: str | None = config.auto_model_routing_classifier_model
-    clf_summary_json: str | None = summary.to_classifier_json()
+    clf_summary_json: str | None = summary.to_classifier_json(prior_response_summary=prior_response_summary)
     clf_format: str | None = 'json' if use_confidence_bump else 'standard'
     parsed_confidence: float | None = None
     clf_raw_response: str | None = None
@@ -1629,6 +1639,16 @@ def route_model(
             classifier_mode='walkback_cache',
         )
 
+    # --- Extract prior assistant response (unconditional) for classifier enrichment.
+    # Used both by the affirmation no-cache path and the main classifier dispatch.
+    _prior_response_limit = getattr(
+        config, 'auto_model_routing_prior_response_summary_limit', 1000
+    )
+    _messages_list = payload.get('messages') or []
+    prior_response_summary = _extract_prior_response_summary(
+        _messages_list, _prior_response_limit
+    )
+
     # --- Short-affirmation continuation: a bare "yes"/"proceed"/"go ahead" as
     # THIS turn's own text carries no complexity signal — it greenlights work the
     # prior turns already established.
@@ -1663,15 +1683,7 @@ def route_model(
                 classifier_mode='affirmation',
             )
 
-        # No-cache path: try to extract the prior assistant response for enrichment.
-        prior_response_limit = getattr(
-            config, 'auto_model_routing_prior_response_summary_limit', 1000
-        )
-        messages_list = payload.get('messages') or []
-        prior_response_summary = _extract_prior_response_summary(
-            messages_list, prior_response_limit
-        )
-
+        # No-cache path: prior_response_summary already extracted above.
         def _affirmation_floor() -> ModelRoutingDecision:
             standard_tier = config.auto_model_routing_classification['standard']
             _capped = _cap_cached_tier(
@@ -1853,6 +1865,7 @@ def route_model(
      clf_model, clf_summary_json, clf_raw_response, clf_format) = _dispatch_classifier_mode(
         effective_mode, summary, config, snapshot, credentials,
         est_tokens, routing_baseline, log_tag, task_tag,
+        prior_response_summary=prior_response_summary,
     )
 
     if label_or_tier is None:

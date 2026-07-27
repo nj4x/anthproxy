@@ -48,7 +48,7 @@ from anthproxy.model_router import (
 
 def _config(routing=True, classifier_model='haiku', long_context_threshold=190_000,
             affirmation_inherit=True, classification=None,
-            auto_model_routing_long='opus[1m]'):
+            auto_model_routing_long='opus[1m]', confidence_bump=False):
     cfg = MagicMock()
     cfg.auto_model_routing = routing
     cfg.auto_model_routing_classifier_model = classifier_model
@@ -69,7 +69,7 @@ def _config(routing=True, classifier_model='haiku', long_context_threshold=190_0
     cfg.auto_model_routing_long = auto_model_routing_long
     # Concrete defaults for new routing-mode / confidence-bump fields so tests
     # that mock the classifier response as a plain string (not JSON) still work.
-    cfg.auto_model_routing_confidence_bump = False
+    cfg.auto_model_routing_confidence_bump = confidence_bump
     cfg.auto_model_routing_min_confidence = 0.0
     cfg.auto_model_routing_mode = 'classifier'
     cfg.auto_model_routing_task_tiers = None
@@ -87,13 +87,15 @@ def _config(routing=True, classifier_model='haiku', long_context_threshold=190_0
 
 def _snapshot(backend=None, routing=True, classifier_model='haiku',
               long_context_threshold=190_000, affirmation_inherit=True,
-              classification=None, auto_model_routing_long='opus[1m]'):
+              classification=None, auto_model_routing_long='opus[1m]',
+              confidence_bump=False):
     snap = MagicMock()
     snap.config = _config(routing=routing, classifier_model=classifier_model,
                           long_context_threshold=long_context_threshold,
                           affirmation_inherit=affirmation_inherit,
                           classification=classification,
-                          auto_model_routing_long=auto_model_routing_long)
+                          auto_model_routing_long=auto_model_routing_long,
+                          confidence_bump=confidence_bump)
     snap.name = 'anthropic'
     if backend is None:
         backend = MagicMock()
@@ -1247,6 +1249,38 @@ class TestBuildClassifierPayload:
                     'thinking_requested', 'effort'):
             assert key not in parsed
         assert parsed['final_user_text'] == 'hi'
+
+    def test_prior_response_summary_injected_into_json(self):
+        cfg = _config(confidence_bump=True)
+        cp = build_classifier_payload(
+            self._make_summary('do the thing'),
+            cfg,
+            prior_response_summary='Here is my plan...',
+        )
+        parsed = json.loads(cp['messages'][0]['content'])
+        assert parsed.get('prior_response_summary') == 'Here is my plan...'
+
+    def test_prior_response_summary_extends_system_prompt(self):
+        cfg = _config(confidence_bump=True)
+        cp_without = build_classifier_payload(self._make_summary(), cfg)
+        cp_with = build_classifier_payload(
+            self._make_summary(), cfg, prior_response_summary='some context'
+        )
+        assert len(cp_with['system']) > len(cp_without['system'])
+        assert 'prior_response_summary' in cp_with['system']
+
+    def test_prior_response_summary_absent_without_confidence_bump(self):
+        # suffix is only appended when use_json (confidence_bump) is True
+        cfg = _config(confidence_bump=False)
+        cp = build_classifier_payload(
+            self._make_summary(), cfg, prior_response_summary='ctx'
+        )
+        # JSON still injected into message content
+        parsed = json.loads(cp['messages'][0]['content'])
+        assert parsed.get('prior_response_summary') == 'ctx'
+        # but system prompt unchanged (non-JSON mode has no suffix)
+        cp_without = build_classifier_payload(self._make_summary(), cfg)
+        assert cp['system'] == cp_without['system']
 
 
 # ---------------------------------------------------------------------------
@@ -2815,6 +2849,85 @@ class TestPriorResponseSummaryLimitConfig:
         from anthproxy.config import parse_args
         cfg = parse_args(['--auto-model-routing'])
         assert cfg.auto_model_routing_prior_response_summary_limit == 1000
+
+
+# ---------------------------------------------------------------------------
+# Unconditional prior-response enrichment (main classifier path)
+# ---------------------------------------------------------------------------
+
+class TestUnconditionalPriorResponseEnrichment:
+    """Verify that prior_response_summary is injected on the main classifier
+    dispatch path even when the user turn is NOT a short affirmation."""
+
+    def _snap_capturing(self, label: str = 'standard', confidence_bump: bool = False):
+        captured: list[dict] = []
+        backend = MagicMock()
+        del backend.send_classifier_message
+
+        def fake_send(clf_payload, credentials, config):
+            captured.append(clf_payload)
+            return _text_response(label)
+
+        backend.send_message.side_effect = fake_send
+        snap = _snapshot(backend=backend, routing=True, confidence_bump=confidence_bump)
+        return snap, captured
+
+    def _make_payload(self, user_text: str, assistant_text: str) -> dict:
+        return {
+            'model': 'claude-haiku-20240307',
+            'max_tokens': 100,
+            'messages': [
+                {'role': 'user', 'content': 'First question'},
+                {'role': 'assistant', 'content': assistant_text},
+                {'role': 'user', 'content': user_text},
+            ],
+        }
+
+    def test_prior_response_injected_on_non_affirmation_turn(self):
+        """A long non-affirmation user turn still receives prior_response_summary."""
+        assistant_reply = 'Here is my detailed plan with many steps...'
+        user_turn = 'Please now implement step 2 of your plan with full error handling and tests'
+        payload = self._make_payload(user_turn, assistant_reply)
+        snap, captured = self._snap_capturing(confidence_bump=True)
+
+        route_model(payload, snap, {})
+
+        assert captured, 'classifier was not called'
+        msg_content = captured[0]['messages'][0]['content']
+        parsed = json.loads(msg_content)
+        assert 'prior_response_summary' in parsed
+        assert parsed['prior_response_summary'] == assistant_reply
+
+    def test_no_prior_response_when_no_assistant_message(self):
+        """When there is no prior assistant message the field is absent."""
+        payload = {
+            'model': 'claude-haiku-20240307',
+            'max_tokens': 100,
+            'messages': [
+                {'role': 'user', 'content': 'Write a full production app with tests'},
+            ],
+        }
+        snap, captured = self._snap_capturing(confidence_bump=True)
+
+        route_model(payload, snap, {})
+
+        assert captured, 'classifier was not called'
+        parsed = json.loads(captured[0]['messages'][0]['content'])
+        assert 'prior_response_summary' not in parsed
+
+    def test_prior_response_enriches_system_prompt_suffix(self):
+        """System prompt gains the prior-context suffix when prior_response_summary present."""
+        assistant_reply = 'I have analyzed the codebase and found three issues.'
+        payload = self._make_payload(
+            'Fix all three issues and add integration tests', assistant_reply
+        )
+        snap, captured = self._snap_capturing(label='deep', confidence_bump=True)
+
+        route_model(payload, snap, {})
+
+        assert captured
+        system = captured[0]['system']
+        assert 'prior_response_summary' in system
 
 
 # ---------------------------------------------------------------------------
