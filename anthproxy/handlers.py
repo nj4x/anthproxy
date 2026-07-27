@@ -827,7 +827,7 @@ def prepare_routing(handler, payload, sess_key):
                 payload.pop('tool_choice', None)
 
     # Capture after stripping so tools_sha256 reflects dispatched payload.
-    prompt_capture = handler._extract_prompt_capture(payload)
+    prompt_capture = handler._extract_prompt_capture(payload, routing=routing)
 
     return PreparedRequest(
         payload=payload,
@@ -1554,7 +1554,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return None
         return None
 
-    def _extract_prompt_capture(self, payload: dict) -> dict:
+    def _extract_prompt_capture(self, payload: dict, routing=None) -> dict:
         """Extract prompt-capture fields for DB recording.  Never raises.
 
         Returns a dict whose keys exactly match the new schema-v2 keyword params
@@ -1613,13 +1613,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # fail-open: leave as None
 
-            # 6. Classifier transparency fields — from ModelRoutingDecision
-            routing = getattr(self, '_routing', None)
-            classifier_model = getattr(routing, 'classifier_model', None)
-            classifier_summary_json = getattr(routing, 'classifier_summary_json', None)
-            classifier_raw_response = getattr(routing, 'classifier_raw_response', None)
-            classifier_confidence = getattr(routing, 'classifier_confidence', None)
-            classifier_format = getattr(routing, 'classifier_format', None)
+            # 6. Classifier transparency fields — from ModelRoutingDecision.
+            # Prefer the routing passed in directly (available during prepare_routing);
+            # fall back to self._routing for callers that don't pass it.
+            _routing = routing if routing is not None else getattr(self, '_routing', None)
+            classifier_model = getattr(_routing, 'classifier_model', None)
+            classifier_summary_json = getattr(_routing, 'classifier_summary_json', None)
+            classifier_raw_response = getattr(_routing, 'classifier_raw_response', None)
+            classifier_confidence = getattr(_routing, 'classifier_confidence', None)
+            classifier_format = getattr(_routing, 'classifier_format', None)
 
             return {
                 'user_prompt_text': user_prompt_text,
