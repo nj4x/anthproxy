@@ -293,7 +293,8 @@ def _get_routing(query_params: dict, db) -> tuple[int, dict]:
         cnt = item['cnt']
         if rc == 'size_forced_long_context':
             size_forced_count += cnt
-        elif rc in ('affirmation_inherited', 'affirmation_floored_standard'):
+        elif rc in ('affirmation_inherited', 'affirmation_floored_standard',
+                    'affirmation_classified', 'affirmation_classifier_failed'):
             affirmation_count += cnt
         elif rc in _CACHED_TIER_CODES:
             cached_tier_count += cnt

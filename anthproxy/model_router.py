@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -143,6 +144,9 @@ _RATIO_MAX = 3.0
 # Maximum final-user text length passed to the classifier (characters).
 _TEXT_LIMIT = 4_000
 
+# Head fraction for prior-response 30/70 truncation (30% head, 70% tail).
+_PRIOR_RESPONSE_HEAD_FRAC = 0.30
+
 # When text exceeds _TEXT_LIMIT, keep the first _TEXT_LIMIT_HEAD_FRAC fraction
 # (opening context) and the last (1 - _TEXT_LIMIT_HEAD_FRAC) fraction (most-
 # recent intent), joined by _TRUNCATION_MARKER.  The tail bias reflects that
@@ -159,6 +163,15 @@ _WALKBACK_TAIL_LIMIT = _TRANSCRIPT_FALLBACK_LIMIT
 
 # Maximum final-user text length echoed into the INFO classification log line.
 _LOG_PROMPT_LIMIT = 200
+
+
+# In-flight sentinel for concurrent affirmation mitigation.  When two
+# simultaneous affirmation turns on the same session both read an empty cache,
+# only the first one that acquires ctx_key in this set calls the classifier;
+# the second uses the floor tier instead.  The lock is held only while
+# checking/inserting/removing; never held across the classifier network call.
+_affirmation_inflight_lock = threading.Lock()
+_affirmation_inflight: set[str] = set()
 
 
 def _prompt_log_preview(text: str) -> str:
@@ -265,6 +278,14 @@ _CLASSIFIER_SYSTEM_JSON = (
 # {"label":"standard","confidence":0.87} is ~14 tokens; 40 gives ample headroom.
 _CLASSIFIER_MAX_TOKENS_JSON = 40
 
+# Appended to _CLASSIFIER_SYSTEM_JSON when an affirmation call includes
+# prior_response_summary so the classifier knows to weight that context.
+_CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX = (
+    '\n\nWhen prior_response_summary is provided, judge complexity from the '
+    'context in prior_response_summary; it describes what the user is '
+    'agreeing to proceed with.'
+)
+
 # ---------------------------------------------------------------------------
 # Public data types
 # ---------------------------------------------------------------------------
@@ -283,7 +304,9 @@ ReasonCode = Literal[
     'session_cached_walkback_capped',
     'session_cached_walkback_tool_result',
     'affirmation_inherited',
-    'affirmation_floored_standard',
+    'affirmation_floored_standard',  # retained for old stats rows; retired from affirmation code path
+    'affirmation_classified',        # new: no cache, classifier called and succeeded
+    'affirmation_classifier_failed', # new: no cache, classifier failed or no prior text
     'rule_title_generation',
     'classifier_trivial',
     'classifier_standard',
@@ -336,6 +359,10 @@ class ModelRoutingDecision:
     classifier_summary_json: str | None = None # bounded JSON sent to the classifier
     classifier_raw_response: str | None = None # full concatenated text from classifier response blocks
     classifier_format: str | None = None       # 'standard' or 'json' response format
+    # Uncapped resolved tier for the affirmation_classified path only.
+    # The handler writes this (not routed_model) to the tier cache so subsequent
+    # turns can apply their own cap.  None on all other paths.
+    cache_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -362,8 +389,8 @@ class RoutingSummary:
     # routing-internal signals, not classifier complexity signals.
     is_short_affirmation: bool = False
 
-    def to_classifier_json(self) -> str:
-        return json.dumps({
+    def to_classifier_json(self, prior_response_summary: str | None = None) -> str:
+        d: dict = {
             'final_user_text': self.final_user_text,
             'text_truncated': self.text_truncated,
             'total_messages': self.total_messages,
@@ -373,7 +400,10 @@ class RoutingSummary:
             'tool_result_count': self.tool_result_count,
             'final_non_text_blocks': self.final_non_text_blocks,
             'has_images': self.has_images,
-        }, ensure_ascii=False)
+        }
+        if prior_response_summary is not None:
+            d['prior_response_summary'] = prior_response_summary
+        return json.dumps(d, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +659,58 @@ def build_routing_summary(payload: dict) -> RoutingSummary | None:
             text_from_final_message_directly and is_short_affirmation(final_user_text)
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Prior-response extraction helpers (affirmation enrichment)
+# ---------------------------------------------------------------------------
+
+def _extract_assistant_text(content) -> str:
+    """Extract text from an assistant message's content (str or list of blocks).
+
+    Malformed items (non-dict elements, non-str text values) are silently skipped.
+    Text blocks are concatenated with '\\n'.  Returns empty string if no text found.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    parts: list[str] = []
+    for element in content:
+        if not isinstance(element, dict):
+            continue  # gracefully skip malformed items
+        if element.get('type') == 'text':
+            text = element.get('text') or ''
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return '\n'.join(parts)
+
+
+def _truncate_prior_response(text: str, limit: int) -> str:
+    """Apply 30/70 head/tail truncation when text exceeds the configured limit."""
+    if len(text) <= limit:
+        return text
+    head_len = int(limit * _PRIOR_RESPONSE_HEAD_FRAC)
+    tail_len = limit - head_len - len(_TRUNCATION_MARKER)
+    return text[:head_len] + _TRUNCATION_MARKER + text[-tail_len:]
+
+
+def _extract_prior_response_summary(
+    messages: list,
+    limit: int,
+) -> str | None:
+    """Walk backward through messages to find the most recent assistant message with text.
+
+    Returns the (truncated) text or None if no text-bearing assistant message exists.
+    The caller must not classify bare affirmation text when None is returned.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+            continue
+        text = _extract_assistant_text(msg.get('content'))
+        if text:
+            return _truncate_prior_response(text, limit)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1303,20 +1385,20 @@ def route_model(
 
     # --- Short-affirmation continuation: a bare "yes"/"proceed"/"go ahead" as
     # THIS turn's own text carries no complexity signal — it greenlights work the
-    # prior turns already established.  Classifying it would label it trivial →
-    # haiku AND (because classification != None) poison the session tier cache,
-    # so the kicked-off complex task runs on the wrong low tier.  Treat it as a
-    # continuation: inherit the tier the planning turns already established, or
-    # floor to standard when there is no cache.  Both return classification=None,
-    # so the handler neither writes nor reads the tier cache for this turn.
-    # Reuses the cached_session_tier already threaded in (same value backing the
-    # walk-back branch above); only fires for Path-1 direct affirmations, so the
-    # cached tier reflects the prior conversation.  Positioned after the size
-    # floor (a large continuation still forces opus[1m]) and after the walk-back
-    # branch (a text-less continuation is handled there), before the classifier.
+    # prior turns already established.
+    #
+    # Cached-tier path: inherit the tier immediately (no classifier call).
+    # No-cache path: extract the prior assistant response and call the classifier
+    # with enriched input (prior_response_summary) so the turn is routed at the
+    # complexity of the work the user agreed to, not the bare "yes".  The result
+    # is written to the tier cache (via non-None classification) so subsequent
+    # tool-result turns inherit the established tier.  If no text-bearing
+    # assistant message exists (critical invariant) or the classifier call fails,
+    # fall back to the standard floor without writing the tier cache.
     if (config.auto_model_routing_affirmation_inherit
             and summary.is_short_affirmation):
         if cached_session_tier is not None:
+            # Cached path: inherit immediately, no classifier call.
             if baseline_model:
                 capped = _cap_cached_tier(
                     cached_session_tier, routing_baseline,
@@ -1334,24 +1416,132 @@ def route_model(
                 estimated_input_tokens=est_tokens,
                 classifier_mode='affirmation',
             )
-        standard_tier = config.auto_model_routing_classification['standard']
-        if baseline_model:
-            capped = _cap_cached_tier(
+
+        # No-cache path: try to extract the prior assistant response for enrichment.
+        prior_response_limit = getattr(
+            config, 'auto_model_routing_prior_response_summary_limit', 1000
+        )
+        messages_list = payload.get('messages') or []
+        prior_response_summary = _extract_prior_response_summary(
+            messages_list, prior_response_limit
+        )
+
+        def _affirmation_floor() -> ModelRoutingDecision:
+            standard_tier = config.auto_model_routing_classification['standard']
+            _capped = _cap_cached_tier(
                 standard_tier, routing_baseline,
                 label_map=config.auto_model_routing_classification,
+            ) if baseline_model else standard_tier
+            payload['model'] = _capped
+            return ModelRoutingDecision(
+                requested_model=requested,
+                routed_model=_capped,
+                classification=None,
+                applied=(_capped != requested),
+                reason_code='affirmation_classifier_failed',
+                estimated_input_tokens=est_tokens,
+                classifier_mode='affirmation',
             )
-        else:
-            capped = standard_tier
-        payload['model'] = capped
-        return ModelRoutingDecision(
-            requested_model=requested,
-            routed_model=capped,
-            classification=None,
-            applied=(capped != requested),
-            reason_code='affirmation_floored_standard',
-            estimated_input_tokens=est_tokens,
-            classifier_mode='affirmation',
-        )
+
+        # Critical invariant: do not classify bare affirmation text when no
+        # text-bearing assistant message exists.  This prevents a session-opening
+        # "yes" from writing a trivial tier to the cache before any real task is
+        # established.
+        if prior_response_summary is None:
+            return _affirmation_floor()
+
+        # Concurrent affirmation mitigation: only one classifier call per
+        # context key; others use the floor tier.
+        sentinel_acquired = False
+        if ctx_key is not None:
+            with _affirmation_inflight_lock:
+                if ctx_key in _affirmation_inflight:
+                    return _affirmation_floor()
+                _affirmation_inflight.add(ctx_key)
+                sentinel_acquired = True
+
+        aff_label: str | None = None
+        aff_routed: str | None = None
+        aff_cache_tier: str | None = None
+        aff_summary_json: str | None = None
+        try:
+            use_json = getattr(config, 'auto_model_routing_confidence_bump', False)
+            aff_summary_json = summary.to_classifier_json(
+                prior_response_summary=prior_response_summary
+            )
+            system = (
+                _CLASSIFIER_SYSTEM_JSON + _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX
+                if use_json
+                else _CLASSIFIER_SYSTEM
+            )
+            clf_payload = {
+                _SENTINEL_KEY: True,
+                'model': config.auto_model_routing_classifier_model,
+                'max_tokens': _CLASSIFIER_MAX_TOKENS_JSON if use_json else _CLASSIFIER_MAX_TOKENS,
+                'temperature': _CLASSIFIER_TEMPERATURE,
+                'system': system,
+                'messages': [{'role': 'user', 'content': aff_summary_json}],
+            }
+            logger.info(
+                '%s Model router: affirmation classifying with prior_response_summary '
+                '(summary_len=%d backend=%s requested=%s)',
+                log_tag, len(prior_response_summary), snapshot.name, requested,
+            )
+            send_fn = getattr(
+                snapshot.backend, 'send_classifier_message', snapshot.backend.send_message
+            )
+            response = send_fn(clf_payload, credentials, config)
+            if use_json:
+                parsed_json = parse_classifier_label_json(response)
+                label: str | None = parsed_json[0] if parsed_json else None
+            else:
+                label = parse_classifier_label(response)
+
+            if label is None:
+                logger.warning(
+                    '%s Model router: affirmation classifier returned invalid label '
+                    '(backend=%s) — using floor: raw=%r',
+                    log_tag, snapshot.name,
+                    _classifier_raw_text_preview(response),
+                )
+            else:
+                uncapped_tier = config.auto_model_routing_classification[label]
+                capped_tier = (
+                    _cap_cached_tier(
+                        uncapped_tier, routing_baseline,
+                        label_map=config.auto_model_routing_classification,
+                    )
+                    if baseline_model
+                    else uncapped_tier
+                )
+                aff_label = label
+                aff_routed = capped_tier
+                aff_cache_tier = uncapped_tier
+        except Exception as exc:
+            logger.warning(
+                '%s Model router: affirmation classifier call failed (backend=%s) — '
+                'using floor: %s',
+                log_tag, snapshot.name, exc,
+            )
+        finally:
+            if sentinel_acquired and ctx_key is not None:
+                with _affirmation_inflight_lock:
+                    _affirmation_inflight.discard(ctx_key)
+
+        if aff_label is not None:
+            payload['model'] = aff_routed
+            return ModelRoutingDecision(
+                requested_model=requested,
+                routed_model=aff_routed,  # type: ignore[arg-type]
+                cache_tier=aff_cache_tier,
+                classification=aff_label,
+                applied=(aff_routed != requested),
+                reason_code='affirmation_classified',
+                estimated_input_tokens=est_tokens,
+                classifier_mode='affirmation',
+                classifier_summary_json=aff_summary_json,
+            )
+        return _affirmation_floor()
 
     # --- Title-generation rule: prompts whose final paragraph is the
     # "Write the title in the predominant language of the session…" instruction

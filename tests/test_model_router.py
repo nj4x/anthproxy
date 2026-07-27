@@ -68,6 +68,7 @@ def _config(routing=True, classifier_model='haiku', long_context_threshold=190_0
     cfg.auto_model_routing_min_confidence = 0.0
     cfg.auto_model_routing_mode = 'classifier'
     cfg.auto_model_routing_task_tiers = None
+    cfg.auto_model_routing_prior_response_summary_limit = 1000
     cfg.lock_requested_model = 'off'
     return cfg
 
@@ -141,6 +142,7 @@ class TestReasonCode:
             'missing_final_user_text', 'session_cached_tier', 'session_cached_walkback',
             'session_cached_tier_capped', 'session_cached_walkback_capped',
             'affirmation_inherited', 'affirmation_floored_standard',
+            'affirmation_classified', 'affirmation_classifier_failed',
             'rule_title_generation',
             'classifier_trivial', 'classifier_standard', 'classifier_deep',
             'classifier_failed', 'classifier_invalid',
@@ -148,12 +150,14 @@ class TestReasonCode:
         assert expected.issubset(set(args))
 
     def test_affirmation_reason_codes_are_valid(self):
-        """Both affirmation reason codes must be in the ReasonCode Literal."""
+        """All affirmation reason codes must be in the ReasonCode Literal."""
         from anthproxy.model_router import ReasonCode
         import typing
         args = typing.get_args(ReasonCode)
         assert 'affirmation_inherited' in args
-        assert 'affirmation_floored_standard' in args
+        assert 'affirmation_floored_standard' in args  # retained for old stats rows
+        assert 'affirmation_classified' in args
+        assert 'affirmation_classifier_failed' in args
 
     def test_route_model_still_returns_missing_final_user_text_for_textless_payload(self):
         """route_model itself is unchanged: text-less payloads still fail-closed."""
@@ -1916,6 +1920,7 @@ class TestRouteModelCustomClassification:
         backend.send_message.assert_not_called()
 
     def test_affirmation_floored_to_configured_standard(self):
+        # No prior assistant message → critical invariant fires; uses floor without calling classifier.
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = _text_response('trivial')
@@ -1926,7 +1931,7 @@ class TestRouteModelCustomClassification:
         assert payload['model'] == 'fable'
         assert decision.routed_model == 'fable'
         assert decision.classification is None
-        assert decision.reason_code == 'affirmation_floored_standard'
+        assert decision.reason_code == 'affirmation_classifier_failed'
         backend.send_message.assert_not_called()
 
 
@@ -2342,7 +2347,8 @@ class TestRouteAffirmation:
         assert decision.reason_code == 'affirmation_inherited'
         backend.send_message.assert_not_called()
 
-    def test_floors_to_standard_when_no_cache(self):
+    def test_floors_to_standard_when_no_cache_no_prior(self):
+        # No prior assistant message → critical invariant fires; uses floor (affirmation_classifier_failed).
         backend = self._backend('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='yes')
@@ -2350,15 +2356,21 @@ class TestRouteAffirmation:
         assert payload['model'] == 'sonnet'
         assert decision.routed_model == 'sonnet'
         assert decision.classification is None
-        assert decision.reason_code == 'affirmation_floored_standard'
+        assert decision.reason_code == 'affirmation_classifier_failed'
         backend.send_message.assert_not_called()
 
     def test_classification_none_so_handler_does_not_cache(self):
-        """Both affirmation outcomes return classification=None (no cache write)."""
+        """Affirmation paths that don't call the classifier return classification=None.
+
+        - cached path (affirmation_inherited): classification=None (no cache write).
+        - floor path (affirmation_classifier_failed, no prior assistant text):
+          classification=None (no cache write).
+        Note: the affirmation_classified path DOES return non-None classification.
+        """
         backend = self._backend('trivial')
         snap = _snapshot(backend=backend, routing=True)
         for cached in ('opus', None):
-            payload = _payload(model='sonnet', content='yes')
+            payload = _payload(model='sonnet', content='yes')  # single user msg, no prior assistant
             decision = route_model(payload, snap, {}, cached_session_tier=cached)
             assert decision.classification is None
 
@@ -2392,6 +2404,405 @@ class TestRouteAffirmation:
         decision = route_model(payload, snap, {}, cached_session_tier='opus')
         assert decision.reason_code == 'classifier_standard'
         backend.send_message.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Prior-response affirmation enrichment
+# ---------------------------------------------------------------------------
+
+def _payload_with_prior(affirmation: str, prior_assistant_text: str, model: str = 'sonnet'):
+    """Build a payload with a prior assistant message (text) followed by an affirmation."""
+    return {
+        'model': model,
+        'messages': [
+            {'role': 'user', 'content': 'Plan the refactor'},
+            {'role': 'assistant', 'content': prior_assistant_text},
+            {'role': 'user', 'content': affirmation},
+        ],
+    }
+
+
+def _payload_with_prior_blocks(affirmation: str, prior_blocks: list, model: str = 'sonnet'):
+    """Build a payload where the prior assistant message uses block content."""
+    return {
+        'model': model,
+        'messages': [
+            {'role': 'user', 'content': 'Plan the refactor'},
+            {'role': 'assistant', 'content': prior_blocks},
+            {'role': 'user', 'content': affirmation},
+        ],
+    }
+
+
+class TestAffirmationEnrichment:
+    """Tests for the prior-response affirmation enrichment feature."""
+
+    def _snap(self, label: str = 'standard', **kw):
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = _text_response(label)
+        return _snapshot(backend=backend, routing=True, **kw), backend
+
+    # ------------------------------------------------------------------
+    # 1. Cached tier path: no classifier call
+    # ------------------------------------------------------------------
+
+    def test_cached_tier_no_classifier(self):
+        snap, backend = self._snap()
+        payload = _payload_with_prior('yes', 'I will implement X')
+        decision = route_model(payload, snap, {}, cached_session_tier='opus')
+        assert decision.reason_code == 'affirmation_inherited'
+        assert decision.classification is None
+        backend.send_message.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 2. No-cache with prior response: classifier called, result cached
+    # ------------------------------------------------------------------
+
+    def test_no_cache_with_prior_response_calls_classifier(self):
+        snap, backend = self._snap('standard')
+        payload = _payload_with_prior('yes', 'I will implement X by refactoring the module')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.classification == 'standard'
+        assert decision.routed_model == 'sonnet'
+        assert decision.classifier_mode == 'affirmation'
+        backend.send_message.assert_called_once()
+
+    def test_no_cache_prior_response_prior_response_summary_in_json(self):
+        """prior_response_summary field is injected into the classifier JSON."""
+        snap, backend = self._snap('standard')
+        payload = _payload_with_prior('yes', 'Implement auth middleware')
+        route_model(payload, snap, {}, cached_session_tier=None)
+        call_args = backend.send_message.call_args[0][0]  # first positional arg
+        user_content = call_args['messages'][0]['content']
+        parsed = json.loads(user_content)
+        assert 'prior_response_summary' in parsed
+        assert 'Implement auth middleware' in parsed['prior_response_summary']
+
+    def test_no_cache_result_has_cache_tier(self):
+        """affirmation_classified returns cache_tier (uncapped) and routed_model (capped)."""
+        snap, backend = self._snap('deep')
+        payload = _payload_with_prior('yes', 'Redesign the auth layer', model='haiku')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.classification == 'deep'
+        assert decision.cache_tier == 'opus'
+        assert decision.routed_model == 'opus'
+
+    # ------------------------------------------------------------------
+    # 3. No prior text in last assistant message: backward walk
+    # ------------------------------------------------------------------
+
+    def test_backward_walk_finds_earlier_assistant_text(self):
+        """Walk-back finds text in an earlier assistant message when the last has only tool_use."""
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = _text_response('standard')
+        snap = _snapshot(backend=backend, routing=True)
+        payload = {
+            'model': 'sonnet',
+            'messages': [
+                {'role': 'user', 'content': 'Plan refactor'},
+                {'role': 'assistant', 'content': 'I will refactor the module in three steps'},
+                {'role': 'user', 'content': 'ok'},
+                {'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': 'tu1', 'name': 'bash', 'input': {}}
+                ]},
+                {'role': 'user', 'content': 'yes'},
+            ],
+        }
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classified'
+        backend.send_message.assert_called_once()
+
+    def test_no_text_in_any_assistant_message_uses_floor(self):
+        """If no text-bearing assistant message exists anywhere, use floor (no cache write)."""
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = _text_response('standard')
+        snap = _snapshot(backend=backend, routing=True)
+        payload = {
+            'model': 'sonnet',
+            'messages': [
+                {'role': 'user', 'content': 'Plan refactor'},
+                {'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': 'tu1', 'name': 'bash', 'input': {}}
+                ]},
+                {'role': 'user', 'content': 'yes'},
+            ],
+        }
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classifier_failed'
+        assert decision.classification is None
+        backend.send_message.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 4. Session-opening affirmation: no prior message at all
+    # ------------------------------------------------------------------
+
+    def test_session_opening_affirmation_uses_floor(self):
+        """First turn is an affirmation: no prior assistant message → floor, no cache."""
+        snap, backend = self._snap()
+        payload = _payload(model='sonnet', content='yes')  # single user message
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classifier_failed'
+        assert decision.classification is None
+        backend.send_message.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 5. Text extraction (string content)
+    # ------------------------------------------------------------------
+
+    def test_prior_response_string_content_extracted(self):
+        """Plain-string assistant content is extracted and sent as prior_response_summary."""
+        snap, backend = self._snap('deep')
+        payload = _payload_with_prior('proceed', 'Redesign the entire auth layer for SSO')
+        route_model(payload, snap, {}, cached_session_tier=None)
+        user_content = backend.send_message.call_args[0][0]['messages'][0]['content']
+        parsed = json.loads(user_content)
+        assert parsed['prior_response_summary'] == 'Redesign the entire auth layer for SSO'
+
+    def test_prior_response_truncation_30_70(self):
+        """Prior response longer than limit is truncated 30/70 head/tail."""
+        from anthproxy.model_router import _TRUNCATION_MARKER
+        snap, backend = self._snap('standard')
+        snap.config.auto_model_routing_prior_response_summary_limit = 50
+        long_text = 'A' * 30 + 'B' * 100
+        payload = _payload_with_prior('yes', long_text)
+        route_model(payload, snap, {}, cached_session_tier=None)
+        user_content = backend.send_message.call_args[0][0]['messages'][0]['content']
+        parsed = json.loads(user_content)
+        summary = parsed['prior_response_summary']
+        assert len(summary) == 50
+        assert _TRUNCATION_MARKER in summary
+
+    # ------------------------------------------------------------------
+    # 6. Text extraction (list content)
+    # ------------------------------------------------------------------
+
+    def test_prior_response_list_content_text_blocks_collected(self):
+        """Text blocks from list content are concatenated; non-text blocks skipped."""
+        snap, backend = self._snap('standard')
+        prior_blocks = [
+            {'type': 'text', 'text': 'First step: refactor'},
+            {'type': 'tool_use', 'id': 'tu1', 'name': 'bash', 'input': {}},
+            {'type': 'text', 'text': 'Second step: test'},
+        ]
+        payload = _payload_with_prior_blocks('yes', prior_blocks)
+        route_model(payload, snap, {}, cached_session_tier=None)
+        user_content = backend.send_message.call_args[0][0]['messages'][0]['content']
+        parsed = json.loads(user_content)
+        summary = parsed['prior_response_summary']
+        assert 'First step: refactor' in summary
+        assert 'Second step: test' in summary
+
+    # ------------------------------------------------------------------
+    # 7. Malformed content (non-dict items)
+    # ------------------------------------------------------------------
+
+    def test_malformed_content_non_dict_items_skipped(self):
+        """Non-dict items in assistant content list are silently skipped (no crash)."""
+        snap, backend = self._snap('standard')
+        prior_blocks = [
+            'not a dict',
+            {'type': 'text', 'text': 'Valid text block'},
+            42,
+        ]
+        payload = _payload_with_prior_blocks('yes', prior_blocks)
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        # The valid text block is found; classifier is called.
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.classification == 'standard'
+
+    # ------------------------------------------------------------------
+    # 8. Classifier failure (network error)
+    # ------------------------------------------------------------------
+
+    def test_classifier_failure_uses_floor_no_cache(self):
+        """Classifier network error → floor tier; classification=None; no cache write."""
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.side_effect = RuntimeError('timeout')
+        snap = _snapshot(backend=backend, routing=True)
+        payload = _payload_with_prior('yes', 'Implement the feature')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classifier_failed'
+        assert decision.classification is None
+        assert decision.routed_model == 'sonnet'  # standard floor
+
+    # ------------------------------------------------------------------
+    # 10. Baseline lock: cache_tier uncapped, routed_model capped
+    # ------------------------------------------------------------------
+
+    def test_baseline_lock_cache_tier_uncapped_routed_capped(self):
+        """With baseline_model=haiku, cache_tier is the raw opus, routed_model is capped."""
+        snap, backend = self._snap('deep')
+        payload = _payload_with_prior('yes', 'Redesign auth')
+        # baseline_model=haiku means deep→opus gets capped to haiku
+        decision = route_model(payload, snap, {}, cached_session_tier=None,
+                               baseline_model='haiku')
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.cache_tier == 'opus'   # uncapped
+        assert decision.routed_model == 'haiku'  # capped by baseline
+
+    # ------------------------------------------------------------------
+    # 11. No upgrade cap applies when no baseline_model
+    # ------------------------------------------------------------------
+
+    def test_no_upgrade_cap_without_baseline(self):
+        """Without baseline_model, the tier from the classifier is used directly."""
+        snap, backend = self._snap('trivial')
+        payload = _payload_with_prior('yes', 'Format the file', model='opus')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.routed_model == 'haiku'
+        assert decision.cache_tier == 'haiku'
+
+    # ------------------------------------------------------------------
+    # 12. routed_model derivation
+    # ------------------------------------------------------------------
+
+    def test_routed_model_equals_capped_tier(self):
+        """routed_model is the capped tier; cache_tier is the uncapped value."""
+        snap, backend = self._snap('standard')
+        snap.config.auto_model_routing_classification = {
+            'trivial': 'haiku', 'standard': 'fable', 'deep': 'opus'
+        }
+        payload = _payload_with_prior('yes', 'Implement the feature')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.classification == 'standard'
+        assert decision.routed_model == 'fable'
+        assert decision.cache_tier == 'fable'
+
+    # ------------------------------------------------------------------
+    # 13. ctx_key=None gate: classification returns non-None but no cache write
+    # ------------------------------------------------------------------
+
+    def test_ctx_key_none_classification_still_routes(self):
+        """ctx_key=None: affirmation_classified routes correctly (cache write skipped by handler)."""
+        snap, backend = self._snap('standard')
+        payload = _payload_with_prior('yes', 'Implement auth')
+        decision = route_model(payload, snap, {}, cached_session_tier=None,
+                               ctx_key=None)
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.classification == 'standard'
+        assert decision.routed_model == 'sonnet'
+
+    # ------------------------------------------------------------------
+    # 15. to_classifier_json with prior_response_summary
+    # ------------------------------------------------------------------
+
+    def test_to_classifier_json_with_prior_response_summary(self):
+        """prior_response_summary is merged into the JSON dict when non-None."""
+        summary = build_routing_summary({'model': 'sonnet', 'messages': [
+            {'role': 'user', 'content': 'yes'}
+        ]})
+        assert summary is not None
+        j = summary.to_classifier_json(prior_response_summary='do the thing')
+        parsed = json.loads(j)
+        assert parsed['prior_response_summary'] == 'do the thing'
+
+    def test_to_classifier_json_without_prior_response_summary(self):
+        """prior_response_summary is absent from JSON when None (default)."""
+        summary = build_routing_summary({'model': 'sonnet', 'messages': [
+            {'role': 'user', 'content': 'hi'}
+        ]})
+        assert summary is not None
+        j = summary.to_classifier_json()
+        parsed = json.loads(j)
+        assert 'prior_response_summary' not in parsed
+
+    # ------------------------------------------------------------------
+    # confidence_bump=True in the affirmation no-cache path
+    # ------------------------------------------------------------------
+
+    def test_confidence_bump_true_uses_json_system_prompt_and_parser(self):
+        """When confidence_bump=True, the affirmation classifier call uses
+        _CLASSIFIER_SYSTEM_JSON + _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX and
+        parse_classifier_label_json, not the one-word prompt/parser."""
+        from anthproxy.model_router import _CLASSIFIER_SYSTEM_JSON, _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = {
+            'content': [{'type': 'text', 'text': '{"label":"standard","confidence":0.92}'}],
+            'usage': {'input_tokens': 10, 'output_tokens': 8},
+        }
+        snap = _snapshot(backend=backend, routing=True)
+        snap.config.auto_model_routing_confidence_bump = True
+        snap.config.auto_model_routing_min_confidence = 0.0
+
+        payload = _payload_with_prior('yes', 'Implement auth middleware')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+
+        assert decision.reason_code == 'affirmation_classified'
+        assert decision.classification == 'standard'
+        assert decision.routed_model == 'sonnet'
+
+        call_args = backend.send_message.call_args[0][0]
+        system_used = call_args['system']
+        assert _CLASSIFIER_SYSTEM_JSON in system_used
+        assert _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX in system_used
+
+    def test_confidence_bump_true_invalid_json_response_falls_to_floor(self):
+        """When confidence_bump=True and the classifier returns an invalid JSON
+        response, the affirmation path falls back to floor (affirmation_classifier_failed)."""
+        backend = MagicMock()
+        del backend.send_classifier_message
+        backend.send_message.return_value = {
+            'content': [{'type': 'text', 'text': 'standard'}],  # one-word: invalid for JSON parser
+        }
+        snap = _snapshot(backend=backend, routing=True)
+        snap.config.auto_model_routing_confidence_bump = True
+
+        payload = _payload_with_prior('proceed', 'Implement the feature')
+        decision = route_model(payload, snap, {}, cached_session_tier=None)
+
+        assert decision.reason_code == 'affirmation_classifier_failed'
+        assert decision.classification is None
+
+
+# ---------------------------------------------------------------------------
+# Config validation for prior_response_summary_limit
+# ---------------------------------------------------------------------------
+
+class TestPriorResponseSummaryLimitConfig:
+    """Validate the auto_model_routing_prior_response_summary_limit config option."""
+
+    def test_limit_below_50_raises(self):
+        """Limit < 50 raises ValueError."""
+        from anthproxy.config import parse_args
+        with pytest.raises((ValueError, SystemExit)):
+            parse_args(['--auto-model-routing',
+                        '--auto-model-routing-prior-response-summary-limit', '49'])
+
+    def test_limit_above_32000_raises(self):
+        """Limit > 32000 raises ValueError."""
+        from anthproxy.config import parse_args
+        with pytest.raises((ValueError, SystemExit)):
+            parse_args(['--auto-model-routing',
+                        '--auto-model-routing-prior-response-summary-limit', '32001'])
+
+    def test_limit_at_50_valid(self):
+        """Limit = 50 is valid (minimum boundary)."""
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--auto-model-routing',
+                          '--auto-model-routing-prior-response-summary-limit', '50'])
+        assert cfg.auto_model_routing_prior_response_summary_limit == 50
+
+    def test_limit_at_32000_valid(self):
+        """Limit = 32000 is valid (maximum boundary)."""
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--auto-model-routing',
+                          '--auto-model-routing-prior-response-summary-limit', '32000'])
+        assert cfg.auto_model_routing_prior_response_summary_limit == 32000
+
+    def test_default_limit_is_1000(self):
+        """Default limit is 1000."""
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--auto-model-routing'])
+        assert cfg.auto_model_routing_prior_response_summary_limit == 1000
 
 
 # ---------------------------------------------------------------------------
@@ -2472,14 +2883,14 @@ class TestRoutingOrderInvariants:
         # Classifier must NOT have been called.
         backend.send_message.assert_not_called()
 
-    def test_affirmation_floor_before_classifier(self):
-        """affirmation_floored_standard fires before classifier when no cached tier."""
+    def test_affirmation_no_prior_text_does_not_call_classifier(self):
+        """Critical invariant: no prior text-bearing assistant message → floor without classifier call."""
         backend = _classifier_backend('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='proceed')
         decision = route_model(payload, snap, {}, cached_session_tier=None)
-        assert decision.reason_code == 'affirmation_floored_standard'
-        # Classifier must NOT have been called.
+        assert decision.reason_code == 'affirmation_classifier_failed'
+        # Classifier must NOT have been called (no prior assistant text).
         backend.send_message.assert_not_called()
 
     # ------------------------------------------------------------------
@@ -2615,13 +3026,13 @@ class TestModelRoutingDecisionTelemetry:
         assert decision.classifier_mode == 'affirmation'
         assert decision.classifier_confidence is None
 
-    def test_affirmation_floored_standard_sets_classifier_mode(self):
-        """affirmation_floored_standard sets classifier_mode='affirmation'."""
+    def test_affirmation_classifier_failed_sets_classifier_mode(self):
+        """affirmation_classifier_failed (no prior text) sets classifier_mode='affirmation'."""
         backend = _classifier_backend('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='proceed')
         decision = route_model(payload, snap, {}, cached_session_tier=None)
-        assert decision.reason_code == 'affirmation_floored_standard'
+        assert decision.reason_code == 'affirmation_classifier_failed'
         assert decision.classifier_mode == 'affirmation'
 
     # ------------------------------------------------------------------
@@ -3065,12 +3476,13 @@ class TestClassifierTransparencyFields:
         assert decision.classifier_raw_response is None
         assert decision.classifier_format is None
 
-    def test_affirmation_floored_standard_fields_are_none(self):
+    def test_affirmation_classifier_failed_fields_are_none(self):
+        # No prior text → affirmation_classifier_failed; transparency fields remain None.
         backend = _classifier_backend('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='proceed')
         decision = route_model(payload, snap, {}, cached_session_tier=None)
-        assert decision.reason_code == 'affirmation_floored_standard'
+        assert decision.reason_code == 'affirmation_classifier_failed'
         assert decision.classifier_model is None
         assert decision.classifier_summary_json is None
         assert decision.classifier_raw_response is None

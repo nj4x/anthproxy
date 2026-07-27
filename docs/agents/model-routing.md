@@ -15,7 +15,7 @@ Refer to `config.py`, `model_config.py`, and `model_router.py` for mutable confi
 - Record each response's context floor from distinct normalized usage fields. Across SSE events, track usage fields by maximum rather than summing cumulative re-statements.
 - The tier cache is a last-resort fallback for missing final-user text. Cached tiers must not upgrade above the actual requested tier and must fail open for non-tier model identifiers.
 - Classification input is bounded and excludes system prompts, tool schemas, thinking, effort, history, metadata, and headers. Text recovery prefers the final user turn, then transcript recovery, then bounded walk-back.
-- Short direct user affirmations inherit the cached tier when available; without one they use the configured floor. They must not overwrite the tier cache.
+- Short direct user affirmations inherit the cached tier when available; without one, call the classifier — with prior-response context if a text-bearing assistant message exists, otherwise skip the classifier entirely — and write the result to the tier cache to serve subsequent turns. Fall back to the configured floor only when the classifier call itself fails or no prior assistant text is available.
 - Classifier traffic is isolated from user-visible statistics, automatic backend switching/retry, and provider kill-switch behavior. Never hold registry or selector locks across classifier network calls.
 - Planning, design, and outline requests must not be classified below the configured standard floor.
 

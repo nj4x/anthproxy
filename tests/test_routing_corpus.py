@@ -74,6 +74,7 @@ def _config(
     cfg.auto_model_routing_min_confidence = 0.0
     cfg.auto_model_routing_mode = 'classifier'
     cfg.auto_model_routing_task_tiers = None
+    cfg.auto_model_routing_prior_response_summary_limit = 1000
     return cfg
 
 

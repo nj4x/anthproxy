@@ -104,6 +104,7 @@ class Config:
     auto_model_routing_min_confidence: float = 0.0
     auto_model_routing_mode: str = 'classifier'
     auto_model_routing_task_tiers: dict[str, str] | None = None
+    auto_model_routing_prior_response_summary_limit: int = 1000
     lock_requested_model: str = 'claude-sonnet-4-6'      # Model baseline lock for routing; 'off' disables
     sse_keepalive_interval: float = 10.0
     db_path: str | None = None   # Path to SQLite DB file; None disables DB recording
@@ -297,6 +298,16 @@ def parse_args(argv=None) -> Config:
              'Unknown task names fail-closed to the requested model. '
              '(env: ANTHPROXY_AUTO_MODEL_ROUTING_TASK_TIERS)',
     )
+    p.add_argument(
+        '--auto-model-routing-prior-response-summary-limit',
+        dest='auto_model_routing_prior_response_summary_limit', type=int,
+        default=int(os.environ.get(
+            'ANTHPROXY_AUTO_MODEL_ROUTING_PRIOR_RESPONSE_SUMMARY_LIMIT', '1000')),
+        help='Maximum characters of the prior assistant response sent to the classifier '
+             'during affirmation enrichment (30/70 head/tail split). '
+             'Valid range: [50, 32000]. '
+             '(default: 1000, env: ANTHPROXY_AUTO_MODEL_ROUTING_PRIOR_RESPONSE_SUMMARY_LIMIT)',
+    )
     p.add_argument('--lock-requested-model', dest='lock_requested_model',
                    default=os.environ.get('ANTHPROXY_LOCK_REQUESTED_MODEL', 'claude-sonnet-4-6'),
                    help='Override the incoming request model with a fixed baseline before'
@@ -365,6 +376,12 @@ def parse_args(argv=None) -> Config:
         p.error('--auto-model-routing-long-context-threshold must be >= 0')
     if cfg.codex_context_limit < 0:
         p.error('--codex-context-limit must be >= 0')
+    prior_limit = cfg.auto_model_routing_prior_response_summary_limit
+    if prior_limit < 50 or prior_limit > 32_000:
+        raise ValueError(
+            f'auto_model_routing_prior_response_summary_limit must be in [50, 32000], '
+            f'got {prior_limit}'
+        )
     # Default db_path when enable_ui is set and no explicit path was given
     if cfg.enable_ui and cfg.db_path is None:
         cfg.db_path = str(Path.home() / '.anthproxy' / 'anthproxy.db')

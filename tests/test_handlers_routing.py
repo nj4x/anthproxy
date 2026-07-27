@@ -65,6 +65,7 @@ def _fake_snapshot(name, backend, session_pinned=False, session_subscription=Fal
     snapshot.config.auto_model_routing_min_confidence = 0.0
     snapshot.config.auto_model_routing_mode = 'classifier'
     snapshot.config.lock_requested_model = 'off'
+    snapshot.config.auto_model_routing_prior_response_summary_limit = 1000
     snapshot.session_pinned = session_pinned
     snapshot.session_subscription = session_subscription
     return snapshot
@@ -1610,9 +1611,9 @@ class TestSessionTierCache:
         # affirmation can never poison the conversation's established tier.
         registry.set_session_routed_tier.assert_not_called()
 
-    def test_affirmation_floors_to_standard_when_uncached(self, caplog):
-        """A bare 'yes' with no cached tier floors to sonnet (never haiku), no
-        classifier call, no cache write."""
+    def test_affirmation_classifies_when_uncached_with_prior_response(self, caplog):
+        """A bare 'yes' with no cached tier and a prior assistant message calls the
+        classifier with enriched input; the result is written to the tier cache."""
         import copy
         handler, registry, backend = self._make_handler(
             auto_routing=True, cached_tier=None)
@@ -1623,10 +1624,10 @@ class TestSessionTierCache:
         with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
             handler._handle_messages()
 
-        assert payload['model'] == 'sonnet'
-        backend.send_classifier_message.assert_not_called()
-        assert 'reason=affirmation_floored_standard' in caplog.text
-        registry.set_session_routed_tier.assert_not_called()
+        assert payload['model'] == 'sonnet'  # classifier returned 'standard' → sonnet
+        backend.send_classifier_message.assert_called_once()
+        assert 'reason=affirmation_classified' in caplog.text
+        registry.set_session_routed_tier.assert_called_once()
 
     def test_affirmation_full_chain_complex_task_keeps_opus(self, caplog):
         """End-to-end: a cached opus tier survives a 'yes' affirmation and the

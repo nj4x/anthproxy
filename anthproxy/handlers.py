@@ -725,7 +725,14 @@ def prepare_routing(handler, payload, sess_key):
     if ctx_key is not None:
         if routing.classification is not None:
             # A valid classification was produced; persist the tier.
-            handler.registry.set_session_routed_tier(ctx_key, routing.routed_model)
+            # For affirmation_classified, write the uncapped cache_tier so
+            # subsequent turns can apply their own cap when reading from cache.
+            if routing.reason_code == 'affirmation_classified':
+                handler.registry.set_session_routed_tier(
+                    ctx_key, routing.cache_tier or routing.routed_model
+                )
+            else:
+                handler.registry.set_session_routed_tier(ctx_key, routing.routed_model)
         elif routing.reason_code == 'missing_final_user_text':
             cached = handler.registry.session_routed_tier(ctx_key)
             if cached is not None:
