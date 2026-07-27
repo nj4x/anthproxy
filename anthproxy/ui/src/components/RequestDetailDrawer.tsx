@@ -387,8 +387,12 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                     </div>
 
                     <div className="text-xs">
-                      <span className="text-gray-400">System prompt: </span>
+                      <span className="text-gray-400">Request system prompt: </span>
                       <span className="text-gray-500 italic">excluded — not sent to classifier</span>
+                    </div>
+                    <div className="text-xs">
+                      <span className="text-gray-400">Classifier system prompt: </span>
+                      <span className="text-gray-500 italic">rules for one-word labels + planning/design floor</span>
                     </div>
 
                     <div className="text-xs">
