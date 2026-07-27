@@ -283,4 +283,10 @@ export interface RequestDetail extends RequestRecord {
   system_prompt_char_count: number | null;
   tools_content: string | null;
   tools_char_count: number | null;
+  // ADR 0010/0011: weighted blend fields
+  system_prompt_tier: string | null;
+  system_prompt_score: number | null;
+  user_prompt_score: number | null;
+  routing_weighted_score: number | null;
+  system_prompt_classification_failed: number | null;
 }

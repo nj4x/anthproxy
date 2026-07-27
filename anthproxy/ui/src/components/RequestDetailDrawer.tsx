@@ -404,6 +404,34 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                       </span>
                     </div>
 
+                    {/* System-prompt tier blend (ADR 0010/0011) */}
+                    {data.routing_weighted_score != null && (
+                      <div className="bg-blue-50 rounded p-3 space-y-2 text-xs">
+                        <div className="font-medium text-blue-700">System-prompt blend</div>
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                          <div>
+                            <span className="text-gray-400">Sys-prompt tier: </span>
+                            <span className="text-gray-700 font-mono">{data.system_prompt_tier ?? '—'}</span>
+                          </div>
+                          <div>
+                            <span className="text-gray-400">Sys-prompt score: </span>
+                            <span className="text-gray-700 font-mono">{data.system_prompt_score?.toFixed(1) ?? '—'}</span>
+                          </div>
+                          <div>
+                            <span className="text-gray-400">User-prompt score: </span>
+                            <span className="text-gray-700 font-mono">{data.user_prompt_score?.toFixed(1) ?? '—'}</span>
+                          </div>
+                          <div>
+                            <span className="text-gray-400">Weighted score: </span>
+                            <span className="text-gray-700 font-mono">{data.routing_weighted_score?.toFixed(2) ?? '—'}</span>
+                          </div>
+                        </div>
+                        {data.system_prompt_classification_failed === 1 && (
+                          <div className="text-amber-600">⚠ System-prompt classifier failed — used standard (1.0) fallback</div>
+                        )}
+                      </div>
+                    )}
+
                     {parsedSummary && (
                       <div className="bg-gray-50 rounded p-3 space-y-3 text-xs">
                         {parsedSummary.final_user_text && (
