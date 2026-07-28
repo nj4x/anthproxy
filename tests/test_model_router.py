@@ -30,6 +30,7 @@ from anthproxy.model_router import (
     RoutingSummary,
     _classify_system_prompt,
     _extract_system_prompt_preview,
+    _score_to_tier,
     _sys_prompt_cache,
     _sys_prompt_cache_lock,
     build_classifier_payload,
@@ -80,8 +81,8 @@ def _config(routing=True, classifier_model='haiku', long_context_threshold=190_0
     # ADR 0010/0012: weighted blend config — concrete values so comparisons work.
     cfg.auto_model_routing_system_prompt_weight = 0.30
     cfg.auto_model_routing_user_prompt_weight = 0.70
-    cfg.auto_model_routing_trivial_threshold = 0.75
-    cfg.auto_model_routing_standard_threshold = 1.50
+    cfg.auto_model_routing_trivial_threshold = 38.0
+    cfg.auto_model_routing_standard_threshold = 75.0
     cfg.auto_model_routing_system_prompt_cache_size = 256
     cfg.auto_model_routing_system_prompt_preview_limit = 500
     return cfg
@@ -101,7 +102,7 @@ def _snapshot(backend=None, routing=True, classifier_model='haiku',
     snap.name = 'anthropic'
     if backend is None:
         backend = MagicMock()
-        backend.send_message.return_value = _text_response('standard')
+        backend.send_message.return_value = _score_response('standard')
         if not hasattr(backend, 'send_classifier_message'):
             del backend.send_classifier_message  # force duck-typed fallback
     snap.backend = backend
@@ -123,6 +124,20 @@ def _payload(model='sonnet', content='Hello', messages=None, **extra):
 def _text_response(label: str) -> dict:
     return {
         'content': [{'type': 'text', 'text': label}],
+        'stop_reason': 'end_turn',
+    }
+
+
+# Canonical 0-100 numeric scores for each tier; proportional to the old 0-2 label-score
+# mapping (trivial=0/2*100=0, standard=1/2*100=50, deep=2/2*100=100).
+# Preserves prior routing behavior with default thresholds (38/75) and weights (0.3/0.7).
+_LABEL_SCORE_STR = {'trivial': '0', 'standard': '50', 'deep': '100'}
+
+
+def _score_response(label: str) -> dict:
+    """Build a numeric classifier response for routing tests."""
+    return {
+        'content': [{'type': 'text', 'text': _LABEL_SCORE_STR[label]}],
         'stop_reason': 'end_turn',
     }
 
@@ -276,7 +291,7 @@ class TestNotEligible:
         """Any non-empty string model (incl. opus) is eligible for routing."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('trivial')
+        backend.send_message.return_value = _score_response('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='opus', content='Hello')
         decision = route_model(payload, snap, {})
@@ -289,19 +304,21 @@ class TestNotEligible:
         """Full Anthropic model IDs are eligible for routing."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('deep')
+        backend.send_message.return_value = _score_response('deep')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='claude-sonnet-4-6', content='Design a system')
         decision = route_model(payload, snap, {})
+        # user=deep(100), no sys → midpoint(56); blend=round(0.3*56+0.7*100)=87 → deep
         assert payload['model'] == 'opus'
         assert decision.requested_model == 'claude-sonnet-4-6'
         assert decision.reason_code == 'classifier_deep'
+        assert decision.applied is True
 
     def test_standard_label_always_rewrites_to_sonnet_alias(self):
         """A 'standard' classifier label rewrites any model to the bare 'sonnet' alias."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('standard')
+        backend.send_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='opus', content='Normal task')
         decision = route_model(payload, snap, {})
@@ -325,7 +342,7 @@ def _classifier_backend(label='standard'):
     """A backend whose only classification path is the duck-typed send_message."""
     backend = MagicMock()
     del backend.send_classifier_message  # force send_message fallback
-    backend.send_message.return_value = _text_response(label)
+    backend.send_message.return_value = _score_response(label)
     return backend
 
 
@@ -588,7 +605,7 @@ class TestSentinel:
 class TestHardOverrides:
     def test_thinking_enabled_falls_through_to_classifier(self):
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response('trivial')
+        backend.send_classifier_message.return_value = _score_response('trivial')
         payload = _payload(
             model='sonnet',
             **{'thinking': {'type': 'enabled', 'budget_tokens': 1000}},
@@ -602,7 +619,7 @@ class TestHardOverrides:
 
     def test_thinking_adaptive_falls_through_to_classifier(self):
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response('standard')
+        backend.send_classifier_message.return_value = _score_response('standard')
         payload = _payload(model='sonnet', **{'thinking': {'type': 'adaptive'}})
         snap = _snapshot(backend=backend, routing=True)
         decision = route_model(payload, snap, {})
@@ -613,7 +630,7 @@ class TestHardOverrides:
 
     def test_thinking_disabled_falls_through_to_classifier(self):
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response('standard')
+        backend.send_classifier_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', **{'thinking': {'type': 'disabled'}})
         decision = route_model(payload, snap, {})
@@ -623,10 +640,11 @@ class TestHardOverrides:
     @pytest.mark.parametrize('effort', ['high', 'xhigh', 'max'])
     def test_high_effort_falls_through_to_classifier(self, effort):
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response('deep')
+        backend.send_classifier_message.return_value = _score_response('deep')
         payload = _payload(model='sonnet', **{'output_config': {'effort': effort}})
         snap = _snapshot(backend=backend, routing=True)
         decision = route_model(payload, snap, {})
+        # user=deep(100), no sys → midpoint(56); blend=round(86.8)=87 → deep
         assert payload['model'] == 'opus'
         assert decision.reason_code == 'classifier_deep'
         assert decision.classification == 'deep'
@@ -635,7 +653,7 @@ class TestHardOverrides:
     @pytest.mark.parametrize('effort', ['low', 'medium', None])
     def test_low_effort_falls_through_to_classifier(self, effort):
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response('standard')
+        backend.send_classifier_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
         if effort is not None:
             payload = _payload(model='sonnet', **{'output_config': {'effort': effort}})
@@ -1595,7 +1613,7 @@ class TestRouteModel:
         backend = MagicMock()
         # Ensure send_classifier_message doesn't exist so duck-typed fallback is used
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response(label)
+        backend.send_message.return_value = _score_response(label)
         snap = _snapshot(backend=backend, routing=routing, classifier_model=classifier_model)
         payload = _payload(model='sonnet', content='Do something')
         credentials = {'token': 'abc'}
@@ -1619,6 +1637,7 @@ class TestRouteModel:
         assert decision.reason_code == 'classifier_standard'
 
     def test_deep_routes_to_opus(self):
+        """deep user(100) + midpoint sys(56): blend=round(86.8)=87 ≥ 75 → deep → opus."""
         payload, decision, _ = self._run('deep')
         assert payload['model'] == 'opus'
         assert decision.routed_model == 'opus'
@@ -1678,7 +1697,7 @@ class TestRouteModel:
     def test_duck_typed_send_classifier_message_used_when_available(self):
         """When backend has send_classifier_message, it is used instead of send_message."""
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response('trivial')
+        backend.send_classifier_message.return_value = _score_response('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='Hello')
         route_model(payload, snap, {})
@@ -1696,7 +1715,7 @@ class TestRouteModel:
         # Verify that the model mutation from the first route_model call persists
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('trivial')
+        backend.send_message.return_value = _score_response('trivial')
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='Simple query')
         decision1 = route_model(payload, snap, {})
@@ -1747,7 +1766,7 @@ class TestRouteModel:
     def test_credentials_passed_to_classifier(self):
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('trivial')
+        backend.send_message.return_value = _score_response('trivial')
         snap = _snapshot(backend=backend, routing=True)
         creds = {'token': 'my_token'}
         payload = _payload(model='sonnet', content='Hi')
@@ -1762,7 +1781,7 @@ class TestRouteModel:
         backend = MagicMock()
         del backend.send_classifier_message
         # This should NOT be called because we skip to cache
-        backend.send_message.return_value = _text_response('trivial')
+        backend.send_message.return_value = _score_response('trivial')
         snap = _snapshot(backend=backend, routing=True)
 
         # Simulate a text-less continuation turn (tool_result-only final message)
@@ -1797,7 +1816,7 @@ class TestRouteModel:
         If the final message has direct text, classifier is called normally."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('standard')
+        backend.send_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
 
         # Final message has direct text (not text-less continuation)
@@ -1907,7 +1926,7 @@ class TestNoUpgradeCap:
         backend = MagicMock()
         del backend.send_classifier_message
         # If the classifier were ever called the cap path would be wrong.
-        backend.send_message.return_value = _text_response('deep')
+        backend.send_message.return_value = _score_response('deep')
         return _snapshot(backend=backend, routing=True), backend
 
     def test_walkback_upgrade_is_capped_to_requested(self):
@@ -2031,6 +2050,7 @@ class TestRouteModelCustomClassification:
     """route_model honors a runtime-configured label→tier classification map."""
 
     def test_classifier_returns_deep_routes_to_fable(self):
+        # deep(100) + midpoint(56): blend=round(86.8)=87 ≥ 75 → deep → fable.
         backend = _classifier_backend('deep')
         classification = {'trivial': 'haiku', 'standard': 'sonnet', 'deep': 'fable'}
         snap = _snapshot(backend=backend, routing=True, classification=classification)
@@ -2058,7 +2078,7 @@ class TestRouteModelCustomClassification:
         the cap."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('deep')
+        backend.send_message.return_value = _score_response('deep')
         classification = {'trivial': 'haiku', 'standard': 'sonnet', 'deep': 'fable'}
         snap = _snapshot(backend=backend, routing=True, classification=classification)
         payload = _walkback_payload('haiku')
@@ -2121,7 +2141,7 @@ class TestRouteModelCustomClassification:
         opus cached, haiku requested → cap fires, model stays haiku."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('deep')
+        backend.send_message.return_value = _score_response('deep')
         classification = {'trivial': 'haiku', 'standard': 'sonnet', 'deep': 'fable'}
         snap = _snapshot(backend=backend, routing=True, classification=classification)
         payload = _image_walkback_payload('haiku')
@@ -2138,7 +2158,7 @@ class TestRouteModelCustomClassification:
         stay on fable, not get capped to sonnet."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('deep')
+        backend.send_message.return_value = _score_response('deep')
         classification = {'trivial': 'haiku', 'standard': 'sonnet', 'deep': 'fable'}
         snap = _snapshot(backend=backend, routing=True, classification=classification)
         payload = _walkback_payload('claude-sonnet-4-6')
@@ -2153,7 +2173,7 @@ class TestRouteModelCustomClassification:
         # No prior assistant message → critical invariant fires; uses floor without calling classifier.
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('trivial')
+        backend.send_message.return_value = _score_response('trivial')
         classification = {'trivial': 'haiku', 'standard': 'fable', 'deep': 'opus'}
         snap = _snapshot(backend=backend, routing=True, classification=classification)
         payload = _payload(model='sonnet', content='yes')
@@ -2218,7 +2238,7 @@ class TestClassificationLogging:
 
     def _classifier_backend(self, label='standard'):
         backend = MagicMock()
-        backend.send_classifier_message.return_value = _text_response(label)
+        backend.send_classifier_message.return_value = _score_response(label)
         return backend
 
     def test_logs_prompt_preview_when_classifier_runs(self, caplog):
@@ -2323,9 +2343,9 @@ class TestHandlerRouting:
 
         def fake_send_message(payload, credentials, config):
             call_models.append(payload.get('model'))
-            # First call is the classifier call (return valid label)
+            # First call is the classifier call (return numeric score)
             if len(call_models) == 1:
-                return _text_response('trivial')
+                return _score_response('trivial')
             # Second call is the main dispatch
             return {'type': 'message', 'content': []}
 
@@ -2552,7 +2572,7 @@ class TestRouteAffirmation:
     def _backend(self, label='trivial'):
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response(label)
+        backend.send_message.return_value = _score_response(label)
         return backend
 
     def test_inherits_cached_tier_without_classifier(self):
@@ -2670,7 +2690,7 @@ class TestAffirmationEnrichment:
     def _snap(self, label: str = 'standard', **kw):
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response(label)
+        backend.send_message.return_value = _score_response(label)
         return _snapshot(backend=backend, routing=True, **kw), backend
 
     # ------------------------------------------------------------------
@@ -2713,6 +2733,7 @@ class TestAffirmationEnrichment:
     def test_no_cache_result_has_cache_tier(self):
         """affirmation_classified returns cache_tier (uncapped) and routed_model (capped)."""
         snap, backend = self._snap('deep')
+        # deep(100) + midpoint(56): blend=round(86.8)=87 → deep → opus.
         payload = _payload_with_prior('yes', 'Redesign the auth layer', model='haiku')
         decision = route_model(payload, snap, {}, cached_session_tier=None)
         assert decision.reason_code == 'affirmation_classified'
@@ -2728,7 +2749,7 @@ class TestAffirmationEnrichment:
         """Walk-back finds text in an earlier assistant message when the last has only tool_use."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('standard')
+        backend.send_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
         payload = {
             'model': 'sonnet',
@@ -2750,7 +2771,7 @@ class TestAffirmationEnrichment:
         """If no text-bearing assistant message exists anywhere, use floor (no cache write)."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('standard')
+        backend.send_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
         payload = {
             'model': 'sonnet',
@@ -2869,6 +2890,7 @@ class TestAffirmationEnrichment:
         """With baseline_model=haiku, cache_tier is the raw opus, routed_model is capped."""
         snap, backend = self._snap('deep')
         payload = _payload_with_prior('yes', 'Redesign auth')
+        # deep(100) + midpoint(56): blend=87 → deep → opus; capped to haiku by baseline.
         # baseline_model=haiku means deep→opus gets capped to haiku
         decision = route_model(payload, snap, {}, cached_session_tier=None,
                                baseline_model='haiku')
@@ -3467,7 +3489,7 @@ class TestClassifierTokens:
         backend = MagicMock()
         del backend.send_classifier_message  # duck-typed fallback
         backend.send_message.return_value = {
-            'content': [{'type': 'text', 'text': 'standard'}],
+            'content': [{'type': 'text', 'text': '50'}],
             'stop_reason': 'end_turn',
             'usage': {'input_tokens': 42, 'output_tokens': 1},
         }
@@ -3483,7 +3505,7 @@ class TestClassifierTokens:
         """Rules mode never calls the LLM; both token counts must be 0."""
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response('standard')
+        backend.send_message.return_value = _score_response('standard')
         snap = _snapshot(backend=backend, routing=True)
         snap.config.auto_model_routing_mode = 'rules'
         payload = _payload(model='sonnet', content='fix the bug')
@@ -3709,11 +3731,11 @@ class TestClassifierTransparencyFields:
     # ------------------------------------------------------------------
 
     def _backend_with_response(self, label='standard', usage=None):
-        """Backend whose send_message returns a text response for the given label."""
+        """Backend whose send_message returns a numeric score response for the given label."""
         backend = MagicMock()
         del backend.send_classifier_message  # force send_message fallback
         resp = {
-            'content': [{'type': 'text', 'text': label}],
+            'content': [{'type': 'text', 'text': _LABEL_SCORE_STR[label]}],
             'stop_reason': 'end_turn',
         }
         if usage is not None:
@@ -3914,27 +3936,27 @@ class TestClassifierTransparencyFields:
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = {
-            'content': [{'type': 'text', 'text': 'standard'}],
+            'content': [{'type': 'text', 'text': '50'}],
             'stop_reason': 'end_turn',
         }
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='implement auth middleware')
         decision = route_model(payload, snap, {})
-        assert decision.classifier_raw_response == 'standard'
+        assert decision.classifier_raw_response == '50'
 
     def test_classifier_raw_response_concatenates_multiple_text_blocks(self):
         """Multiple text blocks are joined with a space into classifier_raw_response.
 
-        The combined text must still parse as a valid label so the decision reaches
-        the success path.  Using 'deep' followed by '!' (pure punctuation — no alpha
-        token) gives combined = 'deep !' which has exactly one alpha token ('deep')
-        and is accepted by parse_classifier_label, while exercising multi-block join.
+        The combined text must still parse as a valid score so the decision reaches
+        the success path.  Using '50' followed by '!' gives combined = '50 !' which
+        has exactly one digit sequence and is accepted by parse_classifier_score,
+        while exercising multi-block join.
         """
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = {
             'content': [
-                {'type': 'text', 'text': 'deep'},
+                {'type': 'text', 'text': '50'},
                 {'type': 'text', 'text': '!'},
             ],
             'stop_reason': 'end_turn',
@@ -3942,9 +3964,9 @@ class TestClassifierTransparencyFields:
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='redesign the auth system')
         decision = route_model(payload, snap, {})
-        assert decision.reason_code == 'classifier_deep'
+        assert decision.reason_code == 'classifier_standard'
         # Both blocks joined with a space
-        assert decision.classifier_raw_response == 'deep !'
+        assert decision.classifier_raw_response == '50 !'
 
     def test_classifier_raw_response_skips_thinking_blocks(self):
         """thinking/redacted_thinking blocks are skipped; only text blocks matter."""
@@ -3952,31 +3974,31 @@ class TestClassifierTransparencyFields:
         del backend.send_classifier_message
         backend.send_message.return_value = {
             'content': [
-                {'type': 'thinking', 'thinking': 'I should say standard', 'signature': 'sig'},
-                {'type': 'text', 'text': 'standard'},
+                {'type': 'thinking', 'thinking': 'I should output a score', 'signature': 'sig'},
+                {'type': 'text', 'text': '50'},
             ],
             'stop_reason': 'end_turn',
         }
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='implement auth middleware')
         decision = route_model(payload, snap, {})
-        assert decision.classifier_raw_response == 'standard'
+        assert decision.classifier_raw_response == '50'
         assert 'thinking' not in (decision.classifier_raw_response or '')
 
-    def test_classifier_raw_response_preserves_original_casing(self):
-        """Raw response text is not lowercased or stripped."""
+    def test_classifier_raw_response_preserves_whitespace(self):
+        """Raw response text is not stripped; parse_classifier_score strips internally."""
         backend = MagicMock()
         del backend.send_classifier_message
-        # Uppercase response wrapping — tolerated by parse_classifier_label
+        # Surrounding whitespace is preserved in the raw field even though parsing strips it
         backend.send_message.return_value = {
-            'content': [{'type': 'text', 'text': 'STANDARD'}],
+            'content': [{'type': 'text', 'text': '  50  '}],
             'stop_reason': 'end_turn',
         }
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='implement auth middleware')
         decision = route_model(payload, snap, {})
-        # Raw response preserves case even though the parser lowercases for matching
-        assert decision.classifier_raw_response == 'STANDARD'
+        # Raw response preserves surrounding whitespace even though the parser strips it
+        assert decision.classifier_raw_response == '  50  '
 
     def test_classifier_format_standard_when_confidence_bump_off(self):
         """classifier_format is 'standard' when confidence_bump is disabled."""
@@ -3986,7 +4008,7 @@ class TestClassifierTransparencyFields:
         assert decision.classifier_format == 'standard'
 
     def test_classifier_format_json_when_confidence_bump_on(self):
-        """classifier_format is 'json' when confidence_bump mode is enabled."""
+        """classifier_format is always 'standard' now; confidence_bump no longer changes dispatch format."""
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = {
@@ -3998,7 +4020,7 @@ class TestClassifierTransparencyFields:
         snap.config.auto_model_routing_min_confidence = 0.0
         payload = _payload(model='sonnet', content='fix the bug')
         decision = route_model(payload, snap, {})
-        assert decision.classifier_format == 'json'
+        assert decision.classifier_format == 'standard'
         assert decision.reason_code in (
             'classifier_standard', 'classifier_trivial', 'classifier_deep',
         )
@@ -4010,7 +4032,7 @@ class TestClassifierTransparencyFields:
         assert decision.reason_code == 'classifier_trivial'
         assert decision.classifier_model == 'haiku'
         assert decision.classifier_summary_json is not None
-        assert decision.classifier_raw_response == 'trivial'
+        assert decision.classifier_raw_response == '0'
         assert decision.classifier_format == 'standard'
 
     def test_all_four_fields_populated_on_deep(self):
@@ -4021,7 +4043,7 @@ class TestClassifierTransparencyFields:
         assert decision.reason_code == 'classifier_deep'
         assert decision.classifier_model == 'haiku'
         assert decision.classifier_summary_json is not None
-        assert decision.classifier_raw_response == 'deep'
+        assert decision.classifier_raw_response == '100'
         assert decision.classifier_format == 'standard'
 
     def test_dataclasses_replace_preserves_new_fields(self):
@@ -4190,12 +4212,14 @@ class TestSystemPromptClassifier:
         cfg = MagicMock()
         cfg.auto_model_routing_classifier_model = 'haiku'
         cfg.auto_model_routing_confidence_bump = False
+        cfg.auto_model_routing_trivial_threshold = 38.0
+        cfg.auto_model_routing_standard_threshold = 75.0
         return cfg
 
     def _make_snap(self, label='standard'):
         backend = MagicMock()
         del backend.send_classifier_message
-        backend.send_message.return_value = _text_response(label)
+        backend.send_message.return_value = _score_response(label)
         snap = MagicMock()
         snap.backend = backend
         snap.name = 'anthropic'
@@ -4208,23 +4232,24 @@ class TestSystemPromptClassifier:
     def test_no_preview_returns_standard_default(self):
         cfg = self._make_config()
         snap = self._make_snap()
-        tier, score, failed = _classify_system_prompt(
-            '', None, 256, cfg, snap, {}, ''
+        score, failed = _classify_system_prompt(
+            '', None, 256, 38.0, 75.0, cfg, snap, {}, ''
         )
-        assert tier == 'standard'
-        assert score == 1.0
+        # Empty preview → midpoint = round((38+75)/2) = 56
+        assert score == 56
         assert failed is False
+        assert _score_to_tier(score, 38.0, 75.0) == 'standard'
         snap.backend.send_message.assert_not_called()
 
     def test_cache_miss_calls_classifier(self):
         cfg = self._make_config()
         snap = self._make_snap('deep')
-        tier, score, failed = _classify_system_prompt(
-            'You are a research architect.', 'sha-abc', 256, cfg, snap, {}, ''
+        score, failed = _classify_system_prompt(
+            'You are a research architect.', 'sha-abc', 256, 38.0, 75.0, cfg, snap, {}, ''
         )
-        assert tier == 'deep'
-        assert score == 2.0
+        assert score == 100
         assert failed is False
+        assert _score_to_tier(score, 38.0, 75.0) == 'deep'
         snap.backend.send_message.assert_called_once()
 
     def test_cache_hit_skips_classifier(self):
@@ -4232,23 +4257,23 @@ class TestSystemPromptClassifier:
         snap = self._make_snap('deep')
         sha = 'sha-cached'
         with _sys_prompt_cache_lock:
-            _sys_prompt_cache[sha] = ('trivial', 0.0)
-        tier, score, failed = _classify_system_prompt(
-            'You are a research architect.', sha, 256, cfg, snap, {}, ''
+            _sys_prompt_cache[sha] = 0  # cached integer score for trivial
+        score, failed = _classify_system_prompt(
+            'You are a research architect.', sha, 256, 38.0, 75.0, cfg, snap, {}, ''
         )
-        assert tier == 'trivial'
-        assert score == 0.0
+        assert score == 0
         assert failed is False
+        assert _score_to_tier(score, 38.0, 75.0) == 'trivial'
         snap.backend.send_message.assert_not_called()
 
     def test_successful_result_cached(self):
         cfg = self._make_config()
         snap = self._make_snap('deep')
         sha = 'sha-write-test'
-        _classify_system_prompt('You are a research architect.', sha, 256, cfg, snap, {}, '')
+        _classify_system_prompt('You are a research architect.', sha, 256, 38.0, 75.0, cfg, snap, {}, '')
         with _sys_prompt_cache_lock:
             assert sha in _sys_prompt_cache
-            assert _sys_prompt_cache[sha] == ('deep', 2.0)
+            assert _sys_prompt_cache[sha] == 100  # integer score, not tuple
 
     def test_failed_classification_not_cached(self):
         cfg = self._make_config()
@@ -4259,11 +4284,11 @@ class TestSystemPromptClassifier:
         snap.backend.send_message.side_effect = RuntimeError('network down')
         snap.name = 'anthropic'
         sha = 'sha-fail'
-        tier, score, failed = _classify_system_prompt(
-            'You are an agent.', sha, 256, cfg, snap, {}, ''
+        score, failed = _classify_system_prompt(
+            'You are an agent.', sha, 256, 38.0, 75.0, cfg, snap, {}, ''
         )
-        assert tier == 'standard'
-        assert score == 1.0
+        # Network failure → midpoint(56), sys_failed=True, not cached
+        assert score == 56
         assert failed is True
         with _sys_prompt_cache_lock:
             assert sha not in _sys_prompt_cache
@@ -4277,11 +4302,11 @@ class TestSystemPromptClassifier:
         snap.backend = backend
         snap.name = 'anthropic'
         sha = 'sha-invalid'
-        tier, score, failed = _classify_system_prompt(
-            'You are an agent.', sha, 256, cfg, snap, {}, ''
+        score, failed = _classify_system_prompt(
+            'You are an agent.', sha, 256, 38.0, 75.0, cfg, snap, {}, ''
         )
-        assert tier == 'standard'
-        assert score == 1.0
+        # Invalid score text → midpoint(56), sys_failed=True, not cached
+        assert score == 56
         assert failed is True
         with _sys_prompt_cache_lock:
             assert sha not in _sys_prompt_cache
@@ -4292,9 +4317,9 @@ class TestSystemPromptClassifier:
         for i in range(3):
             sha = f'sha-{i}'
             with _sys_prompt_cache_lock:
-                _sys_prompt_cache[sha] = ('standard', 1.0)
+                _sys_prompt_cache[sha] = 50  # integer score for standard
         # Cache size = 2; next write should evict oldest
-        _classify_system_prompt('Some prompt.', 'sha-new', 2, cfg, snap, {}, '')
+        _classify_system_prompt('Some prompt.', 'sha-new', 2, 38.0, 75.0, cfg, snap, {}, '')
         with _sys_prompt_cache_lock:
             assert 'sha-new' in _sys_prompt_cache
             # sha-0 evicted (oldest), sha-1 and sha-2 or sha-new remain
@@ -4303,10 +4328,11 @@ class TestSystemPromptClassifier:
     def test_none_sha_skips_cache(self):
         cfg = self._make_config()
         snap = self._make_snap('deep')
-        tier, score, failed = _classify_system_prompt(
-            'You are a research architect.', None, 256, cfg, snap, {}, ''
+        score, failed = _classify_system_prompt(
+            'You are a research architect.', None, 256, 38.0, 75.0, cfg, snap, {}, ''
         )
-        assert tier == 'deep'
+        assert score == 100
+        assert _score_to_tier(score, 38.0, 75.0) == 'deep'
         # No sha → cache stays empty
         with _sys_prompt_cache_lock:
             assert None not in _sys_prompt_cache
@@ -4323,7 +4349,7 @@ class TestWeightedBlendRouting:
         """Snapshot whose classifier returns user_label first, sys_label second."""
         backend = MagicMock()
         backend.send_classifier_message = MagicMock(
-            side_effect=[_text_response(user_label), _text_response(sys_label)]
+            side_effect=[_score_response(user_label), _score_response(sys_label)]
         )
         return _snapshot(backend=backend, routing=True)
 
@@ -4331,78 +4357,79 @@ class TestWeightedBlendRouting:
         """Snapshot with no system prompt — sys classifier never called."""
         backend = MagicMock()
         backend.send_classifier_message = MagicMock(
-            return_value=_text_response(user_label)
+            return_value=_score_response(user_label)
         )
         return _snapshot(backend=backend, routing=True)
 
     def test_no_system_prompt_uses_standard_default(self):
-        """No system prompt → sys_score=1.0; blend = 0.3*1 + 0.7*user_score."""
+        """No system prompt → sys_score=midpoint(56); blend = 0.3*56 + 0.7*100 = 87 → deep."""
         snap = self._snap_no_sys('deep')
         payload = _payload(model='sonnet', content='redesign the auth system')
         decision = route_model(payload, snap, {})
-        # user_score=2.0, sys_score=1.0 → weighted=0.3*1+0.7*2=1.70 → deep
+        # user_score=100 (deep), sys_score=56 (midpoint, no sys) → weighted=round(86.8)=87 → deep
         assert decision.routed_model == 'opus'
         assert decision.system_prompt_tier == 'standard'
-        assert decision.system_prompt_score == 1.0
-        assert decision.user_prompt_score == 2.0
-        assert abs(decision.routing_weighted_score - 1.70) < 1e-9
+        assert decision.system_prompt_score == 56
+        assert decision.user_prompt_score == 100
+        assert decision.routing_weighted_score == 87
         assert decision.system_prompt_classification_failed is False
 
     def test_trivial_user_trivial_sys_stays_trivial(self):
-        """trivial user + trivial sys: 0.3*0 + 0.7*0 = 0.0 < 0.75 → trivial."""
+        """trivial user(0) + trivial sys(0): 0.3*0 + 0.7*0 = 0 < 38 → trivial."""
         snap = self._snap_with_two_calls('trivial', 'trivial')
         payload = _payload(model='sonnet', content='hi', system='You are a file browser.')
         decision = route_model(payload, snap, {})
         assert decision.routed_model == 'haiku'
         assert decision.system_prompt_tier == 'trivial'
-        assert abs(decision.routing_weighted_score - 0.0) < 1e-9
+        assert decision.routing_weighted_score == 0
 
     def test_deep_user_trivial_sys_moderates_to_standard(self):
-        """deep user(2) + trivial sys(0): 0.3*0 + 0.7*2 = 1.40 < 1.50 → standard."""
+        """deep user(100) + trivial sys(0): round(0.3*0 + 0.7*100) = 70 → standard."""
         snap = self._snap_with_two_calls('deep', 'trivial')
         payload = _payload(model='sonnet', content='redesign the auth system',
                            system='You are a file browser.')
         decision = route_model(payload, snap, {})
-        assert decision.routed_model == 'sonnet'  # standard
-        assert abs(decision.routing_weighted_score - 1.40) < 1e-9
+        assert decision.routed_model == 'sonnet'  # standard (70 < 75)
+        assert decision.routing_weighted_score == 70
 
-    def test_trivial_user_deep_sys_elevates_to_standard(self):
-        """trivial user(0) + deep sys(2): 0.3*2 + 0.7*0 = 0.60 < 0.75 → trivial."""
+    def test_trivial_user_deep_sys_stays_trivial(self):
+        """trivial user(0) + deep sys(100): round(0.3*100 + 0.7*0) = 30 < 38 → trivial."""
         snap = self._snap_with_two_calls('trivial', 'deep')
         payload = _payload(model='sonnet', content='hi',
                            system='You are a research architect.')
         decision = route_model(payload, snap, {})
-        # 0.3*2 + 0.7*0 = 0.60 < 0.75 → still trivial
+        # round(30 + 0) = 30 < 38 → still trivial
         assert decision.routed_model == 'haiku'
-        assert abs(decision.routing_weighted_score - 0.60) < 1e-9
+        assert decision.routing_weighted_score == 30
 
     def test_standard_user_standard_sys_stays_standard(self):
-        """standard user(1) + standard sys(1): 0.3*1 + 0.7*1 = 1.0 → standard."""
+        """standard user(50) + standard sys(50): round(0.3*50 + 0.7*50) = 50 → standard."""
         snap = self._snap_with_two_calls('standard', 'standard')
         payload = _payload(model='sonnet', content='implement auth',
                            system='You are a helpful assistant.')
         decision = route_model(payload, snap, {})
         assert decision.routed_model == 'sonnet'
-        assert abs(decision.routing_weighted_score - 1.0) < 1e-9
+        assert decision.routing_weighted_score == 50
 
     def test_deep_user_deep_sys_stays_deep(self):
-        """deep user(2) + deep sys(2): 0.3*2 + 0.7*2 = 2.0 → deep."""
+        """deep user(100) + deep sys(100): round(0.3*100 + 0.7*100) = 100 ≥ 75 → deep."""
         snap = self._snap_with_two_calls('deep', 'deep')
         payload = _payload(model='sonnet', content='redesign the auth system',
                            system='You are a research architect.')
         decision = route_model(payload, snap, {})
         assert decision.routed_model == 'opus'
-        assert abs(decision.routing_weighted_score - 2.0) < 1e-9
+        assert decision.routing_weighted_score == 100
 
     def test_blend_fields_populated_on_success(self):
         """All 5 blend fields are populated on a successful classifier path."""
         snap = self._snap_no_sys('standard')
         payload = _payload(model='sonnet', content='implement auth')
         decision = route_model(payload, snap, {})
+        # user=50 (standard), sys=56 (midpoint, no sys) → round(0.3*56+0.7*50)=round(51.8)=52
         assert decision.system_prompt_tier == 'standard'
-        assert decision.system_prompt_score == 1.0
-        assert decision.user_prompt_score == 1.0
-        assert decision.routing_weighted_score is not None
+        assert decision.system_prompt_score == 56
+        assert decision.user_prompt_score == 50
+        assert decision.routing_weighted_score == 52
         assert decision.system_prompt_classification_failed is False
 
     def test_blend_fields_none_on_disabled_routing(self):
@@ -4426,19 +4453,19 @@ class TestWeightedBlendRouting:
         assert decision.routing_weighted_score is None
 
     def test_sys_classif_failure_uses_standard_fallback(self):
-        """System prompt classifier failure: sys_score=1.0, classification_failed=True."""
+        """System prompt classifier failure: sys_score=midpoint(56), classification_failed=True."""
         backend = MagicMock()
         # First call = user prompt → standard
         # Second call (sys prompt) → exception
         backend.send_classifier_message = MagicMock(
-            side_effect=[_text_response('standard'), RuntimeError('timeout')]
+            side_effect=[_score_response('standard'), RuntimeError('timeout')]
         )
         snap = _snapshot(backend=backend, routing=True)
         payload = _payload(model='sonnet', content='implement auth',
                            system='You are a helpful assistant.')
         decision = route_model(payload, snap, {})
         assert decision.system_prompt_classification_failed is True
-        assert decision.system_prompt_score == 1.0
+        assert decision.system_prompt_score == 56
         assert decision.system_prompt_tier == 'standard'
 
     def test_sys_classif_result_cached_for_next_request(self):
@@ -4450,8 +4477,8 @@ class TestWeightedBlendRouting:
         backend = MagicMock()
         backend.send_classifier_message = MagicMock(
             side_effect=[
-                _text_response('standard'),  # user prompt 1st request
-                _text_response('trivial'),   # sys prompt 1st request
+                _score_response('standard'),  # user prompt 1st request
+                _score_response('trivial'),   # sys prompt 1st request
             ]
         )
         snap = _snapshot(backend=backend, routing=True)
@@ -4463,7 +4490,7 @@ class TestWeightedBlendRouting:
 
         # Second request: sys prompt cached → only user prompt call
         backend.send_classifier_message.reset_mock()
-        backend.send_classifier_message.side_effect = [_text_response('standard')]
+        backend.send_classifier_message.side_effect = [_score_response('standard')]
         payload2 = _payload(model='sonnet', content='another task', system=sys_content)
         route_model(payload2, snap, {})
         assert backend.send_classifier_message.call_count == 1
@@ -4477,8 +4504,8 @@ class TestWeightedBlendRouting:
         backend = MagicMock()
         backend.send_classifier_message = MagicMock(
             side_effect=[
-                _text_response('standard'),  # affirmation classifier
-                _text_response('standard'),  # system prompt classifier
+                _score_response('standard'),  # affirmation classifier
+                _score_response('standard'),  # system prompt classifier
             ]
         )
         snap = _snapshot(backend=backend, routing=True)
@@ -4518,25 +4545,23 @@ class TestWeightedBlendRouting:
 
     def test_score_at_trivial_threshold_routes_standard(self):
         """weighted_score == trivial_threshold: < is False, so result is standard not trivial."""
-        # With threshold=0.30: sys=standard(1), user=trivial(0) → 0.30*1 + 0.70*0 = 0.30 exactly
+        # trivial(0)*0.70 + standard(50)*0.30 = 0 + 15 = 15; set threshold=15 → not trivial
         snap = self._snap_with_two_calls('trivial', 'standard')
-        snap.config.auto_model_routing_trivial_threshold = 0.30
+        snap.config.auto_model_routing_trivial_threshold = 15
         payload = _payload(model='sonnet', content='hi', system='You are a helpful assistant.')
         decision = route_model(payload, snap, {})
-        import pytest
-        assert decision.routing_weighted_score == pytest.approx(0.30)
-        assert decision.routed_model == 'sonnet'  # standard (not trivial)
+        assert decision.routing_weighted_score == 15
+        assert decision.routed_model == 'sonnet'  # standard (not trivial; 15 < 15 is False)
 
     def test_score_at_standard_threshold_routes_deep(self):
         """weighted_score == standard_threshold: < is False, so result is deep not standard."""
-        # With threshold=1.40: deep(2)*0.70 + trivial(0)*0.30 = 1.40 exactly
+        # deep(100)*0.70 + trivial(0)*0.30 = 70 + 0 = 70; set standard_threshold=70 → deep
         snap = self._snap_with_two_calls('deep', 'trivial')
-        snap.config.auto_model_routing_standard_threshold = 1.40
+        snap.config.auto_model_routing_standard_threshold = 70
         payload = _payload(model='sonnet', content='redesign', system='You are a file browser.')
         decision = route_model(payload, snap, {})
-        import pytest
-        assert decision.routing_weighted_score == pytest.approx(1.40)
-        assert decision.routed_model == 'opus'  # deep (not standard)
+        assert decision.routing_weighted_score == 70
+        assert decision.routed_model == 'opus'  # deep (70 < 70 is False)
 
     def test_affirmation_rules_mode_skips_sys_prompt_classifier(self):
         """In rules mode the affirmation path must not call the system-prompt classifier."""
@@ -4546,7 +4571,7 @@ class TestWeightedBlendRouting:
         backend = MagicMock()
         # Only one call allowed: the affirmation user-prompt classifier
         backend.send_classifier_message = MagicMock(
-            side_effect=[_text_response('standard')]
+            side_effect=[_score_response('standard')]
         )
         snap = _snapshot(backend=backend, routing=True)
         snap.config.auto_model_routing_mode = 'rules'
@@ -4637,3 +4662,118 @@ class TestBuildSystemPromptClassifierPayload:
         cfg.auto_model_routing_classifier_model = 'haiku'
         p = build_system_prompt_classifier_payload('preview', cfg)
         assert p['temperature'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Numeric score integration: user_prompt_tier, fail-closed, fail-open
+# ---------------------------------------------------------------------------
+
+class TestNumericScoreIntegration:
+    """End-to-end integration tests for the 0-100 numeric classifier score path."""
+
+    def _snap(self, score: int | None = 50, *, routing=True, mode='classifier'):
+        backend = MagicMock()
+        del backend.send_classifier_message
+        if score is None:
+            backend.send_message.return_value = {
+                'content': [{'type': 'text', 'text': 'not-a-number'}],
+                'stop_reason': 'end_turn',
+            }
+        else:
+            backend.send_message.return_value = {
+                'content': [{'type': 'text', 'text': str(score)}],
+                'stop_reason': 'end_turn',
+            }
+        snap = _snapshot(backend=backend, routing=routing)
+        snap.config.auto_model_routing_mode = mode
+        return snap
+
+    def test_user_prompt_tier_trivial(self):
+        """score=0 → user_prompt_tier='trivial'."""
+        snap = self._snap(0)
+        decision = route_model(_payload(model='sonnet', content='hi'), snap, {})
+        assert decision.user_prompt_tier == 'trivial'
+        assert decision.reason_code == 'classifier_trivial'
+
+    def test_user_prompt_tier_standard(self):
+        """score=50 → user_prompt_tier='standard'."""
+        snap = self._snap(50)
+        decision = route_model(_payload(model='sonnet', content='do a task'), snap, {})
+        assert decision.user_prompt_tier == 'standard'
+        assert decision.reason_code == 'classifier_standard'
+
+    def test_user_prompt_tier_deep(self):
+        """score=100 → user_prompt_tier='deep'."""
+        snap = self._snap(100)
+        decision = route_model(_payload(model='sonnet', content='redesign everything'), snap, {})
+        assert decision.user_prompt_tier == 'deep'
+        assert decision.reason_code == 'classifier_deep'
+
+    def test_fail_closed_on_invalid_user_score(self):
+        """Invalid user-prompt score → fail-closed: original model returned, reason=classifier_invalid."""
+        snap = self._snap(None)
+        payload = _payload(model='sonnet', content='do something')
+        decision = route_model(payload, snap, {})
+        assert decision.reason_code == 'classifier_invalid'
+        assert decision.routed_model == 'sonnet'
+        assert decision.user_prompt_tier is None
+
+    def test_fail_open_on_invalid_sys_score(self):
+        """System-prompt classifier failure → midpoint used, routing still proceeds."""
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+        # First call: user-prompt classifier returns 100 (deep).
+        # Second call: system-prompt classifier returns invalid output → midpoint used (fail-open).
+        call_count = {'n': 0}
+        backend = MagicMock()
+        del backend.send_classifier_message
+
+        def side_effect(*args, **kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return {'content': [{'type': 'text', 'text': '100'}], 'stop_reason': 'end_turn'}
+            return {'content': [{'type': 'text', 'text': 'bad output'}], 'stop_reason': 'end_turn'}
+
+        backend.send_message.side_effect = side_effect
+        snap = _snapshot(backend=backend, routing=True)
+        payload = _payload(model='sonnet', content='redesign everything',
+                           system='You are a file browser.')
+        decision = route_model(payload, snap, {})
+        # Even with sys-prompt failure, routing succeeds (fail-open uses midpoint).
+        assert decision.routed_model is not None
+        assert decision.reason_code in ('classifier_trivial', 'classifier_standard', 'classifier_deep')
+        assert decision.user_prompt_tier == 'deep'
+
+    def test_user_prompt_tier_none_on_rules_mode(self):
+        """rules mode does not produce user_prompt_tier."""
+        snap = self._snap(mode='rules')
+        payload = _payload(model='sonnet', content='implement feature X with api calls')
+        decision = route_model(payload, snap, {})
+        # rules mode never calls the numeric classifier; user_prompt_tier stays None.
+        assert decision.user_prompt_tier is None
+
+    def test_blend_arithmetic_integers(self):
+        """Blended score is an integer: round(0.3*sys + 0.7*user)."""
+        with _sys_prompt_cache_lock:
+            _sys_prompt_cache.clear()
+
+        # user=60, sys=40 → blend=round(0.3*40 + 0.7*60)=round(12+42)=54 → standard
+        call_count = {'n': 0}
+        backend = MagicMock()
+        del backend.send_classifier_message
+
+        def side_effect(*args, **kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return {'content': [{'type': 'text', 'text': '60'}], 'stop_reason': 'end_turn'}
+            return {'content': [{'type': 'text', 'text': '40'}], 'stop_reason': 'end_turn'}
+
+        backend.send_message.side_effect = side_effect
+        snap = _snapshot(backend=backend, routing=True)
+        payload = _payload(model='sonnet', content='implement auth', system='You are a helper.')
+        decision = route_model(payload, snap, {})
+        assert decision.user_prompt_score == 60
+        assert decision.system_prompt_score == 40
+        assert decision.routing_weighted_score == 54  # round(0.3*40 + 0.7*60)
+        assert isinstance(decision.routing_weighted_score, int)

@@ -1,8 +1,11 @@
 import argparse
 import dataclasses
 import json
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from .backends_registry import backend_names as _backend_names
 from .constants import VALID_BACKEND_MODES
@@ -107,8 +110,8 @@ class Config:
     auto_model_routing_prior_response_summary_limit: int = 1000
     auto_model_routing_system_prompt_weight: float = 0.30
     auto_model_routing_user_prompt_weight: float = 0.70
-    auto_model_routing_trivial_threshold: float = 0.75
-    auto_model_routing_standard_threshold: float = 1.50
+    auto_model_routing_trivial_threshold: float = 38.0
+    auto_model_routing_standard_threshold: float = 75.0
     auto_model_routing_system_prompt_cache_size: int = 256
     auto_model_routing_system_prompt_preview_limit: int = 500
     lock_requested_model: str = 'claude-sonnet-4-6'      # Model baseline lock for routing; 'off' disables
@@ -336,20 +339,22 @@ def parse_args(argv=None) -> Config:
         '--auto-model-routing-trivial-threshold',
         dest='auto_model_routing_trivial_threshold', type=float,
         default=float(os.environ.get(
-            'ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD', '0.75')),
+            'ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD', '38')),
         help='Weighted-score threshold below which the blended tier is "trivial". '
              'Must be strictly less than --auto-model-routing-standard-threshold. '
-             '(default: 0.75, env: ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD)',
+             'On the 0-100 numeric scale: default 38. '
+             '(default: 38, env: ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD)',
     )
     p.add_argument(
         '--auto-model-routing-standard-threshold',
         dest='auto_model_routing_standard_threshold', type=float,
         default=float(os.environ.get(
-            'ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD', '1.50')),
+            'ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD', '75')),
         help='Weighted-score threshold at/above which the blended tier is "deep"; '
              'between trivial_threshold and this value is "standard". '
              'Must be strictly greater than --auto-model-routing-trivial-threshold. '
-             '(default: 1.50, env: ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD)',
+             'On the 0-100 numeric scale: default 75. '
+             '(default: 75, env: ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD)',
     )
     p.add_argument(
         '--auto-model-routing-system-prompt-cache-size',
@@ -465,6 +470,16 @@ def parse_args(argv=None) -> Config:
         raise ValueError(
             f'auto_model_routing_trivial_threshold must be < auto_model_routing_standard_threshold, '
             f'got {trivial_t} >= {standard_t}'
+        )
+    # Warn if thresholds look like old 0–2 scale values (e.g. 0.75/1.50). On the
+    # new 0–100 scale, any threshold ≤ 2 would route almost everything as 'deep'.
+    if trivial_t <= 2.0 or standard_t <= 2.0:
+        logger.warning(
+            'auto-model-routing thresholds look like un-migrated 0–2 scale values '
+            '(trivial=%s standard=%s). On the new 0–100 scale this routes almost '
+            'everything as "deep". Update to e.g. --auto-model-routing-trivial-threshold 38 '
+            '--auto-model-routing-standard-threshold 75.',
+            trivial_t, standard_t,
         )
     if cfg.auto_model_routing_system_prompt_cache_size < 1:
         raise ValueError(

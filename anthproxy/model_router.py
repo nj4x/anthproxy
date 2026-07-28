@@ -167,9 +167,14 @@ _WALKBACK_TAIL_LIMIT = _TRANSCRIPT_FALLBACK_LIMIT
 _LOG_PROMPT_LIMIT = 200
 
 
-# Numeric tier scores for the weighted blend (ADR 0010).
-# Maps the three classifier labels to scalar scores; missing labels get 1.0 (standard).
-_LABEL_SCORES: dict[str, float] = {'trivial': 0.0, 'standard': 1.0, 'deep': 2.0}
+def _score_to_tier(score: int | float, trivial_threshold: float, standard_threshold: float) -> str:
+    """Map a 0–100 numeric score to a tier label using configured thresholds."""
+    if score < trivial_threshold:
+        return 'trivial'
+    if score < standard_threshold:
+        return 'standard'
+    return 'deep'
+
 
 # Specialized system prompt for system-prompt tier inference (ADR 0012).
 # Distinct from _CLASSIFIER_SYSTEM (which classifies user prompts) — teaches the
@@ -204,10 +209,11 @@ _CLASSIFIER_SYSTEM_PROMPT_TIER = (
     'Reply with ONLY the integer. No punctuation, no explanation.'
 )
 
-# Module-level LRU cache: system_prompt_sha256 → (tier_label, score_float).
+# Module-level LRU cache: system_prompt_sha256 → numeric score (0–100 int).
+# Tier is derived from thresholds on each read; only the raw score is stored.
 # Thread-safe: _sys_prompt_cache_lock is held only for short dict operations,
 # never across classifier network calls (satisfies concurrency.md invariant).
-_sys_prompt_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+_sys_prompt_cache: OrderedDict[str, int] = OrderedDict()
 _sys_prompt_cache_lock = threading.Lock()
 
 # In-flight sentinel for concurrent affirmation mitigation.  When two
@@ -388,7 +394,7 @@ class ModelRoutingDecision:
     session_estimate_ratio: float = 1.0  # per-session calibration ratio at decision time
     classifier_mode: str = 'classifier'  # 'classifier' | 'walkback_cache' | 'affirmation'
     classifier_confidence: float | None = None  # reserved; None until confidence is produced
-    tier_bumped: bool = False            # True when confidence_bump mode promoted the tier (trivial→standard or standard→deep); False on all other paths
+    tier_bumped: bool = False            # Always False; retained for schema stability (confidence-bump promotion removed in numeric-score migration)
     task_tag: str | None = None          # reserved; None until task-tag routing is added
     classifier_input_tokens: int = 0   # estimated tokens sent to classifier; 0 when no classifier call made
     classifier_output_tokens: int = 0  # estimated tokens returned by classifier; 0 when no classifier call made
@@ -416,6 +422,7 @@ class ModelRoutingDecision:
     user_prompt_score: float | None = None
     routing_weighted_score: float | None = None
     system_prompt_classification_failed: bool = False
+    user_prompt_tier: str | None = None  # derived tier label for the user-prompt score
 
 
 @dataclass(frozen=True)
@@ -843,33 +850,41 @@ def _classify_system_prompt(
     system_preview: str,
     system_prompt_sha256: str | None,
     cache_size: int,
+    trivial_threshold: float,
+    standard_threshold: float,
     config: 'Config',
     snapshot,
     credentials: dict,
     log_tag: str,
-) -> tuple[str, float, bool]:
-    """Return (tier_label, score, classification_failed) for a system prompt.
+) -> tuple[int, bool]:
+    """Return (score, sys_failed) for a system prompt.
 
-    Cache hit path: reads from _sys_prompt_cache under a short lock, returns cached result.
-    Cache miss path: calls the system-prompt classifier, writes to cache on success only.
-    Failed classifications are not cached so future requests can retry.
+    score: 0–100 integer (or midpoint on failure/absence).
+    sys_failed: True only when a classification was attempted and failed.
 
-    When system_preview is empty (no system prompt), returns ('standard', 1.0, False)
-    per ADR 0010 default.
+    Two distinct cases both return the midpoint score:
+    - Empty system prompt (no preview): midpoint with sys_failed=False (no signal, not a failure).
+    - Classification call fails or returns None: midpoint with sys_failed=True; result NOT cached.
+
+    The midpoint is guaranteed to lie in the standard band regardless of operator config.
+
+    Cache stores raw integer scores; tier is derived from thresholds at the call site.
 
     Thread safety: _sys_prompt_cache_lock is held only for short dict operations,
     never across the classifier network call (satisfies concurrency.md invariant).
     """
+    midpoint = round((trivial_threshold + standard_threshold) / 2)
+
     if not system_preview:
-        return 'standard', 1.0, False
+        return midpoint, False
 
     # Cache lookup (short lock, no I/O)
     if system_prompt_sha256:
         with _sys_prompt_cache_lock:
             if system_prompt_sha256 in _sys_prompt_cache:
                 _sys_prompt_cache.move_to_end(system_prompt_sha256)
-                tier, score = _sys_prompt_cache[system_prompt_sha256]
-                return tier, score, False
+                score = _sys_prompt_cache[system_prompt_sha256]
+                return score, False
 
     # Cache miss — classify (no lock held across network call)
     clf_payload = build_system_prompt_classifier_payload(system_preview, config)
@@ -878,79 +893,76 @@ def _classify_system_prompt(
             snapshot.backend, 'send_classifier_message', snapshot.backend.send_message
         )
         response = send_fn(clf_payload, credentials, config)
-        label = parse_classifier_label(response)
-        if label is None:
+        score = parse_classifier_score(response)
+        if score is None:
             logger.warning(
-                '%s System-prompt classifier returned invalid label — using standard: raw=%r',
-                log_tag,
+                '%s System-prompt classifier returned invalid score — using midpoint %d: raw=%r',
+                log_tag, midpoint,
                 _classifier_raw_text_preview(response),
             )
-            return 'standard', 1.0, True  # fail-open; do NOT cache
-        score = _LABEL_SCORES.get(label, 1.0)
+            return midpoint, True  # fail-open; do NOT cache
         # Write to cache on success only; do not cache failures.
         if system_prompt_sha256:
             with _sys_prompt_cache_lock:
-                _sys_prompt_cache[system_prompt_sha256] = (label, score)
+                _sys_prompt_cache[system_prompt_sha256] = score
                 _sys_prompt_cache.move_to_end(system_prompt_sha256)
                 while len(_sys_prompt_cache) > cache_size:
                     _sys_prompt_cache.popitem(last=False)
+        tier = _score_to_tier(score, trivial_threshold, standard_threshold)
         logger.debug(
-            '%s System-prompt classifier: sha=%s → %s (score=%.1f)',
-            log_tag, (system_prompt_sha256 or '')[:8], label, score,
+            '%s System-prompt classifier: sha=%s → score=%d (tier=%s)',
+            log_tag, (system_prompt_sha256 or '')[:8], score, tier,
         )
-        return label, score, False
+        return score, False
     except Exception as exc:
         logger.warning(
-            '%s System-prompt classifier call failed — using standard: %s',
-            log_tag, exc,
+            '%s System-prompt classifier call failed — using midpoint %d: %s',
+            log_tag, midpoint, exc,
         )
-        return 'standard', 1.0, True  # fail-open; do NOT cache
+        return midpoint, True  # fail-open; do NOT cache
 
 
 def _apply_weighted_blend(
-    user_label: str,
+    user_score: int,
     system_prompt_sha256: str | None,
     payload: dict,
     config: 'Config',
     snapshot,
     credentials: dict,
     log_tag: str,
-) -> tuple[str, str, float, float, float, bool]:
+) -> tuple[str, str, int, int, int, bool]:
     """Apply weighted system-prompt + user-prompt tier blend (ADR 0010).
 
     Returns (final_tier_label, sys_tier, sys_score, user_score, weighted_score, sys_failed).
 
-    ``user_label`` is the post-bump classifier label (trivial/standard/deep).
-    The system prompt is classified (with LRU caching) and blended with the
-    user score using the configured weights and thresholds.
+    ``user_score`` is the 0–100 integer from parse_classifier_score().
+    Blend arithmetic operates on 0–100 floats; result is rounded to nearest integer
+    before threshold comparison and storage.
 
-    Only called in 'classifier' mode after a successful user-prompt label is
+    Only called in 'classifier' mode after a successful user-prompt score is
     produced (including the affirmation_classified path).
     """
     cache_size = getattr(config, 'auto_model_routing_system_prompt_cache_size', 256)
     preview_limit = getattr(config, 'auto_model_routing_system_prompt_preview_limit', 500)
     sys_weight = getattr(config, 'auto_model_routing_system_prompt_weight', 0.30)
     user_weight = getattr(config, 'auto_model_routing_user_prompt_weight', 0.70)
-    trivial_threshold = getattr(config, 'auto_model_routing_trivial_threshold', 0.75)
-    standard_threshold = getattr(config, 'auto_model_routing_standard_threshold', 1.50)
+    trivial_threshold = getattr(config, 'auto_model_routing_trivial_threshold', 38.0)
+    standard_threshold = getattr(config, 'auto_model_routing_standard_threshold', 75.0)
 
     sys_preview = _extract_system_prompt_preview(payload, preview_limit)
-    sys_tier, sys_score, sys_failed = _classify_system_prompt(
-        sys_preview, system_prompt_sha256, cache_size, config, snapshot, credentials, log_tag,
+    sys_score, sys_failed = _classify_system_prompt(
+        sys_preview, system_prompt_sha256, cache_size,
+        trivial_threshold, standard_threshold,
+        config, snapshot, credentials, log_tag,
     )
-    user_score = _LABEL_SCORES.get(user_label, 1.0)
-    weighted_score = sys_weight * sys_score + user_weight * user_score
-
-    if weighted_score < trivial_threshold:
-        final_label = 'trivial'
-    elif weighted_score < standard_threshold:
-        final_label = 'standard'
-    else:
-        final_label = 'deep'
+    weighted_score = round(sys_weight * sys_score + user_weight * user_score)
+    final_label = _score_to_tier(weighted_score, trivial_threshold, standard_threshold)
+    sys_tier = _score_to_tier(sys_score, trivial_threshold, standard_threshold)
+    user_tier = _score_to_tier(user_score, trivial_threshold, standard_threshold)
 
     logger.debug(
-        '%s Weighted blend: user=%s(%.1f) sys=%s(%.1f) score=%.3f → %s',
-        log_tag, user_label, user_score, sys_tier, sys_score, weighted_score, final_label,
+        '%s Weighted blend: user=score=%d(tier=%s) sys=score=%d(tier=%s) weighted=%d → %s',
+        log_tag, user_score, user_tier, sys_score, sys_tier, weighted_score, final_label,
     )
     return final_label, sys_tier, sys_score, user_score, weighted_score, sys_failed
 
@@ -1329,20 +1341,19 @@ def _dispatch_classifier_mode(
     log_tag: str,
     task_tag: str | None = None,
     prior_response_summary: str | None = None,
-) -> tuple[str | None, str, float | None, int, int, str | None, str | None, str | None, str | None]:
+) -> tuple[int | str | None, str, int, int, str | None, str | None, str | None, str | None]:
     """Dispatch to the appropriate classification mode.
 
-    Returns ``(label_or_tier, reason_code, classifier_confidence, clf_in, clf_out,
+    Returns ``(score_or_label_or_tier, reason_code, clf_in, clf_out,
     clf_model, clf_summary_json, clf_raw_response, clf_format)`` where the first
     element is:
 
-    * For ``'classifier'`` and ``'rules'`` modes: a classification label
-      (``'trivial'``, ``'standard'``, or ``'deep'``), or ``None`` on failure.
+    * For ``'classifier'`` mode: a raw 0–100 integer score, or ``None`` on failure.
+    * For ``'rules'`` mode: a classification label (``'trivial'``, ``'standard'``,
+      or ``'deep'``), or ``None`` on failure.
     * For ``'tag'`` mode: the tier/model string from
       ``config.auto_model_routing_task_tiers``, or ``None`` on failure.
 
-    ``classifier_confidence`` is a float when ``auto_model_routing_confidence_bump``
-    is enabled and the JSON response parses successfully; ``None`` otherwise.
     ``None`` first element means the caller must fail-closed to the requested model.
     Unknown or empty mode values fall back to ``'classifier'``.
 
@@ -1358,7 +1369,7 @@ def _dispatch_classifier_mode(
                 'fail-closed to %s',
                 log_tag, requested,
             )
-            return None, 'no_task_tag', None, 0, 0, None, None, None, None
+            return None, 'no_task_tag', 0, 0, None, None, None, None
         task_tiers = getattr(config, 'auto_model_routing_task_tiers', None)
         if not task_tiers or task_tag not in task_tiers:
             logger.warning(
@@ -1368,14 +1379,14 @@ def _dispatch_classifier_mode(
                 list(task_tiers) if task_tiers else '(none)',
                 requested,
             )
-            return None, 'unknown_task_tag', None, 0, 0, None, None, None, None
+            return None, 'unknown_task_tag', 0, 0, None, None, None, None
         tier = task_tiers[task_tag]
         logger.info(
             '%s Model router: tag mode task=%r → tier=%s '
             '(backend=%s requested=%s)',
             log_tag, task_tag, tier, snapshot.name, requested,
         )
-        return tier, 'task_tag_routed', None, 0, 0, None, None, None, None
+        return tier, 'task_tag_routed', 0, 0, None, None, None, None
 
     if mode == 'rules':
         # Rules mode: deterministic keyword-based classification; no LLM call.
@@ -1385,7 +1396,7 @@ def _dispatch_classifier_mode(
                 '%s Model router: rules mode — no signal, fail-closed to %s',
                 log_tag, requested,
             )
-            return None, 'rules_no_signal', None, 0, 0, None, None, None, None
+            return None, 'rules_no_signal', 0, 0, None, None, None, None
         reason = f'classifier_rules_{label}'
         logger.info(
             '%s Model router: rules mode → %s (backend=%s requested=%s '
@@ -1393,7 +1404,7 @@ def _dispatch_classifier_mode(
             log_tag, label, snapshot.name, requested,
             len(summary.final_user_text),
         )
-        return label, reason, None, 0, 0, None, None, None, None
+        return label, reason, 0, 0, None, None, None, None
 
     # Default / 'classifier' mode: LLM-based classifier call.
     threshold = getattr(config, 'auto_model_routing_long_context_threshold', 0)
@@ -1419,13 +1430,11 @@ def _dispatch_classifier_mode(
         log_tag, snapshot.name, requested, summary.final_user_text,
     )
     classifier_payload = build_classifier_payload(summary, config, prior_response_summary)
-    use_confidence_bump = getattr(config, 'auto_model_routing_confidence_bump', False)
     # Transparency fields captured before the call so they're available even when
     # the response is available (raw_response captured after).
     clf_model: str | None = config.auto_model_routing_classifier_model
     clf_summary_json: str | None = summary.to_classifier_json(prior_response_summary=prior_response_summary)
-    clf_format: str | None = 'json' if use_confidence_bump else 'standard'
-    parsed_confidence: float | None = None
+    clf_format: str | None = 'standard'
     clf_raw_response: str | None = None
     try:
         send_fn = getattr(
@@ -1450,46 +1459,27 @@ def _dispatch_classifier_mode(
                             _parts.append(_t)
             if _parts:
                 clf_raw_response = ' '.join(_parts)
-        if use_confidence_bump:
-            score_json = parse_classifier_score_json(response)
-            if score_json is None:
-                label: str | None = None
-            else:
-                # Derive label from numeric score; ticket 02 replaces with full numeric routing.
-                if score_json < 38:
-                    label = 'trivial'
-                elif score_json < 75:
-                    label = 'standard'
-                else:
-                    label = 'deep'
-        else:
-            label = parse_classifier_label(response)
+        user_score: int | None = parse_classifier_score(response)
     except Exception as exc:
         logger.warning(
             '%s Model router: classifier call failed (backend=%s) — keeping %s: %s',
             log_tag, snapshot.name, requested, exc,
         )
-        return None, 'classifier_failed', None, 0, 0, None, None, None, None
+        return None, 'classifier_failed', 0, 0, None, None, None, None
 
-    if label is None:
+    if user_score is None:
         logger.warning(
-            '%s Model router: classifier returned invalid label (backend=%s) — '
+            '%s Model router: classifier returned invalid score (backend=%s) — '
             'keeping %s: raw=%r',
             log_tag, snapshot.name, requested,
             _classifier_raw_text_preview(response),
         )
-        return None, 'classifier_invalid', None, 0, 0, None, None, None, None
-
-    if label == 'trivial':
-        reason = 'classifier_trivial'
-    elif label == 'deep':
-        reason = 'classifier_deep'
-    else:
-        reason = 'classifier_standard'
+        return None, 'classifier_invalid', 0, 0, None, None, None, None
 
     clf_in = response.get('usage', {}).get('input_tokens', 0)
     clf_out = response.get('usage', {}).get('output_tokens', 0)
-    return label, reason, parsed_confidence, clf_in, clf_out, clf_model, clf_summary_json, clf_raw_response, clf_format
+    # Return raw score; reason_code is derived in route_model() after thresholding.
+    return user_score, 'classifier_scored', clf_in, clf_out, clf_model, clf_summary_json, clf_raw_response, clf_format
 
 
 # ---------------------------------------------------------------------------
@@ -1769,30 +1759,31 @@ def route_model(
                 sentinel_acquired = True
 
         aff_label: str | None = None
+        aff_user_tier: str | None = None
         aff_routed: str | None = None
         aff_cache_tier: str | None = None
         aff_summary_json: str | None = None
         aff_sys_tier: str | None = None
-        aff_sys_score: float | None = None
-        aff_user_score: float | None = None
-        aff_weighted_score: float | None = None
+        aff_sys_score: int | None = None
+        aff_user_score: int | None = None
+        aff_weighted_score: int | None = None
         aff_sys_failed: bool = False
+        aff_trivial_t = getattr(config, 'auto_model_routing_trivial_threshold', 38.0)
+        aff_standard_t = getattr(config, 'auto_model_routing_standard_threshold', 75.0)
         try:
-            use_json = getattr(config, 'auto_model_routing_confidence_bump', False)
             aff_summary_json = summary.to_classifier_json(
                 prior_response_summary=prior_response_summary
             )
-            system = (
-                _CLASSIFIER_SYSTEM_JSON + _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX
-                if use_json
-                else _CLASSIFIER_SYSTEM
-            )
+            use_json = getattr(config, 'auto_model_routing_confidence_bump', False)
+            aff_system = _CLASSIFIER_SYSTEM_JSON if use_json else _CLASSIFIER_SYSTEM
+            if use_json and prior_response_summary is not None:
+                aff_system = aff_system + _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX
             clf_payload = {
                 _SENTINEL_KEY: True,
                 'model': config.auto_model_routing_classifier_model,
                 'max_tokens': _CLASSIFIER_MAX_TOKENS_JSON if use_json else _CLASSIFIER_MAX_TOKENS,
                 'temperature': _CLASSIFIER_TEMPERATURE,
-                'system': system,
+                'system': aff_system,
                 'messages': [{'role': 'user', 'content': aff_summary_json}],
             }
             logger.info(
@@ -1804,27 +1795,24 @@ def route_model(
                 snapshot.backend, 'send_classifier_message', snapshot.backend.send_message
             )
             response = send_fn(clf_payload, credentials, config)
-            if use_json:
-                score_json = parse_classifier_score_json(response)
-                if score_json is None:
-                    label: str | None = None
-                elif score_json < 38:
-                    label = 'trivial'
-                elif score_json < 75:
-                    label = 'standard'
-                else:
-                    label = 'deep'
-            else:
-                label = parse_classifier_label(response)
+            aff_score: int | None = (
+                parse_classifier_score_json(response) if use_json
+                else parse_classifier_score(response)
+            )
 
-            if label is None:
+            if aff_score is None:
                 logger.warning(
-                    '%s Model router: affirmation classifier returned invalid label '
+                    '%s Model router: affirmation classifier returned invalid score '
                     '(backend=%s) — using floor: raw=%r',
                     log_tag, snapshot.name,
                     _classifier_raw_text_preview(response),
                 )
             else:
+                aff_user_tier = _score_to_tier(aff_score, aff_trivial_t, aff_standard_t)
+                logger.info(
+                    '%s Model router: affirmation score=%d (tier=%s) (backend=%s requested=%s)',
+                    log_tag, aff_score, aff_user_tier, snapshot.name, requested,
+                )
                 # Apply weighted blend (ADR 0010) to produce the final tier.
                 # Mode guard mirrors the main dispatch path: blend only in 'classifier'
                 # mode; 'rules' avoids LLM calls by design, 'tag' uses direct strings.
@@ -1836,11 +1824,11 @@ def route_model(
                 if aff_effective_mode == 'classifier':
                     (blend_label, aff_sys_tier, aff_sys_score,
                      aff_user_score, aff_weighted_score, aff_sys_failed) = _apply_weighted_blend(
-                        label, summary.system_prompt_sha256, payload, config,
+                        aff_score, summary.system_prompt_sha256, payload, config,
                         snapshot, credentials, log_tag,
                     )
                 else:
-                    blend_label = label
+                    blend_label = aff_user_tier
                 uncapped_tier = config.auto_model_routing_classification[blend_label]
                 capped_tier = (
                     _cap_cached_tier(
@@ -1850,7 +1838,7 @@ def route_model(
                     if baseline_model
                     else uncapped_tier
                 )
-                aff_label = label
+                aff_label = aff_user_tier
                 aff_routed = capped_tier
                 aff_cache_tier = uncapped_tier
         except Exception as exc:
@@ -1881,6 +1869,7 @@ def route_model(
                 user_prompt_score=aff_user_score,
                 routing_weighted_score=aff_weighted_score,
                 system_prompt_classification_failed=aff_sys_failed,
+                user_prompt_tier=aff_user_tier,
             )
         return _affirmation_floor()
 
@@ -1918,17 +1907,17 @@ def route_model(
         or 'classifier'
     )
 
-    (label_or_tier, dispatch_reason, parsed_confidence, clf_in_tokens, clf_out_tokens,
+    (score_or_label_or_tier, dispatch_reason, clf_in_tokens, clf_out_tokens,
      clf_model, clf_summary_json, clf_raw_response, clf_format) = _dispatch_classifier_mode(
         effective_mode, summary, config, snapshot, credentials,
         est_tokens, routing_baseline, log_tag, task_tag,
         prior_response_summary=prior_response_summary,
     )
 
-    if label_or_tier is None:
+    if score_or_label_or_tier is None:
         # Fail-closed: keep the originally requested model.
-        # The 4 transparency fields remain None (their dataclass defaults) on all
-        # non-successful-classifier paths (failed, invalid, rules, tag, etc.).
+        # Transparency fields remain None (their dataclass defaults) on all
+        # non-successful paths (failed, invalid, rules, tag, etc.).
         return ModelRoutingDecision(
             requested_model=requested,
             routed_model=requested,
@@ -1939,57 +1928,50 @@ def route_model(
             classifier_mode=effective_mode,
         )
 
-    # --- Confidence-based tier bump (only when confidence_bump mode is on).
-    # When the classifier's confidence is below the configured threshold, promote
-    # the label one tier to err on the side of more capable models:
-    #   trivial → standard, standard → deep, deep → deep (no-op: already highest).
-    # Deep stays deep with tier_bumped=False since no promotion is possible.
-    # Both bumped and unbumped paths use the original classifier label as
-    # `classification` (the raw signal) and set tier_bumped to distinguish.
-    use_confidence_bump = getattr(config, 'auto_model_routing_confidence_bump', False)
-    original_label = label_or_tier  # preserves the raw label for the classification field
-    tier_bumped = False
-    min_confidence = getattr(config, 'auto_model_routing_min_confidence', 0.0)
-    if (effective_mode != 'tag'
-            and use_confidence_bump
-            and parsed_confidence is not None
-            and parsed_confidence < min_confidence
-            and label_or_tier in ('trivial', 'standard')):
-        if label_or_tier == 'trivial':
-            label_or_tier = 'standard'
-            dispatch_reason = 'classifier_trivial_bumped'
-        else:  # standard
-            label_or_tier = 'deep'
-            dispatch_reason = 'classifier_standard_bumped'
-        tier_bumped = True
-
-    # --- Weighted blend (ADR 0010): applies in 'classifier' mode after confidence bump.
+    # --- Weighted blend (ADR 0010): applies in 'classifier' mode only.
     # For 'rules' and 'tag' modes the system-prompt classifier is not called —
     # 'rules' avoids LLM calls by design; 'tag' produces a direct model string.
     blend_sys_tier: str | None = None
-    blend_sys_score: float | None = None
-    blend_user_score: float | None = None
-    blend_weighted_score: float | None = None
+    blend_sys_score: int | None = None
+    blend_user_score: int | None = None
+    blend_weighted_score: int | None = None
     blend_sys_failed: bool = False
+    user_prompt_tier: str | None = None
 
-    if effective_mode == 'classifier' and label_or_tier in _LABEL_SCORES:
-        (label_or_tier, blend_sys_tier, blend_sys_score,
-         blend_user_score, blend_weighted_score, blend_sys_failed) = _apply_weighted_blend(
-            label_or_tier, summary.system_prompt_sha256, payload, config,
+    trivial_threshold = getattr(config, 'auto_model_routing_trivial_threshold', 38.0)
+    standard_threshold = getattr(config, 'auto_model_routing_standard_threshold', 75.0)
+
+    if effective_mode == 'classifier' and isinstance(score_or_label_or_tier, int):
+        user_score_val: int = score_or_label_or_tier
+        user_prompt_tier = _score_to_tier(user_score_val, trivial_threshold, standard_threshold)
+        dispatch_reason_str = f'classifier_{user_prompt_tier}'
+        logger.info(
+            '%s Model router: score=%d (tier=%s) (backend=%s requested=%s)',
+            log_tag, user_score_val, user_prompt_tier, snapshot.name, routing_baseline,
+        )
+        (label_or_tier, blend_sys_tier, blend_sys_score_val,
+         blend_user_score_val, blend_weighted_score_val, blend_sys_failed) = _apply_weighted_blend(
+            user_score_val, summary.system_prompt_sha256, payload, config,
             snapshot, credentials, log_tag,
         )
+        blend_sys_score = blend_sys_score_val
+        blend_user_score = blend_user_score_val
+        blend_weighted_score = blend_weighted_score_val
+        score_or_label_or_tier = label_or_tier
+        dispatch_reason = dispatch_reason_str  # type: ignore[assignment]
 
     # Map result to the final model string
     if effective_mode == 'tag':
-        # label_or_tier is already the model/tier string from the task map
-        routed = label_or_tier
+        # score_or_label_or_tier is already the model/tier string from the task map
+        routed = score_or_label_or_tier  # type: ignore[assignment]
         classification = None
         reason: ReasonCode = dispatch_reason  # type: ignore[assignment]
     else:
-        # classifier or rules mode: label_or_tier is 'trivial'/'standard'/'deep'
-        # (possibly bumped); original_label is the pre-bump raw classifier label
-        classification = original_label
-        routed = config.auto_model_routing_classification[label_or_tier]
+        # classifier or rules mode: score_or_label_or_tier is 'trivial'/'standard'/'deep'
+        label_str: str = score_or_label_or_tier  # type: ignore[assignment]
+        # classification = raw user-prompt tier (pre-blend); rules mode uses the rules tier.
+        classification = user_prompt_tier if user_prompt_tier is not None else label_str
+        routed = config.auto_model_routing_classification[label_str]
         reason = dispatch_reason  # type: ignore[assignment]
 
     payload['model'] = routed
@@ -2000,8 +1982,7 @@ def route_model(
         applied=(routed != requested),
         reason_code=reason,
         estimated_input_tokens=est_tokens,
-        tier_bumped=tier_bumped,
-        classifier_confidence=parsed_confidence,
+        tier_bumped=False,
         classifier_mode=effective_mode,
         classifier_input_tokens=clf_in_tokens,
         classifier_output_tokens=clf_out_tokens,
@@ -2014,4 +1995,5 @@ def route_model(
         user_prompt_score=blend_user_score,
         routing_weighted_score=blend_weighted_score,
         system_prompt_classification_failed=blend_sys_failed,
+        user_prompt_tier=user_prompt_tier,
     )
