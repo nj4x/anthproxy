@@ -69,8 +69,8 @@ def _fake_snapshot(name, backend, session_pinned=False, session_subscription=Fal
     # ADR 0010/0012: weighted blend config — concrete values so comparisons work.
     snapshot.config.auto_model_routing_system_prompt_weight = 0.30
     snapshot.config.auto_model_routing_user_prompt_weight = 0.70
-    snapshot.config.auto_model_routing_trivial_threshold = 0.75
-    snapshot.config.auto_model_routing_standard_threshold = 1.50
+    snapshot.config.auto_model_routing_trivial_threshold = 38.0
+    snapshot.config.auto_model_routing_standard_threshold = 75.0
     snapshot.config.auto_model_routing_system_prompt_cache_size = 256
     snapshot.config.auto_model_routing_system_prompt_preview_limit = 500
     snapshot.session_pinned = session_pinned
@@ -1101,10 +1101,10 @@ class TestSessionTierCache:
         if send_message_return is None:
             send_message_return = {'type': 'message', 'content': []}
         backend.send_message.return_value = send_message_return
-        # Classifier response — always 'standard' for simplicity
+        # Classifier response — numeric score 50 = standard tier
         backend.send_classifier_message = MagicMock(
             return_value={
-                'content': [{'type': 'text', 'text': 'standard'}],
+                'content': [{'type': 'text', 'text': '50'}],
             }
         )
 
@@ -1132,10 +1132,10 @@ class TestSessionTierCache:
         if send_message_return is None:
             send_message_return = {'type': 'message', 'content': []}
         backend.send_message.return_value = send_message_return
-        # Classifier response — always 'standard' for simplicity
+        # Classifier response — numeric score 50 = standard tier
         backend.send_classifier_message = MagicMock(
             return_value={
-                'content': [{'type': 'text', 'text': 'standard'}],
+                'content': [{'type': 'text', 'text': '50'}],
             }
         )
 
@@ -1397,10 +1397,10 @@ class TestSessionTierCache:
         payload['model'] = 'haiku'  # client requests haiku
         handler._read_body = MagicMock(return_value=b'{}')
         handler._parse_json = MagicMock(return_value=payload)
-        # Classifier will say 'deep' (should route to opus)
+        # Classifier will return 100 (deep, should route to opus)
         handler.registry.snapshot.return_value.config.lock_requested_model = 'claude-sonnet-4-6'
         backend.send_classifier_message.return_value = {
-            'content': [{'type': 'text', 'text': 'deep'}],
+            'content': [{'type': 'text', 'text': '100'}],
         }
 
         with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
@@ -1706,7 +1706,7 @@ class TestSessionTierCache:
         handler, registry, backend = self._make_handler_with_custom_map(
             classification=classification, auto_routing=True, cached_tier=None)
         backend.send_classifier_message.return_value = {
-            'content': [{'type': 'text', 'text': 'deep'}],
+            'content': [{'type': 'text', 'text': '100'}],
         }
         payload = copy.deepcopy(self._TEXT_PAYLOAD)
         handler._read_body = MagicMock(return_value=b'{}')
@@ -2571,7 +2571,7 @@ class TestHandlerRoutingOrderInvariants:
         backend.parse_credentials.return_value = {'token': 'ok'}
         backend.send_message.return_value = {'type': 'message', 'content': [], 'model': 'haiku'}
         backend.send_classifier_message = MagicMock(
-            return_value={'content': [{'type': 'text', 'text': 'trivial'}]}
+            return_value={'content': [{'type': 'text', 'text': '0'}]}  # 0 = trivial tier
         )
         snapshot = _fake_snapshot('anthropic', backend)
         snapshot.config.auto_model_routing = routing_on
@@ -2694,9 +2694,9 @@ class TestHandlerRoutingOrderInvariants:
         Stats receive the original requested model separately from the serving model."""
         handler, _, backend, snapshot = self._make_handler()
         snapshot.config.auto_model_routing = True
-        # Classifier: trivial → haiku; requested was 'opus'.
+        # Classifier: score=0 → trivial → haiku; requested was 'opus'.
         backend.send_classifier_message.return_value = {
-            'content': [{'type': 'text', 'text': 'trivial'}]
+            'content': [{'type': 'text', 'text': '0'}]
         }
         backend.send_message.return_value = {
             'type': 'message', 'content': [], 'model': 'haiku',

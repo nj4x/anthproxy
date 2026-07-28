@@ -2823,8 +2823,8 @@ class TestBusySecsWindow:
 class TestWeightedBlendMigration:
     """_apply_migration_7 adds 5 new columns; record_request stores them."""
 
-    def test_schema_version_is_8(self):
-        assert _SCHEMA_VERSION == 8
+    def test_schema_version_is_9(self):
+        assert _SCHEMA_VERSION == 9
 
     def test_migration_7_adds_columns(self):
         fd, path = tempfile.mkstemp(suffix='.db')
@@ -2916,6 +2916,113 @@ class TestWeightedBlendMigration:
             row = db.get_request(row_id)
             assert row is not None
             assert row['system_prompt_classification_failed'] == 1
+        finally:
+            db.close()
+            os.unlink(path)
+
+class TestNumericScoreMigration:
+    """Migration 8: add user_prompt_tier column and rescale old 0-2 fractional scores."""
+
+    def _apply_through_migration_7(self):
+        """Return an open in-memory connection with migrations 0-7 applied."""
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        from anthproxy.db import _MIGRATIONS
+        for i in range(8):
+            with conn:
+                _MIGRATIONS[i](conn)
+                conn.execute(f"PRAGMA user_version = {i + 1};")
+        return conn
+
+    def test_migration_8_adds_user_prompt_tier_column(self):
+        conn = self._apply_through_migration_7()
+        from anthproxy.db import _apply_migration_8
+        with conn:
+            _apply_migration_8(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+        assert 'user_prompt_tier' in cols
+        conn.close()
+
+    def test_migration_8_rescales_fractional_old_scale_rows(self):
+        conn = self._apply_through_migration_7()
+        # Insert a row with old-scale fractional scores.
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, request_ts, requested_model, routed_model,
+                    backend, status, applied, system_prompt_score,
+                    user_prompt_score, routing_weighted_score
+                ) VALUES (
+                    'sess1', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'sonnet', 'haiku', 'anthropic', 'success', 1,
+                    0.75, 1.5, 1.05
+                )"""
+            )
+        from anthproxy.db import _apply_migration_8
+        with conn:
+            _apply_migration_8(conn)
+        row = conn.execute("SELECT system_prompt_score, user_prompt_score, routing_weighted_score FROM requests WHERE session_id='sess1'").fetchone()
+        assert row['system_prompt_score'] == pytest.approx(38.0)   # round(0.75*50)
+        assert row['user_prompt_score'] == pytest.approx(75.0)     # round(1.5*50)
+        assert row['routing_weighted_score'] == pytest.approx(53.0) # round(1.05*50)
+        conn.close()
+
+    def test_migration_8_does_not_rescale_integer_rows(self):
+        """Integer-valued rows (new 0-100 scale) must not be double-rescaled."""
+        conn = self._apply_through_migration_7()
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, request_ts, requested_model, routed_model,
+                    backend, status, applied, system_prompt_score,
+                    user_prompt_score, routing_weighted_score
+                ) VALUES (
+                    'sess2', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'sonnet', 'haiku', 'anthropic', 'success', 1,
+                    50.0, 75.0, 60.0
+                )"""
+            )
+        from anthproxy.db import _apply_migration_8
+        with conn:
+            _apply_migration_8(conn)
+        row = conn.execute("SELECT system_prompt_score, user_prompt_score, routing_weighted_score FROM requests WHERE session_id='sess2'").fetchone()
+        assert row['system_prompt_score'] == pytest.approx(50.0)
+        assert row['user_prompt_score'] == pytest.approx(75.0)
+        assert row['routing_weighted_score'] == pytest.approx(60.0)
+        conn.close()
+
+    def test_record_request_stores_user_prompt_tier(self):
+        db, path = _make_db()
+        try:
+            decision = _make_decision()
+            row_id = db.record_request(
+                session_id='sess-upt',
+                conversation_anchor=None,
+                routing_decision=decision,
+                stats_dict=dict(_DEFAULT_STATS),
+                duration_ms=100,
+                backend='anthropic',
+                status='success',
+                system_prompt_tier='standard',
+                system_prompt_score=50,
+                user_prompt_score=75,
+                routing_weighted_score=65,
+                user_prompt_tier='deep',
+            )
+            row = db.get_request(row_id)
+            assert row is not None
+            assert row['user_prompt_tier'] == 'deep'
+        finally:
+            db.close()
+            os.unlink(path)
+
+    def test_record_request_user_prompt_tier_defaults_null(self):
+        db, path = _make_db()
+        try:
+            row_id = _insert(db)
+            row = db.get_request(row_id)
+            assert row is not None
+            assert row['user_prompt_tier'] is None
         finally:
             db.close()
             os.unlink(path)

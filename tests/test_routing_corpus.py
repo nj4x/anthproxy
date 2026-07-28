@@ -78,8 +78,8 @@ def _config(
     # ADR 0010/0012: weighted blend config — concrete values so comparisons work.
     cfg.auto_model_routing_system_prompt_weight = 0.30
     cfg.auto_model_routing_user_prompt_weight = 0.70
-    cfg.auto_model_routing_trivial_threshold = 0.75
-    cfg.auto_model_routing_standard_threshold = 1.50
+    cfg.auto_model_routing_trivial_threshold = 38.0
+    cfg.auto_model_routing_standard_threshold = 75.0
     cfg.auto_model_routing_system_prompt_cache_size = 256
     cfg.auto_model_routing_system_prompt_preview_limit = 500
     return cfg
@@ -110,8 +110,14 @@ def _config_from_overrides(overrides: dict):
     return _config(**defaults)
 
 
-def _text_response(label: str) -> dict:
-    return {'content': [{'type': 'text', 'text': label}], 'stop_reason': 'end_turn'}
+# Numeric scores for each tier (0-100 scale, matching test_model_router.py _LABEL_SCORE_STR).
+_LABEL_SCORE_STR = {'trivial': '0', 'standard': '50', 'deep': '100'}
+
+
+def _text_response(label_or_raw: str) -> dict:
+    """Build classifier response dict. Converts tier labels to canonical numeric scores."""
+    text = _LABEL_SCORE_STR.get(label_or_raw, label_or_raw)
+    return {'content': [{'type': 'text', 'text': text}], 'stop_reason': 'end_turn'}
 
 
 def _make_backend(

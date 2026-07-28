@@ -1,6 +1,6 @@
 """SQLite persistence layer for the anthproxy web UI.
 
-Schema version: 8
+Schema version: 9
 Thread safety: threading.Lock() for all writes; WAL mode for concurrent reads.
 Migrations: PRAGMA user_version tracks applied schema version (no Alembic).
 """
@@ -18,7 +18,7 @@ from .stats import MODEL_PRICING, _classify_model
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +293,30 @@ def _apply_migration_7(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_migration_8(conn: sqlite3.Connection) -> None:
+    """Add user_prompt_tier column and rescale old 0-2 fractional scores to 0-100 (v8 → v9)."""
+    conn.execute("ALTER TABLE requests ADD COLUMN user_prompt_tier TEXT")
+
+    # Rescale system_prompt_score, user_prompt_score, routing_weighted_score from 0-2 to 0-100.
+    # Heuristic: fractional (non-integer) values are characteristic of old-scale outputs
+    # (e.g. 0.75, 1.50). Integer-valued rows on the new 0-100 scale are excluded.
+    # Rows where the old score was exactly 0.0, 1.0, or 2.0 are not migrated (negligibly rare;
+    # the risk of double-rescaling outweighs the benefit).
+    cur = conn.execute(
+        """
+        UPDATE requests
+        SET
+            system_prompt_score  = ROUND(system_prompt_score  * 50, 0),
+            user_prompt_score    = ROUND(user_prompt_score    * 50, 0),
+            routing_weighted_score = ROUND(routing_weighted_score * 50, 0)
+        WHERE system_prompt_score IS NOT NULL
+          AND system_prompt_score != CAST(system_prompt_score AS INTEGER)
+        """
+    )
+    if cur.rowcount:
+        logger.info('Migration 8: rescaled %d old 0-2 scale score rows to 0-100', cur.rowcount)
+
+
 _MIGRATIONS: dict[int, object] = {
     0: _apply_migration_0,
     1: _apply_migration_1,
@@ -302,6 +326,7 @@ _MIGRATIONS: dict[int, object] = {
     5: _apply_migration_5,
     6: _apply_migration_6,
     7: _apply_migration_7,
+    8: _apply_migration_8,
 }
 
 
@@ -446,6 +471,7 @@ class SessionDB:
         user_prompt_score: float | None = None,
         routing_weighted_score: float | None = None,
         system_prompt_classification_failed: bool = False,
+        user_prompt_tier: str | None = None,
     ) -> int:
         """Insert one request row and upsert the owning session row.
 
@@ -506,11 +532,12 @@ class SessionDB:
                         parent_conversation_anchor, response_text,
                         user_prompt_search, response_search,
                         system_prompt_tier, system_prompt_score, user_prompt_score,
-                        routing_weighted_score, system_prompt_classification_failed
+                        routing_weighted_score, system_prompt_classification_failed,
+                        user_prompt_tier
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -552,6 +579,7 @@ class SessionDB:
                         user_prompt_score,
                         routing_weighted_score,
                         1 if system_prompt_classification_failed else 0,
+                        user_prompt_tier,
                     ),
                 )
                 rowid: int = cur.lastrowid  # type: ignore[assignment]

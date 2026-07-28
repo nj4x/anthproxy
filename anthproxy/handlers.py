@@ -1631,6 +1631,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             system_prompt_classification_failed = getattr(
                 _routing, 'system_prompt_classification_failed', False
             )
+            user_prompt_tier = getattr(_routing, 'user_prompt_tier', None)
 
             return {
                 'user_prompt_text': user_prompt_text,
@@ -1648,6 +1649,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 'user_prompt_score': user_prompt_score,
                 'routing_weighted_score': routing_weighted_score,
                 'system_prompt_classification_failed': system_prompt_classification_failed,
+                'user_prompt_tier': user_prompt_tier,
             }
         except Exception:
             logger.warning('%s prompt capture extraction failed', self._log_tag(), exc_info=True)
