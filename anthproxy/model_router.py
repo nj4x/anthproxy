@@ -175,33 +175,33 @@ _LABEL_SCORES: dict[str, float] = {'trivial': 0.0, 'standard': 1.0, 'deep': 2.0}
 # Distinct from _CLASSIFIER_SYSTEM (which classifies user prompts) — teaches the
 # classifier to judge role complexity, not task complexity.
 _CLASSIFIER_SYSTEM_PROMPT_TIER = (
-    'You are a one-word complexity classifier for AI agent system prompts. '
-    'Read the system prompt preview and reply with EXACTLY one of these three labels and nothing else:\n'
+    'You are a numeric complexity classifier for AI agent system prompts. '
+    'Read the system prompt preview and reply with EXACTLY one integer from 0 to 100 and nothing else.\n'
     '\n'
-    'trivial  — a narrow specialist role with low cognitive complexity: file browsing, '
+    '0–37    — trivial: a narrow specialist role with low cognitive complexity: file browsing, '
     'simple retrieval, formatting, mechanical data tasks, or any role that mostly reads '
     'and summarises with minimal reasoning.\n'
     '\n'
-    'standard — a general-purpose assistant, software engineer, or analyst role that '
+    '38–74   — standard: a general-purpose assistant, software engineer, or analyst role that '
     'handles a mix of coding, explanation, debugging, and planning tasks.\n'
     '\n'
-    'deep     — a research architect, system designer, or expert-level specialist role '
+    '75–100  — deep: a research architect, system designer, or expert-level specialist role '
     'that implies complex reasoning, architectural decisions, multi-domain synthesis, '
     'or security-sensitive work.\n'
     '\n'
     'Judge complexity from the ROLE implied by the system prompt, not from any specific '
-    'user task. A "file search specialist" is trivial by role even for a hard task; '
-    'a "research architect" is deep by role even for a simple task.\n'
+    'user task. A "file search specialist" is low (e.g. 10) by role even for a hard task; '
+    'a "research architect" is high (e.g. 90) by role even for a simple task.\n'
     '\n'
     'Examples:\n'
-    '"You are a file search and retrieval assistant." → trivial\n'
-    '"You are a helpful assistant." → standard\n'
-    '"You are Claude, an AI assistant." → standard\n'
-    '"You are a senior software engineer helping with code review." → standard\n'
-    '"You are a security researcher and penetration testing expert." → deep\n'
-    '"You are a research architect responsible for designing distributed systems." → deep\n'
+    '"You are a file search and retrieval assistant." → 10\n'
+    '"You are a helpful assistant." → 50\n'
+    '"You are Claude, an AI assistant." → 50\n'
+    '"You are a senior software engineer helping with code review." → 60\n'
+    '"You are a security researcher and penetration testing expert." → 85\n'
+    '"You are a research architect responsible for designing distributed systems." → 90\n'
     '\n'
-    'Reply with ONLY the single label word. No punctuation, no explanation.'
+    'Reply with ONLY the integer. No punctuation, no explanation.'
 )
 
 # Module-level LRU cache: system_prompt_sha256 → (tier_label, score_float).
@@ -227,50 +227,50 @@ def _prompt_log_preview(text: str) -> str:
     return preview
 
 # Classifier response constraints
-_CLASSIFIER_MAX_TOKENS = 4
+_CLASSIFIER_MAX_TOKENS = 8
 _CLASSIFIER_TEMPERATURE = 0.0
 
 _CLASSIFIER_SYSTEM = (
-    'You are a one-word complexity classifier for AI coding assistant requests. '
-    'Read the JSON summary of the user request and reply with EXACTLY one of '
-    'these three labels and nothing else:\n'
+    'You are a numeric complexity classifier for AI coding assistant requests. '
+    'Read the JSON summary of the user request and reply with EXACTLY one integer '
+    'from 0 to 100 and nothing else.\n'
     '\n'
-    'trivial  — greeting, acknowledgement, simple lookup, short factual answer, '
+    '0–37    — trivial: greeting, acknowledgement, simple lookup, short factual answer, '
     'formatting, tiny edit, or low-risk mechanical task that requires almost no '
     'reasoning.\n'
     '\n'
-    'standard — normal coding, explanation, debugging, planning, or multi-step '
+    '38–74   — standard: normal coding, explanation, debugging, planning, or multi-step '
     'work that does not require extended reasoning or unusual depth.\n'
     '\n'
-    'deep     — architecture, ambiguous high-stakes design, advanced mathematics, '
+    '75–100  — deep: architecture, ambiguous high-stakes design, advanced mathematics, '
     'security-sensitive reasoning, '
     'or a task likely to need extended chain-of-thought thinking.\n'
     '\n'
     'Judge complexity ONLY from the user\'s intent in "final_user_text". The '
     'other fields (message counts, tool counts, conversation length) describe '
     'the harness setup and prior context, NOT the difficulty of THIS request — '
-    'never escalate the label because of them. A short, simple request is '
-    'trivial even inside a long session with many tools.\n'
+    'never escalate because of them. A short, simple request is low (e.g. 5) '
+    'even inside a long session with many tools.\n'
     '\n'
     'Floor: any request that asks to plan, design, or outline an approach or '
-    'implementation is AT LEAST "standard", never "trivial", even when the '
-    'wording looks small or simple.\n'
+    'implementation is AT LEAST 38, never below that, even when the wording '
+    'looks small or simple.\n'
     '\n'
-    'Examples (final_user_text → label):\n'
-    '"hi" → trivial\n'
-    '"thanks, that works" → trivial\n'
-    '"fix the typo in the README" → trivial\n'
-    '"read the first 20 lines of config.py" → trivial\n'
-    '"what is the signature of parse_config()?" → trivial\n'
-    '"implement auth middleware for the Express router" → standard\n'
-    '"plan how to add a logout button" → standard\n'
-    '"why does this endpoint return 500?" → standard\n'
-    '"refactor the payment module to use the strategy pattern" → standard\n'
-    '"update 5 test files to use the new mock factory" → standard\n'
-    '"add cursor-based pagination to the list users API" → standard\n'
-    '"redesign the auth layer for SSO and multi-tenant isolation" → deep\n'
+    'Examples (final_user_text → score):\n'
+    '"hi" → 5\n'
+    '"thanks, that works" → 5\n'
+    '"fix the typo in the README" → 10\n'
+    '"read the first 20 lines of config.py" → 10\n'
+    '"what is the signature of parse_config()?" → 15\n'
+    '"implement auth middleware for the Express router" → 55\n'
+    '"plan how to add a logout button" → 45\n'
+    '"why does this endpoint return 500?" → 50\n'
+    '"refactor the payment module to use the strategy pattern" → 60\n'
+    '"update 5 test files to use the new mock factory" → 55\n'
+    '"add cursor-based pagination to the list users API" → 60\n'
+    '"redesign the auth layer for SSO and multi-tenant isolation" → 90\n'
     '\n'
-    'Reply with ONLY the single label word. No punctuation, no explanation.'
+    'Reply with ONLY the integer. No punctuation, no explanation.'
 )
 
 # Labels the classifier is allowed to produce
@@ -283,44 +283,41 @@ _VALID_LABELS = frozenset({'trivial', 'standard', 'deep'})
 # Used ONLY when config.auto_model_routing_confidence_bump is True.  The
 # existing _CLASSIFIER_SYSTEM / parse_classifier_label pair is never modified.
 _CLASSIFIER_SYSTEM_JSON = (
-    'You are a complexity classifier for AI coding assistant requests. '
+    'You are a numeric complexity classifier for AI coding assistant requests. '
     'Read the JSON summary of the user request and reply ONLY with valid JSON:\n'
-    '{"label":"trivial"|"standard"|"deep","confidence":0.0-1.0}\n'
+    '{"score":<int 0-100>}\n'
     '\n'
-    'trivial  — greeting, acknowledgement, simple lookup, short factual answer, '
+    '0–37    — trivial: greeting, acknowledgement, simple lookup, short factual answer, '
     'formatting, tiny edit, or low-risk mechanical task that requires almost no '
     'reasoning.\n'
     '\n'
-    'standard — normal coding, explanation, debugging, planning, or multi-step '
+    '38–74   — standard: normal coding, explanation, debugging, planning, or multi-step '
     'work that does not require extended reasoning or unusual depth.\n'
     '\n'
-    'deep     — architecture, ambiguous high-stakes design, advanced mathematics, '
+    '75–100  — deep: architecture, ambiguous high-stakes design, advanced mathematics, '
     'security-sensitive reasoning, '
     'or a task likely to need extended chain-of-thought thinking.\n'
     '\n'
     'Judge complexity ONLY from the user\'s intent in "final_user_text". The '
     'other fields (message counts, tool counts, conversation length) describe '
     'the harness setup and prior context, NOT the difficulty of THIS request — '
-    'never escalate the label because of them. A short, simple request is '
-    'trivial even inside a long session with many tools.\n'
+    'never escalate because of them. A short, simple request is low (e.g. 5) '
+    'even inside a long session with many tools.\n'
     '\n'
     'Floor: any request that asks to plan, design, or outline an approach or '
-    'implementation is AT LEAST "standard", never "trivial", even when the '
-    'wording looks small or simple.\n'
+    'implementation is AT LEAST 38, never below that.\n'
     '\n'
-    'confidence must reflect how certain you are (0.0=uncertain, 1.0=certain).\n'
-    '\n'
-    '"implement auth middleware for the Express router" → standard\n'
-    '"refactor the payment module to use the strategy pattern" → standard\n'
-    '"update 5 test files to use the new mock factory" → standard\n'
-    '"read the first 20 lines of config.py" → trivial\n'
-    '"what is the signature of parse_config()?" → trivial\n'
+    '"implement auth middleware for the Express router" → {"score":55}\n'
+    '"refactor the payment module to use the strategy pattern" → {"score":60}\n'
+    '"update 5 test files to use the new mock factory" → {"score":55}\n'
+    '"read the first 20 lines of config.py" → {"score":10}\n'
+    '"what is the signature of parse_config()?" → {"score":15}\n'
     '\n'
     'Reply with ONLY the JSON object. No other text.'
 )
 
 # Larger token budget for the JSON-format response.  The JSON payload
-# {"label":"standard","confidence":0.87} is ~14 tokens; 40 gives ample headroom.
+# {"score":42} is ~5 tokens; 40 gives ample headroom.
 _CLASSIFIER_MAX_TOKENS_JSON = 40
 
 # Appended to _CLASSIFIER_SYSTEM_JSON when the classifier payload includes
@@ -1092,26 +1089,78 @@ def parse_classifier_label(
     return None
 
 
-def parse_classifier_label_json(
+def parse_classifier_score(
     response: dict,
-) -> tuple[str, float] | None:
-    """Extract a valid (label, confidence) pair from a non-streaming JSON response.
+) -> int | None:
+    """Extract a valid integer score in [0, 100] from a non-streaming response dict.
+
+    Collects text from all non-thinking content blocks (skips thinking/
+    redacted_thinking), strips whitespace, and validates that ``re.findall``
+    returns exactly one digit sequence.  Rejects negative numbers, out-of-range
+    values, multiple digit sequences (e.g. '42/100'), and non-text blocks.
+    Returns ``int`` in [0, 100] on success, ``None`` on any failure.
+    """
+    content = response.get('content')
+    if not isinstance(content, list) or not content:
+        return None
+
+    _SKIP_BLOCK_TYPES = frozenset({'thinking', 'redacted_thinking'})
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            return None
+        btype = block.get('type')
+        if btype in _SKIP_BLOCK_TYPES:
+            continue
+        if btype != 'text':
+            return None
+        t = block.get('text')
+        if not isinstance(t, str):
+            return None
+        text_parts.append(t)
+
+    if not text_parts:
+        return None
+
+    stripped = ' '.join(text_parts).strip()
+    if not stripped:
+        return None
+
+    # Negative-number guard: re.findall(r'\d+', '-5') returns ['5'] and would
+    # silently pass; reject before extracting digits.
+    if re.search(r'-\d', stripped):
+        return None
+
+    matches = re.findall(r'\d+', stripped)
+    if len(matches) != 1:
+        return None
+
+    value = int(matches[0])
+    if not (0 <= value <= 100):
+        return None
+
+    return value
+
+
+def parse_classifier_score_json(
+    response: dict,
+) -> int | None:
+    """Extract a valid integer score in [0, 100] from a non-streaming JSON response.
 
     Used ONLY when ``config.auto_model_routing_confidence_bump`` is True.  The
     existing ``parse_classifier_label`` function and one-word prompt are never
     modified.
 
     Accepts a response whose text blocks (after stripping thinking/
-    redacted_thinking) contain a single JSON object with ``label`` and
-    ``confidence`` keys.  Tolerates surrounding whitespace but rejects:
+    redacted_thinking) contain a single JSON object with a ``score`` key.
+    Tolerates surrounding whitespace but rejects:
 
     - Malformed JSON or non-object values
-    - Missing ``label`` or ``confidence`` keys
-    - Unknown label (not in ``_VALID_LABELS``)
-    - Non-numeric ``confidence`` or confidence outside ``[0.0, 1.0]``
+    - Missing ``score`` key
+    - Non-integer ``score`` or score outside [0, 100]
     - Non-text content blocks (other than skipped thinking blocks)
 
-    Returns ``(label, confidence)`` on success, or ``None`` on any error.
+    Returns ``int`` in [0, 100] on success, ``None`` on any error.
     The caller fails-closed to the original requested model on ``None``.
     """
     content = response.get('content')
@@ -1145,18 +1194,13 @@ def parse_classifier_label_json(
     if not isinstance(parsed, dict):
         return None
 
-    label = parsed.get('label')
-    if label not in _VALID_LABELS:
+    score = parsed.get('score')
+    if not isinstance(score, int) or isinstance(score, bool):
+        return None
+    if not (0 <= score <= 100):
         return None
 
-    confidence = parsed.get('confidence')
-    if not isinstance(confidence, (int, float)):
-        return None
-    confidence = float(confidence)
-    if not (0.0 <= confidence <= 1.0):
-        return None
-
-    return (label, confidence)  # type: ignore[return-value]
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -1407,11 +1451,17 @@ def _dispatch_classifier_mode(
             if _parts:
                 clf_raw_response = ' '.join(_parts)
         if use_confidence_bump:
-            parsed_json = parse_classifier_label_json(response)
-            if parsed_json is None:
+            score_json = parse_classifier_score_json(response)
+            if score_json is None:
                 label: str | None = None
             else:
-                label, parsed_confidence = parsed_json
+                # Derive label from numeric score; ticket 02 replaces with full numeric routing.
+                if score_json < 38:
+                    label = 'trivial'
+                elif score_json < 75:
+                    label = 'standard'
+                else:
+                    label = 'deep'
         else:
             label = parse_classifier_label(response)
     except Exception as exc:
@@ -1755,8 +1805,15 @@ def route_model(
             )
             response = send_fn(clf_payload, credentials, config)
             if use_json:
-                parsed_json = parse_classifier_label_json(response)
-                label: str | None = parsed_json[0] if parsed_json else None
+                score_json = parse_classifier_score_json(response)
+                if score_json is None:
+                    label: str | None = None
+                elif score_json < 38:
+                    label = 'trivial'
+                elif score_json < 75:
+                    label = 'standard'
+                else:
+                    label = 'deep'
             else:
                 label = parse_classifier_label(response)
 

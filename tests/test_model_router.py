@@ -38,6 +38,8 @@ from anthproxy.model_router import (
     classify_by_rules,
     is_model_auto_routable,
     parse_classifier_label,
+    parse_classifier_score,
+    parse_classifier_score_json,
     route_model,
 )
 
@@ -1169,11 +1171,12 @@ class TestBuildRoutingSummary:
 class TestClassifierSystemPrompt:
     def test_planning_floored_to_standard(self):
         # Regression guard: the prompt must instruct that planning/design
-        # requests are at least standard, never trivial.
+        # requests are at least 38 (standard floor), never trivial.
         text = _CLASSIFIER_SYSTEM.lower()
         assert 'plan' in text
-        assert 'never' in text and 'trivial' in text
-        assert 'plan how to add a logout button" → standard' in _CLASSIFIER_SYSTEM
+        assert 'never' in text
+        assert '38' in text  # numeric floor instruction
+        assert 'plan how to add a logout button" → 45' in _CLASSIFIER_SYSTEM
 
 
 # ---------------------------------------------------------------------------
@@ -1201,7 +1204,7 @@ class TestBuildClassifierPayload:
 
     def test_max_tokens_is_tiny(self):
         cp = build_classifier_payload(self._make_summary(), _config())
-        assert cp['max_tokens'] == 4
+        assert cp['max_tokens'] == 8
 
     def test_temperature_is_zero(self):
         cp = build_classifier_payload(self._make_summary(), _config())
@@ -1400,6 +1403,187 @@ class TestParseClassifierLabel:
 
     def test_non_list_content_returns_none(self):
         assert parse_classifier_label({'content': 'trivial'}) is None
+
+
+# ---------------------------------------------------------------------------
+# 8b. parse_classifier_score — numeric 0-100 parser
+# ---------------------------------------------------------------------------
+
+class TestParseClassifierScore:
+    def _resp(self, text: str) -> dict:
+        return {'content': [{'type': 'text', 'text': text}]}
+
+    @pytest.mark.parametrize('text,expected', [
+        ('0', 0),
+        ('42', 42),
+        ('100', 100),
+        ('  37  ', 37),
+        ('\n75\n', 75),
+        ('5', 5),
+    ])
+    def test_valid_integers(self, text, expected):
+        assert parse_classifier_score(self._resp(text)) == expected
+
+    def test_multiple_digit_sequences_rejected_slash(self):
+        # '42/100' → re.findall returns ['42', '100'] → rejected
+        assert parse_classifier_score(self._resp('42/100')) is None
+
+    def test_multiple_digit_sequences_rejected_space(self):
+        # 'score: 42 (out of 100)' → re.findall returns ['42', '100'] → rejected
+        assert parse_classifier_score(self._resp('score: 42 (out of 100)')) is None
+
+    def test_multiple_digit_sequences_rejected_two_numbers(self):
+        assert parse_classifier_score(self._resp('42 42')) is None
+
+    def test_no_digits_rejected(self):
+        assert parse_classifier_score(self._resp('standard')) is None
+
+    def test_empty_text_rejected(self):
+        assert parse_classifier_score(self._resp('')) is None
+
+    def test_out_of_range_low_rejected(self):
+        # -5 is handled by negative guard; 101 is out of range
+        assert parse_classifier_score(self._resp('101')) is None
+
+    def test_out_of_range_high_rejected(self):
+        assert parse_classifier_score(self._resp('200')) is None
+
+    def test_negative_number_guard(self):
+        # re.findall(r'\d+', '-5') returns ['5'] and would silently pass without guard
+        assert parse_classifier_score(self._resp('-5')) is None
+
+    def test_negative_number_guard_no_false_positive(self):
+        # '-' not immediately followed by a digit; guard doesn't fire; single digit sequence
+        assert parse_classifier_score(self._resp('-abc 42')) == 42
+
+    def test_thinking_block_skipped(self):
+        resp = {
+            'content': [
+                {'type': 'thinking', 'thinking': 'reasoning here', 'signature': 'sig'},
+                {'type': 'text', 'text': '55'},
+            ]
+        }
+        assert parse_classifier_score(resp) == 55
+
+    def test_redacted_thinking_skipped(self):
+        resp = {
+            'content': [
+                {'type': 'redacted_thinking', 'data': 'opaque'},
+                {'type': 'text', 'text': '80'},
+            ]
+        }
+        assert parse_classifier_score(resp) == 80
+
+    def test_all_thinking_no_text_returns_none(self):
+        resp = {
+            'content': [
+                {'type': 'thinking', 'thinking': 'reasoning', 'signature': 'sig'}
+            ]
+        }
+        assert parse_classifier_score(resp) is None
+
+    def test_empty_content_list_returns_none(self):
+        assert parse_classifier_score({'content': []}) is None
+
+    def test_missing_content_returns_none(self):
+        assert parse_classifier_score({}) is None
+
+    def test_malformed_block_missing_type(self):
+        # Block without 'type' key: get() returns None, not in skip set, not 'text' → None
+        resp = {'content': [{'text': '42'}]}
+        assert parse_classifier_score(resp) is None
+
+    def test_non_text_block_rejected(self):
+        resp = {'content': [{'type': 'tool_use', 'id': 't1', 'name': 'bash', 'input': {}}]}
+        assert parse_classifier_score(resp) is None
+
+    def test_non_list_content_returns_none(self):
+        assert parse_classifier_score({'content': 'trivial'}) is None
+
+    def test_boundary_zero(self):
+        assert parse_classifier_score(self._resp('0')) == 0
+
+    def test_boundary_hundred(self):
+        assert parse_classifier_score(self._resp('100')) == 100
+
+
+# ---------------------------------------------------------------------------
+# 8c. parse_classifier_score_json — JSON {"score": N} parser
+# ---------------------------------------------------------------------------
+
+class TestParseClassifierScoreJson:
+    def _resp(self, text: str) -> dict:
+        return {'content': [{'type': 'text', 'text': text}]}
+
+    def test_valid_score(self):
+        assert parse_classifier_score_json(self._resp('{"score":55}')) == 55
+
+    def test_boundary_zero(self):
+        assert parse_classifier_score_json(self._resp('{"score":0}')) == 0
+
+    def test_boundary_hundred(self):
+        assert parse_classifier_score_json(self._resp('{"score":100}')) == 100
+
+    def test_out_of_range_rejects(self):
+        assert parse_classifier_score_json(self._resp('{"score":101}')) is None
+        assert parse_classifier_score_json(self._resp('{"score":-1}')) is None
+
+    def test_missing_score_key_rejects(self):
+        assert parse_classifier_score_json(self._resp('{"label":"standard"}')) is None
+
+    def test_float_score_rejects(self):
+        # Only int is accepted; float is not
+        assert parse_classifier_score_json(self._resp('{"score":55.5}')) is None
+
+    def test_bool_score_rejects(self):
+        # bool is subclass of int; must be explicitly rejected
+        assert parse_classifier_score_json(self._resp('{"score":true}')) is None
+
+    def test_string_score_rejects(self):
+        assert parse_classifier_score_json(self._resp('{"score":"55"}')) is None
+
+    def test_malformed_json_rejects(self):
+        assert parse_classifier_score_json(self._resp('not json')) is None
+
+    def test_non_object_json_rejects(self):
+        assert parse_classifier_score_json(self._resp('[55]')) is None
+
+    def test_empty_text_rejects(self):
+        assert parse_classifier_score_json(self._resp('')) is None
+
+    def test_empty_content_list_returns_none(self):
+        assert parse_classifier_score_json({'content': []}) is None
+
+    def test_missing_content_returns_none(self):
+        assert parse_classifier_score_json({}) is None
+
+    def test_thinking_block_skipped(self):
+        resp = {
+            'content': [
+                {'type': 'thinking', 'thinking': 'reasoning', 'signature': 'sig'},
+                {'type': 'text', 'text': '{"score":42}'},
+            ]
+        }
+        assert parse_classifier_score_json(resp) == 42
+
+    def test_all_thinking_no_text_returns_none(self):
+        resp = {
+            'content': [
+                {'type': 'thinking', 'thinking': 'r', 'signature': 's'}
+            ]
+        }
+        assert parse_classifier_score_json(resp) is None
+
+    def test_malformed_block_missing_type(self):
+        resp = {'content': [{'text': '{"score":42}'}]}
+        assert parse_classifier_score_json(resp) is None
+
+    def test_non_text_block_rejected(self):
+        resp = {'content': [{'type': 'tool_use', 'id': 't1', 'name': 'bash', 'input': {}}]}
+        assert parse_classifier_score_json(resp) is None
+
+    def test_whitespace_around_json(self):
+        assert parse_classifier_score_json(self._resp('  {"score":75}  ')) == 75
 
 
 # ---------------------------------------------------------------------------
@@ -2767,12 +2951,12 @@ class TestAffirmationEnrichment:
     def test_confidence_bump_true_uses_json_system_prompt_and_parser(self):
         """When confidence_bump=True, the affirmation classifier call uses
         _CLASSIFIER_SYSTEM_JSON + _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX and
-        parse_classifier_label_json, not the one-word prompt/parser."""
+        parse_classifier_score_json, not the one-word prompt/parser."""
         from anthproxy.model_router import _CLASSIFIER_SYSTEM_JSON, _CLASSIFIER_SYSTEM_JSON_PRIOR_SUFFIX
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = {
-            'content': [{'type': 'text', 'text': '{"label":"standard","confidence":0.92}'}],
+            'content': [{'type': 'text', 'text': '{"score":55}'}],
             'usage': {'input_tokens': 10, 'output_tokens': 8},
         }
         snap = _snapshot(backend=backend, routing=True)
@@ -3333,17 +3517,16 @@ class TestConfidenceBumpPromotion:
     """Verify tier_bumped when confidence_bump mode promotes a tier."""
 
     def test_confidence_bump_trivial_to_standard(self):
-        """tier_bumped is True when confidence_bump mode promotes trivial to standard.
+        """In numeric score mode, confidence_bump path uses {"score":N} JSON.
 
-        When confidence_bump=True and the JSON classifier returns a label with
-        confidence below the configured min_confidence threshold, the label is
-        promoted one tier (trivial→standard).  tier_bumped reflects the
-        promotion; classification carries the raw pre-bump label.
+        The numeric score is parsed by parse_classifier_score_json; parsed_confidence
+        is no longer available, so tier_bumped is False. tier_bumped removal is
+        completed in ticket 02; this test verifies the numeric path classifies correctly.
         """
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = {
-            'content': [{'type': 'text', 'text': '{"label":"trivial","confidence":0.3}'}],
+            'content': [{'type': 'text', 'text': '{"score":10}'}],
             'stop_reason': 'end_turn',
         }
         snap = _snapshot(backend=backend, routing=True)
@@ -3351,10 +3534,9 @@ class TestConfidenceBumpPromotion:
         snap.config.auto_model_routing_min_confidence = 0.8
         payload = _payload(model='claude-sonnet-4-6', content='fix the typo')
         decision = route_model(payload, snap, {})
-        assert decision.tier_bumped is True
-        assert decision.reason_code == 'classifier_trivial_bumped'
+        assert decision.tier_bumped is False
+        assert decision.reason_code == 'classifier_trivial'
         assert decision.classification == 'trivial'
-        assert 'sonnet' in payload['model']
 
     # ------------------------------------------------------------------
     # Default values for reserved fields
@@ -3808,7 +3990,7 @@ class TestClassifierTransparencyFields:
         backend = MagicMock()
         del backend.send_classifier_message
         backend.send_message.return_value = {
-            'content': [{'type': 'text', 'text': '{"label":"standard","confidence":0.9}'}],
+            'content': [{'type': 'text', 'text': '{"score":55}'}],
             'stop_reason': 'end_turn',
         }
         snap = _snapshot(backend=backend, routing=True)
@@ -3819,7 +4001,6 @@ class TestClassifierTransparencyFields:
         assert decision.classifier_format == 'json'
         assert decision.reason_code in (
             'classifier_standard', 'classifier_trivial', 'classifier_deep',
-            'classifier_trivial_bumped', 'classifier_standard_bumped',
         )
 
     def test_all_four_fields_populated_on_trivial(self):
