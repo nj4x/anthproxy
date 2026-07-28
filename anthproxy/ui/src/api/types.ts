@@ -289,4 +289,5 @@ export interface RequestDetail extends RequestRecord {
   user_prompt_score: number | null;
   routing_weighted_score: number | null;
   system_prompt_classification_failed: number | null;
+  user_prompt_tier: string | null;
 }

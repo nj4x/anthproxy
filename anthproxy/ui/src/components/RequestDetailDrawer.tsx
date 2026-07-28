@@ -416,19 +416,23 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                           </div>
                           <div>
                             <span className="text-gray-400">Sys-prompt score: </span>
-                            <span className="text-gray-700 font-mono">{data.system_prompt_score?.toFixed(1) ?? '—'}</span>
+                            <span className="text-gray-700 font-mono">{data.system_prompt_score ?? '—'}</span>
+                          </div>
+                          <div>
+                            <span className="text-gray-400">User-prompt tier: </span>
+                            <span className="text-gray-700 font-mono">{data.user_prompt_tier ?? '—'}</span>
                           </div>
                           <div>
                             <span className="text-gray-400">User-prompt score: </span>
-                            <span className="text-gray-700 font-mono">{data.user_prompt_score?.toFixed(1) ?? '—'}</span>
+                            <span className="text-gray-700 font-mono">{data.user_prompt_score ?? '—'}</span>
                           </div>
                           <div>
                             <span className="text-gray-400">Weighted score: </span>
-                            <span className="text-gray-700 font-mono">{data.routing_weighted_score?.toFixed(2) ?? '—'}</span>
+                            <span className="text-gray-700 font-mono">{data.routing_weighted_score ?? '—'}</span>
                           </div>
                         </div>
                         {data.system_prompt_classification_failed === 1 && (
-                          <div className="text-amber-600">⚠ System-prompt classifier failed — used standard (1.0) fallback</div>
+                          <div className="text-amber-600">⚠ System-prompt classifier failed — used midpoint fallback</div>
                         )}
                       </div>
                     )}
