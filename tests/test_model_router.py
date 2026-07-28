@@ -1474,6 +1474,14 @@ class TestParseClassifierScore:
         # '-' not immediately followed by a digit; guard doesn't fire; single digit sequence
         assert parse_classifier_score(self._resp('-abc 42')) == 42
 
+    def test_negative_number_guard_rejects_hyphenated_word_with_number(self):
+        # 'test-42' contains '-4' which matches r'-\d', so guard correctly rejects
+        assert parse_classifier_score(self._resp('test-42')) is None
+
+    def test_multiple_numbers_across_hyphen(self):
+        # '42-5' contains '-5' matching r'-\d', so guard rejects; and re.findall would return ['42','5'] anyway
+        assert parse_classifier_score(self._resp('42-5')) is None
+
     def test_thinking_block_skipped(self):
         resp = {
             'content': [
@@ -1602,6 +1610,14 @@ class TestParseClassifierScoreJson:
 
     def test_whitespace_around_json(self):
         assert parse_classifier_score_json(self._resp('  {"score":75}  ')) == 75
+
+    def test_extra_fields_ignored(self):
+        # JSON parser should ignore extra fields like 'confidence'
+        assert parse_classifier_score_json(self._resp('{"score":42,"confidence":0.87}')) == 42
+
+    def test_score_with_extra_numeric_fields_ignored(self):
+        # Only 'score' key is extracted; other numeric fields are ignored
+        assert parse_classifier_score_json(self._resp('{"score":50,"other_number":100}')) == 50
 
 
 # ---------------------------------------------------------------------------
@@ -4020,7 +4036,7 @@ class TestClassifierTransparencyFields:
         snap.config.auto_model_routing_min_confidence = 0.0
         payload = _payload(model='sonnet', content='fix the bug')
         decision = route_model(payload, snap, {})
-        assert decision.classifier_format == 'standard'
+        assert decision.classifier_format == 'json'
         assert decision.reason_code in (
             'classifier_standard', 'classifier_trivial', 'classifier_deep',
         )

@@ -378,7 +378,7 @@ ReasonCode = Literal[
 class ModelRoutingDecision:
     requested_model: str
     routed_model: str
-    classification: str | None  # raw label from classifier, or None
+    classification: str | None  # derived tier label (trivial/standard/deep), or None
     applied: bool               # True if the model was actually rewritten
     reason_code: ReasonCode
     # Raw per-request size estimate (chars/4 + tool overhead) computed for the
@@ -1159,9 +1159,9 @@ def parse_classifier_score_json(
 ) -> int | None:
     """Extract a valid integer score in [0, 100] from a non-streaming JSON response.
 
-    Used ONLY when ``config.auto_model_routing_confidence_bump`` is True.  The
-    existing ``parse_classifier_label`` function and one-word prompt are never
-    modified.
+    Used when ``config.auto_model_routing_confidence_bump`` is True.  The default
+    mode uses ``parse_classifier_score`` (plain-text numeric parser); ``parse_classifier_label``
+    is retained for backward-compat in rules mode only.
 
     Accepts a response whose text blocks (after stripping thinking/
     redacted_thinking) contain a single JSON object with a ``score`` key.
@@ -1434,7 +1434,8 @@ def _dispatch_classifier_mode(
     # the response is available (raw_response captured after).
     clf_model: str | None = config.auto_model_routing_classifier_model
     clf_summary_json: str | None = summary.to_classifier_json(prior_response_summary=prior_response_summary)
-    clf_format: str | None = 'standard'
+    use_json = getattr(config, 'auto_model_routing_confidence_bump', False)
+    clf_format: str | None = 'json' if use_json else 'standard'
     clf_raw_response: str | None = None
     try:
         send_fn = getattr(
@@ -1459,7 +1460,10 @@ def _dispatch_classifier_mode(
                             _parts.append(_t)
             if _parts:
                 clf_raw_response = ' '.join(_parts)
-        user_score: int | None = parse_classifier_score(response)
+        user_score: int | None = (
+            parse_classifier_score_json(response) if use_json
+            else parse_classifier_score(response)
+        )
     except Exception as exc:
         logger.warning(
             '%s Model router: classifier call failed (backend=%s) — keeping %s: %s',

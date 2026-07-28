@@ -300,8 +300,10 @@ def _apply_migration_8(conn: sqlite3.Connection) -> None:
     # Rescale system_prompt_score, user_prompt_score, routing_weighted_score from 0-2 to 0-100.
     # Heuristic: fractional (non-integer) values are characteristic of old-scale outputs
     # (e.g. 0.75, 1.50). Integer-valued rows on the new 0-100 scale are excluded.
-    # Rows where the old score was exactly 0.0, 1.0, or 2.0 are not migrated (negligibly rare;
-    # the risk of double-rescaling outweighs the benefit).
+    # Rows where a score was exactly 0.0, 1.0, or 2.0 are not migrated for that column
+    # (negligibly rare; the risk of double-rescaling outweighs the benefit).
+    # The WHERE clause predicates independently on each column to handle rows where
+    # system_prompt_score is NULL but user_prompt_score or routing_weighted_score are fractional.
     cur = conn.execute(
         """
         UPDATE requests
@@ -309,8 +311,12 @@ def _apply_migration_8(conn: sqlite3.Connection) -> None:
             system_prompt_score  = ROUND(system_prompt_score  * 50, 0),
             user_prompt_score    = ROUND(user_prompt_score    * 50, 0),
             routing_weighted_score = ROUND(routing_weighted_score * 50, 0)
-        WHERE system_prompt_score IS NOT NULL
-          AND system_prompt_score != CAST(system_prompt_score AS INTEGER)
+        WHERE (system_prompt_score IS NOT NULL
+               AND system_prompt_score != CAST(system_prompt_score AS INTEGER))
+           OR (user_prompt_score IS NOT NULL
+               AND user_prompt_score != CAST(user_prompt_score AS INTEGER))
+           OR (routing_weighted_score IS NOT NULL
+               AND routing_weighted_score != CAST(routing_weighted_score AS INTEGER))
         """
     )
     if cur.rowcount:

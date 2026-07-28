@@ -2991,6 +2991,78 @@ class TestNumericScoreMigration:
         assert row['routing_weighted_score'] == pytest.approx(60.0)
         conn.close()
 
+    def test_migration_8_rescales_null_system_score_with_fractional_user_score(self):
+        """Rows with NULL system_prompt_score but fractional user_prompt_score must be rescaled."""
+        conn = self._apply_through_migration_7()
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, request_ts, requested_model, routed_model,
+                    backend, status, applied, system_prompt_score,
+                    user_prompt_score, routing_weighted_score
+                ) VALUES (
+                    'sess_null_sys', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'sonnet', 'haiku', 'anthropic', 'success', 1,
+                    NULL, 1.5, 1.05
+                )"""
+            )
+        from anthproxy.db import _apply_migration_8
+        with conn:
+            _apply_migration_8(conn)
+        row = conn.execute("SELECT system_prompt_score, user_prompt_score, routing_weighted_score FROM requests WHERE session_id='sess_null_sys'").fetchone()
+        assert row['system_prompt_score'] is None  # Still NULL
+        assert row['user_prompt_score'] == pytest.approx(75.0)  # round(1.5*50)
+        assert row['routing_weighted_score'] == pytest.approx(53.0)  # round(1.05*50)
+        conn.close()
+
+    def test_migration_8_preserves_exact_integer_boundary_values(self):
+        """Rows with exactly 0.0, 1.0, or 2.0 (old-scale boundary) are not rescaled."""
+        conn = self._apply_through_migration_7()
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, request_ts, requested_model, routed_model,
+                    backend, status, applied, system_prompt_score,
+                    user_prompt_score, routing_weighted_score
+                ) VALUES (
+                    'sess_trivial', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'sonnet', 'haiku', 'anthropic', 'success', 1,
+                    0.0, 0.0, 0.0
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, request_ts, requested_model, routed_model,
+                    backend, status, applied, system_prompt_score,
+                    user_prompt_score, routing_weighted_score
+                ) VALUES (
+                    'sess_standard', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'sonnet', 'haiku', 'anthropic', 'success', 1,
+                    1.0, 1.0, 1.0
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, request_ts, requested_model, routed_model,
+                    backend, status, applied, system_prompt_score,
+                    user_prompt_score, routing_weighted_score
+                ) VALUES (
+                    'sess_deep', strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'sonnet', 'haiku', 'anthropic', 'success', 1,
+                    2.0, 2.0, 2.0
+                )"""
+            )
+        from anthproxy.db import _apply_migration_8
+        with conn:
+            _apply_migration_8(conn)
+        trivial_row = conn.execute("SELECT system_prompt_score FROM requests WHERE session_id='sess_trivial'").fetchone()
+        standard_row = conn.execute("SELECT system_prompt_score FROM requests WHERE session_id='sess_standard'").fetchone()
+        deep_row = conn.execute("SELECT system_prompt_score FROM requests WHERE session_id='sess_deep'").fetchone()
+        assert trivial_row['system_prompt_score'] == pytest.approx(0.0)
+        assert standard_row['system_prompt_score'] == pytest.approx(1.0)
+        assert deep_row['system_prompt_score'] == pytest.approx(2.0)
+        conn.close()
+
     def test_record_request_stores_user_prompt_tier(self):
         db, path = _make_db()
         try:

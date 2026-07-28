@@ -18,7 +18,7 @@ We replace the categorical label output with a plain integer on a 0–100 scale 
 
 2. **Token budget:** `_CLASSIFIER_MAX_TOKENS` is raised from 4 to 8 to accommodate "100" plus any trailing whitespace or newline the model may emit. The confidence-bump path retains its own `_CLASSIFIER_MAX_TOKENS_JSON = 40` budget.
 
-3. **Confidence-bump mode:** When `auto_model_routing_confidence_bump` is True, the JSON format switches from `{"label":"standard","confidence":0.87}` to `{"score":42,"confidence":0.87}`. `parse_classifier_label_json` is renamed to `parse_classifier_score_json` and updated to read `score` (integer, 0–100) instead of `label`. Out-of-range `score` values (e.g., `150`) are rejected — `parse_classifier_score_json` returns `None`. The one-number plain path is unaffected when confidence bump is off.
+3. **Confidence-bump mode:** When `auto_model_routing_confidence_bump` is True, the JSON format switches from `{"label":"standard","confidence":0.87}` to `{"score":<int 0-100>}`. The confidence-bump promotion logic (tier bumping based on low confidence) has been removed; the feature now merely switches to JSON numeric format without extracting or using the `confidence` field. `parse_classifier_label_json` is renamed to `parse_classifier_score_json` and updated to read `score` (integer, 0–100) instead of `label`. Out-of-range `score` values (e.g., `150`) are rejected — `parse_classifier_score_json` returns `None`. The one-number plain path is unaffected when confidence bump is off.
 
 4. **Weighted blend:** The blend arithmetic `sys_weight × sys_score + user_weight × user_score` (ADR 0010) now operates directly on 0–100 integers, producing a 0–100 weighted result. The `_LABEL_SCORES` dict is removed.
 
