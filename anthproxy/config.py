@@ -321,7 +321,7 @@ def parse_args(argv=None) -> Config:
         '--auto-model-routing-system-prompt-weight',
         dest='auto_model_routing_system_prompt_weight', type=float,
         default=float(os.environ.get(
-            'ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_WEIGHT', '0.30')),
+            'ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_WEIGHT', '0.20')),
         help='Weight applied to the system-prompt tier score in the weighted blend '
              '(must sum to 1.0 with --auto-model-routing-user-prompt-weight; both > 0). '
              '(default: 0.30, env: ANTHPROXY_AUTO_MODEL_ROUTING_SYSTEM_PROMPT_WEIGHT)',
@@ -330,7 +330,7 @@ def parse_args(argv=None) -> Config:
         '--auto-model-routing-user-prompt-weight',
         dest='auto_model_routing_user_prompt_weight', type=float,
         default=float(os.environ.get(
-            'ANTHPROXY_AUTO_MODEL_ROUTING_USER_PROMPT_WEIGHT', '0.70')),
+            'ANTHPROXY_AUTO_MODEL_ROUTING_USER_PROMPT_WEIGHT', '0.80')),
         help='Weight applied to the user-prompt tier score in the weighted blend '
              '(must sum to 1.0 with --auto-model-routing-system-prompt-weight; both > 0). '
              '(default: 0.70, env: ANTHPROXY_AUTO_MODEL_ROUTING_USER_PROMPT_WEIGHT)',
@@ -339,22 +339,22 @@ def parse_args(argv=None) -> Config:
         '--auto-model-routing-trivial-threshold',
         dest='auto_model_routing_trivial_threshold', type=float,
         default=float(os.environ.get(
-            'ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD', '38')),
+            'ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD', '30')),
         help='Weighted-score threshold below which the blended tier is "trivial". '
              'Must be strictly less than --auto-model-routing-standard-threshold. '
-             'On the 0-100 numeric scale: default 38. '
+             'On the 0-100 numeric scale: default 35. '
              '(default: 38, env: ANTHPROXY_AUTO_MODEL_ROUTING_TRIVIAL_THRESHOLD)',
     )
     p.add_argument(
         '--auto-model-routing-standard-threshold',
         dest='auto_model_routing_standard_threshold', type=float,
         default=float(os.environ.get(
-            'ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD', '75')),
+            'ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD', '60')),
         help='Weighted-score threshold at/above which the blended tier is "deep"; '
              'between trivial_threshold and this value is "standard". '
              'Must be strictly greater than --auto-model-routing-trivial-threshold. '
-             'On the 0-100 numeric scale: default 75. '
-             '(default: 75, env: ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD)',
+             'On the 0-100 numeric scale: default 65. '
+             '(default: 65, env: ANTHPROXY_AUTO_MODEL_ROUTING_STANDARD_THRESHOLD)',
     )
     p.add_argument(
         '--auto-model-routing-system-prompt-cache-size',
