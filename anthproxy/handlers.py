@@ -315,6 +315,21 @@ def _session_key(payload: dict) -> str | None:
     return user_id[:128]
 
 
+def _economics_kwargs(econ) -> dict:
+    """Return ``record_request`` kwargs for the persisted routing-economics columns.
+
+    Yields values only when economics were computed with available pricing; an
+    absent or pricing-unavailable ``econ`` produces an empty dict so the columns
+    default to NULL.  ``record_request`` itself gates on ``applied``.
+    """
+    if econ is None or not getattr(econ, 'pricing_available', False):
+        return {}
+    return {
+        'net_savings_usd': econ.net_savings_usd,
+        'classifier_overhead_usd': econ.classifier_overhead_usd,
+    }
+
+
 _UUID_RE = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
     re.IGNORECASE,
@@ -1193,7 +1208,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 usage.get('cache_read_input_tokens', 0),
                 usage.get('output_tokens', 0),
             )
-            self._log_routing_economics(
+            econ = self._log_routing_economics(
                 routed_model=model,
                 input_tokens=usage.get('input_tokens', 0),
                 output_tokens=usage.get('output_tokens', 0),
@@ -1221,6 +1236,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         backend=backend_name,
                         status='success',
                         response_text=_resp_text,
+                        **_economics_kwargs(econ),
                         **getattr(self, '_prompt_capture', {}),
                     )
                 except Exception:
@@ -1316,16 +1332,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         output_tokens: int,
         cache_creation_tokens: int,
         cache_read_tokens: int,
-    ) -> None:
+    ):
         """Compute and log per-request routing cost breakdown as a single INFO line.
 
-        No-op when ``self._routing`` is not set (e.g. local commands, count_tokens,
-        direct unit-test calls to ``_dispatch``).  Never raises — errors are silently
-        swallowed so this log call can never affect request handling.
+        Returns the :class:`RoutingEconomics` result (against the opus baseline) so
+        callers can persist it, or ``None`` when economics could not be computed —
+        e.g. ``self._routing`` is not set (local commands, count_tokens, classifier
+        requests, direct unit-test calls to ``_dispatch``) or an error occurred.
+        Never raises — errors are silently swallowed so this call can never affect
+        request handling.
         """
         routing = getattr(self, '_routing', None)
         if routing is None:
-            return
+            return None
         try:
             from .stats import routing_economics as _routing_economics
             config = getattr(self, 'config', None)
@@ -1333,9 +1352,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 getattr(config, 'auto_model_routing_classifier_model', 'haiku')
                 if config is not None else 'haiku'
             )
-            requested_model = routing.requested_model or routed_model
             econ = _routing_economics(
-                requested_model=requested_model,
                 routed_model=routed_model,
                 classifier_model=classifier_model,
                 input_tokens=input_tokens,
@@ -1347,20 +1364,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
             logger.info(
                 '%s Routing economics: req=%s routed=%s reason=%s '
-                'pricing=%s req_cost=$%.6f routed_cost=$%.6f '
+                'pricing=%s opus_baseline=$%.6f routed_cost=$%.6f '
                 'clf_overhead=$%.6f net_savings=$%.6f',
                 self._log_tag(),
-                requested_model,
+                routing.requested_model or routed_model,
                 routed_model,
                 routing.reason_code,
                 econ.pricing_available,
-                econ.requested_baseline_cost,
+                econ.opus_baseline_cost,
                 econ.routed_cost,
-                econ.classifier_overhead,
-                econ.net_savings,
+                econ.classifier_overhead_usd,
+                econ.net_savings_usd,
             )
+            return econ
         except Exception:
             logger.debug('%s routing economics log failed', self._log_tag(), exc_info=True)
+            return None
 
     def _usage_sse_wrapper(self, sse_gen, first_chunk, backend_name: str, start_time: float,
                            model: str = '', *, session_id: str = '',
@@ -1446,7 +1465,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 stats['cache_read_tokens'],
                 stats['output_tokens'],
             )
-            self._log_routing_economics(
+            econ = self._log_routing_economics(
                 routed_model=model,
                 input_tokens=stats['input_tokens'],
                 output_tokens=stats['output_tokens'],
@@ -1492,6 +1511,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             status=status,
                             error='sse_error' if errored else None,
                             response_text=response_text,
+                            **_economics_kwargs(econ),
                             **getattr(self, '_prompt_capture', {}),
                         )
                     except Exception:

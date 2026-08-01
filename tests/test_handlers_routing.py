@@ -5,16 +5,20 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from anthproxy.handlers import (
     AnthropicRequestError,
     ProxyRequestHandler,
     _context_key,
     _conversation_anchor,
+    _economics_kwargs,
     _parse_local_command,
     _session_key,
     _session_short_id,
     _system_fingerprint,
 )
+from anthproxy.stats import RoutingEconomics
 
 
 def _msg(content):
@@ -2710,3 +2714,91 @@ class TestHandlerRoutingOrderInvariants:
         # But the routing decision's routed_model is 'haiku' (the serving tier).
         assert handler._routing.routed_model == 'haiku'
         assert handler._routing.requested_model == 'opus'
+
+
+class TestEconomicsKwargs:
+    """_economics_kwargs gates the persisted routing-economics columns."""
+
+    def test_none_econ_yields_empty(self):
+        assert _economics_kwargs(None) == {}
+
+    def test_pricing_unavailable_yields_empty(self):
+        # pricing_available=False carries zeroed numerics that must NOT be
+        # persisted as a misleading 0.0 — the columns should default to NULL.
+        econ = RoutingEconomics(pricing_available=False)
+        assert _economics_kwargs(econ) == {}
+
+    def test_available_econ_yields_both_columns(self):
+        econ = RoutingEconomics(
+            pricing_available=True,
+            opus_baseline_cost=5.0,
+            routed_cost=1.0,
+            classifier_overhead_usd=0.001,
+            net_savings_usd=4.0,
+        )
+        assert _economics_kwargs(econ) == {
+            'net_savings_usd': 4.0,
+            'classifier_overhead_usd': 0.001,
+        }
+
+
+class TestLogRoutingEconomicsReturn:
+    """_log_routing_economics returns the econ for persistence, or None."""
+
+    def _handler(self, routing):
+        handler = object.__new__(ProxyRequestHandler)
+        handler._routing = routing
+        handler.config = SimpleNamespace(auto_model_routing_classifier_model='haiku')
+        handler._log_tag = MagicMock(return_value='[t]')
+        return handler
+
+    def _routing(self, requested='opus', routed='haiku'):
+        return SimpleNamespace(
+            requested_model=requested,
+            routed_model=routed,
+            reason_code='classifier',
+            classifier_input_tokens=0,
+            classifier_output_tokens=0,
+        )
+
+    def test_returns_none_when_routing_unset(self):
+        handler = object.__new__(ProxyRequestHandler)
+        # _routing intentionally not set (local commands, count_tokens, etc.)
+        assert handler._log_routing_economics(
+            routed_model='haiku', input_tokens=1_000_000, output_tokens=0,
+            cache_creation_tokens=0, cache_read_tokens=0,
+        ) is None
+
+    def test_returns_econ_and_round_trips_to_record_request_kwargs(self):
+        handler = self._handler(self._routing())
+        econ = handler._log_routing_economics(
+            routed_model='haiku', input_tokens=1_000_000, output_tokens=0,
+            cache_creation_tokens=0, cache_read_tokens=0,
+        )
+        assert isinstance(econ, RoutingEconomics)
+        assert econ.pricing_available is True
+        # Routing opus baseline → haiku on 1M input yields $4.0 net savings.
+        assert econ.net_savings_usd == pytest.approx(4.0)
+        # The returned econ must flow through _economics_kwargs to the DB layer.
+        assert _economics_kwargs(econ) == {
+            'net_savings_usd': econ.net_savings_usd,
+            'classifier_overhead_usd': econ.classifier_overhead_usd,
+        }
+
+    def test_returns_none_and_swallows_errors(self):
+        # A routing object whose attribute access raises must not propagate;
+        # the guarantee is "never raises, returns None on failure".
+        class Boom:
+            requested_model = 'opus'
+            routed_model = 'haiku'
+            reason_code = 'classifier'
+
+            @property
+            def classifier_input_tokens(self):
+                raise RuntimeError('boom')
+
+        handler = self._handler(Boom())
+        assert handler._log_routing_economics(
+            routed_model='haiku', input_tokens=1_000, output_tokens=0,
+            cache_creation_tokens=0, cache_read_tokens=0,
+        ) is None

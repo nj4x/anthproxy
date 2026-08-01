@@ -108,14 +108,13 @@ class RoutingEconomics:
     """Per-request routing cost breakdown returned by :func:`routing_economics`."""
 
     pricing_available: bool
-    requested_baseline_cost: float = 0.0
+    opus_baseline_cost: float = 0.0
     routed_cost: float = 0.0
-    classifier_overhead: float = 0.0
-    net_savings: float = 0.0
+    classifier_overhead_usd: float = 0.0
+    net_savings_usd: float = 0.0
 
 
 def routing_economics(
-    requested_model: str,
     routed_model: str,
     classifier_model: str,
     input_tokens: int,
@@ -125,7 +124,7 @@ def routing_economics(
     classifier_input_tokens: int = 0,
     classifier_output_tokens: int = 0,
 ) -> RoutingEconomics:
-    """Compute per-request routing cost breakdown.
+    """Compute per-request routing cost breakdown against the opus baseline.
 
     Uses the same pricing tables as :func:`_record_cost` (sourced from
     :mod:`model_config`).  Never raises.
@@ -133,25 +132,25 @@ def routing_economics(
     Returns a :class:`RoutingEconomics` with:
 
     ``pricing_available``
-        ``False`` when pricing is unavailable for the requested or routed
-        model; all numeric fields are ``0.0`` in that case.
-    ``requested_baseline_cost``
-        Cost if the request had been served on the originally-requested model.
+        ``False`` when pricing is unavailable for the opus baseline or the
+        routed model; all numeric fields are ``0.0`` in that case.
+    ``opus_baseline_cost``
+        Cost if the request had been served on the ``opus`` tier — the fixed
+        baseline every routed request is measured against.
     ``routed_cost``
         Actual cost on the routed (serving) model.
-    ``classifier_overhead``
+    ``classifier_overhead_usd``
         Cost of the classifier call; ``0.0`` when
         ``classifier_input_tokens`` and ``classifier_output_tokens`` are both
         ``0``, or when classifier model pricing is unavailable.
-    ``net_savings``
-        ``requested_baseline_cost - routed_cost - classifier_overhead``.
+    ``net_savings_usd``
+        ``opus_baseline_cost - routed_cost - classifier_overhead_usd``.
     """
-    req_tier = _classify_model(requested_model or '')
     routed_tier = _classify_model(routed_model or '')
 
-    req_price = MODEL_PRICING.get(req_tier)
+    opus_price = MODEL_PRICING.get('opus')
     routed_price = MODEL_PRICING.get(routed_tier)
-    if req_price is None or routed_price is None:
+    if opus_price is None or routed_price is None:
         return RoutingEconomics(pricing_available=False)
 
     inp = int(input_tokens or 0)
@@ -163,26 +162,26 @@ def routing_economics(
         in_p, out_p, cr_p, cw_p = price
         return (inp * in_p + out * out_p + cr * cr_p + cc * cw_p) / 1_000_000
 
-    requested_baseline_cost = _cost(req_price)
+    opus_baseline_cost = _cost(opus_price)
     routed_cost = _cost(routed_price)
 
-    classifier_overhead = 0.0
+    classifier_overhead_usd = 0.0
     if classifier_input_tokens or classifier_output_tokens:
         clf_tier = _classify_model(classifier_model or '')
         clf_price = MODEL_PRICING.get(clf_tier)
         if clf_price is not None:
             clf_in_p, clf_out_p, _cr_p, _cw_p = clf_price
-            classifier_overhead = (
+            classifier_overhead_usd = (
                 int(classifier_input_tokens or 0) * clf_in_p
                 + int(classifier_output_tokens or 0) * clf_out_p
             ) / 1_000_000
 
     return RoutingEconomics(
         pricing_available=True,
-        requested_baseline_cost=requested_baseline_cost,
+        opus_baseline_cost=opus_baseline_cost,
         routed_cost=routed_cost,
-        classifier_overhead=classifier_overhead,
-        net_savings=requested_baseline_cost - routed_cost - classifier_overhead,
+        classifier_overhead_usd=classifier_overhead_usd,
+        net_savings_usd=opus_baseline_cost - routed_cost - classifier_overhead_usd,
     )
 
 

@@ -1,6 +1,6 @@
 """SQLite persistence layer for the anthproxy web UI.
 
-Schema version: 9
+Schema version: 10
 Thread safety: threading.Lock() for all writes; WAL mode for concurrent reads.
 Migrations: PRAGMA user_version tracks applied schema version (no Alembic).
 """
@@ -18,7 +18,7 @@ from .stats import MODEL_PRICING, _classify_model
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +323,16 @@ def _apply_migration_8(conn: sqlite3.Connection) -> None:
         logger.info('Migration 8: rescaled %d old 0-2 scale score rows to 0-100', cur.rowcount)
 
 
+def _apply_migration_9(conn: sqlite3.Connection) -> None:
+    """Add routing-economics columns to requests (v9 → v10).
+
+    Both nullable: NULL for pre-migration rows and for requests where routing
+    was not applied.
+    """
+    conn.execute("ALTER TABLE requests ADD COLUMN net_savings_usd REAL")
+    conn.execute("ALTER TABLE requests ADD COLUMN classifier_overhead_usd REAL")
+
+
 _MIGRATIONS: dict[int, object] = {
     0: _apply_migration_0,
     1: _apply_migration_1,
@@ -333,6 +343,7 @@ _MIGRATIONS: dict[int, object] = {
     6: _apply_migration_6,
     7: _apply_migration_7,
     8: _apply_migration_8,
+    9: _apply_migration_9,
 }
 
 
@@ -478,6 +489,9 @@ class SessionDB:
         routing_weighted_score: float | None = None,
         system_prompt_classification_failed: bool = False,
         user_prompt_tier: str | None = None,
+        # Schema v10: routing-economics columns
+        net_savings_usd: float | None = None,
+        classifier_overhead_usd: float | None = None,
     ) -> int:
         """Insert one request row and upsert the owning session row.
 
@@ -487,6 +501,10 @@ class SessionDB:
 
         ``cache_savings_usd`` is computed internally from ``routed_model`` and
         ``cache_read_tokens``; it is NOT accepted as a parameter.
+
+        ``net_savings_usd`` and ``classifier_overhead_usd`` are persisted only
+        for requests where routing was ``applied``; they are forced to NULL for
+        unrouted requests regardless of the passed values.
 
         ``prompt_store_entries`` is a dict mapping sha256 hex → (content_type, content).
         Each entry is upserted into ``prompt_store`` (INSERT OR IGNORE) within the
@@ -507,6 +525,11 @@ class SessionDB:
         walkback_int: int | None = None
         if routing_recovered_via_walkback is not None:
             walkback_int = int(routing_recovered_via_walkback)
+
+        # Routing economics are meaningful only when routing was applied.
+        if not routing_decision.applied:
+            net_savings_usd = None
+            classifier_overhead_usd = None
 
         with self._lock:
             # Compute parent_anchor inside the lock to ensure atomicity with the INSERT.
@@ -539,11 +562,11 @@ class SessionDB:
                         user_prompt_search, response_search,
                         system_prompt_tier, system_prompt_score, user_prompt_score,
                         routing_weighted_score, system_prompt_classification_failed,
-                        user_prompt_tier
+                        user_prompt_tier, net_savings_usd, classifier_overhead_usd
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -586,6 +609,8 @@ class SessionDB:
                         routing_weighted_score,
                         1 if system_prompt_classification_failed else 0,
                         user_prompt_tier,
+                        net_savings_usd,
+                        classifier_overhead_usd,
                     ),
                 )
                 rowid: int = cur.lastrowid  # type: ignore[assignment]
@@ -722,7 +747,8 @@ class SessionDB:
         Each dict contains: session_id, created_at, last_seen_at,
         display_name, pinned_backend, pinned_tier, summary, summary_updated_at,
         request_count, total_input_tokens, total_output_tokens,
-        total_cache_creation, total_cache_read, estimated_cost_usd.
+        total_cache_creation, total_cache_read, estimated_cost_usd,
+        net_savings_usd.
 
         If q is provided, filter to sessions where any recent request matches
         the search term in user_prompt_search or response_search (casefolded INSTR).
@@ -745,7 +771,8 @@ class SessionDB:
                     COALESCE(SUM(r.output_tokens), 0)         AS total_output_tokens,
                     COALESCE(SUM(r.cache_creation_tokens), 0) AS total_cache_creation,
                     COALESCE(SUM(r.cache_read_tokens), 0)     AS total_cache_read,
-                    COALESCE(SUM(r.cost_estimate), 0.0)       AS estimated_cost_usd
+                    COALESCE(SUM(r.cost_estimate), 0.0)       AS estimated_cost_usd,
+                    COALESCE(SUM(r.net_savings_usd), 0.0)     AS net_savings_usd
                 FROM sessions s
                 LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
                 LEFT JOIN requests r ON s.session_id = r.session_id
@@ -787,7 +814,8 @@ class SessionDB:
                     COALESCE(SUM(r.output_tokens), 0)         AS total_output_tokens,
                     COALESCE(SUM(r.cache_creation_tokens), 0) AS total_cache_creation,
                     COALESCE(SUM(r.cache_read_tokens), 0)     AS total_cache_read,
-                    COALESCE(SUM(r.cost_estimate), 0.0)       AS estimated_cost_usd
+                    COALESCE(SUM(r.cost_estimate), 0.0)       AS estimated_cost_usd,
+                    COALESCE(SUM(r.net_savings_usd), 0.0)     AS net_savings_usd
                 FROM sessions s
                 JOIN matched m ON m.session_id = s.session_id
                 LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
@@ -1033,7 +1061,8 @@ class SessionDB:
         ``'-7 days'``, ``'-1 days'``, ``'-30 days'``.
 
         Each returned dict has: key, requests, input_tokens, output_tokens,
-        cache_creation, cache_read, cost_usd, cache_savings_usd.
+        cache_creation, cache_read, cost_usd, cache_savings_usd,
+        net_savings_usd, classifier_overhead_usd.
         """
         if group_by == 'tier':
             key_col = 'model_tier'
@@ -1058,7 +1087,9 @@ class SessionDB:
                 COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                 COALESCE(SUM(cache_read_tokens), 0)     AS cache_read,
                 COALESCE(SUM(cost_estimate), 0.0)        AS cost_usd,
-                COALESCE(SUM(cache_savings_usd), 0.0)    AS cache_savings_usd
+                COALESCE(SUM(cache_savings_usd), 0.0)    AS cache_savings_usd,
+                COALESCE(SUM(net_savings_usd), 0.0)      AS net_savings_usd,
+                COALESCE(SUM(classifier_overhead_usd), 0.0) AS classifier_overhead_usd
             FROM requests
             {where_clause}
             GROUP BY {key_col}
@@ -1433,7 +1464,8 @@ class SessionDB:
         _NUMERIC_FIELDS = (
             'requests', 'input_tokens', 'output_tokens',
             'cache_read_tokens', 'cache_creation_tokens',
-            'cost_usd', 'cache_savings_usd', 'active_time_secs',
+            'cost_usd', 'cache_savings_usd',
+            'net_savings_usd', 'classifier_overhead_usd', 'active_time_secs',
         )
 
         period_map: dict[str, tuple[str, str]] = {
@@ -1470,6 +1502,8 @@ class SessionDB:
                 COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
                 COALESCE(SUM(cost_estimate), 0) AS cost_usd,
                 COALESCE(SUM(cache_savings_usd), 0) AS cache_savings_usd,
+                COALESCE(SUM(net_savings_usd), 0) AS net_savings_usd,
+                COALESCE(SUM(classifier_overhead_usd), 0) AS classifier_overhead_usd,
                 CAST(
                     (julianday(MAX(request_ts)) - julianday(MIN(request_ts))) * 86400
                     AS INTEGER

@@ -88,6 +88,7 @@ export default function Sessions() {
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Last Seen</th>
                     <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wide">Requests</th>
                     <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wide">Cost</th>
+                    <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wide">Net Savings</th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Backend</th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Tier</th>
                   </tr>
@@ -128,6 +129,9 @@ export default function Sessions() {
                         <td className="px-4 py-3 text-right text-gray-600">
                           ${s.estimated_cost_usd.toFixed(2)}
                         </td>
+                        <td className="px-4 py-3 text-right text-gray-600">
+                          {s.net_savings_usd == null ? '—' : `$${s.net_savings_usd.toFixed(2)}`}
+                        </td>
                         <td className="px-4 py-3 text-gray-600 text-xs">
                           {s.pinned_backend ?? <span className="text-gray-400">auto</span>}
                         </td>
@@ -139,7 +143,7 @@ export default function Sessions() {
                   })}
                   {data.items.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="px-4 py-6 text-center text-gray-400 text-sm">
+                      <td colSpan={8} className="px-4 py-6 text-center text-gray-400 text-sm">
                         {q ? `No sessions match "${q}"` : 'No sessions yet'}
                       </td>
                     </tr>

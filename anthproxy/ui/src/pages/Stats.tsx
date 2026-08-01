@@ -21,6 +21,11 @@ function formatDuration(secs: number): string {
   return parts.join(' ') || '0m';
 }
 
+function fmtUsd(v: number | null): string {
+  if (v == null) return '—';
+  return `$${v.toFixed(2)}`;
+}
+
 function cacheHitRatio(row: StatsRow): string {
   const denom = row.input_tokens + row.cache_read_tokens;
   if (denom === 0) return '—';
@@ -42,6 +47,8 @@ function DataRow({ row, bold }: { row: StatsRow; bold?: boolean }) {
       <td className="px-3 py-2 text-right text-gray-700">{row.cache_creation_tokens.toLocaleString()}</td>
       <td className="px-3 py-2 text-right text-gray-700">${row.cost_usd.toFixed(2)}</td>
       <td className="px-3 py-2 text-right text-gray-700">${row.cache_savings_usd.toFixed(2)}</td>
+      <td className="px-3 py-2 text-right text-gray-700">{fmtUsd(row.net_savings_usd)}</td>
+      <td className="px-3 py-2 text-right text-gray-700">{fmtUsd(row.classifier_overhead_usd)}</td>
     </tr>
   );
 }
@@ -173,7 +180,7 @@ export default function Stats() {
               <table className="min-w-full divide-y divide-gray-200 text-xs">
                 <thead className="bg-gray-50">
                   <tr>
-                    {['Backend', 'Model', 'Requests', 'Input', 'Output', 'Cache Read', 'Cache Created', 'Cost', 'Cache Savings'].map(
+                    {['Backend', 'Model', 'Requests', 'Input', 'Output', 'Cache Read', 'Cache Created', 'Cost', 'Cache Savings', 'Net Savings', 'Clf Overhead'].map(
                       (col, i) => (
                         <th
                           key={col}
@@ -192,7 +199,7 @@ export default function Stats() {
                         className="bg-gray-100 cursor-pointer hover:bg-gray-200"
                         onClick={() => toggleBucket(bi)}
                       >
-                        <td colSpan={9} className="px-3 py-2 text-xs font-semibold text-gray-600">
+                        <td colSpan={11} className="px-3 py-2 text-xs font-semibold text-gray-600">
                           <span className="mr-2 text-gray-400">{openBuckets.has(bi) ? '▼' : '▶'}</span>
                           {bucket.label}
                         </td>
@@ -206,7 +213,7 @@ export default function Stats() {
                         <>
                           <DataRow row={bucket.subtotal} bold />
                           <tr className="bg-gray-50">
-                            <td colSpan={9} className="px-3 py-1 text-xs text-gray-400">
+                            <td colSpan={11} className="px-3 py-1 text-xs text-gray-400">
                               Active: {formatDuration(bucket.subtotal.active_time_secs)}
                             </td>
                           </tr>
@@ -225,6 +232,8 @@ export default function Stats() {
                     <td className="px-3 py-2 text-right text-xs font-bold text-gray-700">{total.cache_creation_tokens.toLocaleString()}</td>
                     <td className="px-3 py-2 text-right text-xs font-bold text-gray-700">${total.cost_usd.toFixed(2)}</td>
                     <td className="px-3 py-2 text-right text-xs font-bold text-gray-700">${total.cache_savings_usd.toFixed(2)}</td>
+                    <td className="px-3 py-2 text-right text-xs font-bold text-gray-700">{fmtUsd(total.net_savings_usd)}</td>
+                    <td className="px-3 py-2 text-right text-xs font-bold text-gray-700">{fmtUsd(total.classifier_overhead_usd)}</td>
                   </tr>
                 </tbody>
               </table>

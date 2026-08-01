@@ -820,9 +820,8 @@ class TestRoutingEconomics:
     """Tests for routing_economics() — per-request cost breakdown."""
 
     def test_normal_routed_savings_computed_correctly(self):
-        """Routing opus→haiku on 1M input tokens yields correct savings."""
+        """Routing to haiku on 1M input tokens yields savings vs the opus baseline."""
         econ = routing_economics(
-            requested_model='opus',
             routed_model='haiku',
             classifier_model='haiku',
             input_tokens=1_000_000,
@@ -833,32 +832,30 @@ class TestRoutingEconomics:
         assert isinstance(econ, RoutingEconomics)
         assert econ.pricing_available is True
         # opus input = $5.0/M; haiku input = $1.0/M
-        assert abs(econ.requested_baseline_cost - 5.0) < 1e-9
+        assert abs(econ.opus_baseline_cost - 5.0) < 1e-9
         assert abs(econ.routed_cost - 1.0) < 1e-9
-        assert econ.classifier_overhead == 0.0
-        assert abs(econ.net_savings - 4.0) < 1e-9
+        assert econ.classifier_overhead_usd == 0.0
+        assert abs(econ.net_savings_usd - 4.0) < 1e-9
 
-    def test_unknown_requested_model_pricing_unavailable_no_crash(self):
-        """Unknown requested model → pricing_available=False, zero numerics, no raise."""
+    def test_baseline_is_opus_regardless_of_routed_tier(self):
+        """Baseline is always the opus tier, not the routed model."""
+        # Serving on sonnet still measures against the opus baseline.
         econ = routing_economics(
-            requested_model='gpt-5.5',
-            routed_model='haiku',
+            routed_model='sonnet',
             classifier_model='haiku',
             input_tokens=1_000_000,
             output_tokens=0,
             cache_creation_tokens=0,
             cache_read_tokens=0,
         )
-        assert econ.pricing_available is False
-        assert econ.requested_baseline_cost == 0.0
-        assert econ.routed_cost == 0.0
-        assert econ.classifier_overhead == 0.0
-        assert econ.net_savings == 0.0
+        assert econ.pricing_available is True
+        assert abs(econ.opus_baseline_cost - 5.0) < 1e-9  # opus input $5.0/M
+        assert abs(econ.routed_cost - 3.0) < 1e-9         # sonnet input $3.0/M
+        assert abs(econ.net_savings_usd - 2.0) < 1e-9
 
     def test_unknown_routed_model_pricing_unavailable_no_crash(self):
         """Unknown routed model → pricing_available=False, no raise."""
         econ = routing_economics(
-            requested_model='opus',
             routed_model='plugin-model-1',
             classifier_model='haiku',
             input_tokens=500_000,
@@ -867,7 +864,10 @@ class TestRoutingEconomics:
             cache_read_tokens=0,
         )
         assert econ.pricing_available is False
-        assert econ.net_savings == 0.0
+        assert econ.opus_baseline_cost == 0.0
+        assert econ.routed_cost == 0.0
+        assert econ.classifier_overhead_usd == 0.0
+        assert econ.net_savings_usd == 0.0
 
     def test_classifier_overhead_included_when_nonzero(self):
         """Nonzero classifier tokens are priced and reduce net_savings."""
@@ -875,7 +875,6 @@ class TestRoutingEconomics:
         clf_in = 1_000
         clf_out = 10
         econ = routing_economics(
-            requested_model='opus',
             routed_model='haiku',
             classifier_model='haiku',
             input_tokens=100_000,
@@ -887,17 +886,16 @@ class TestRoutingEconomics:
         )
         assert econ.pricing_available is True
         expected_clf = (clf_in * 1.0 + clf_out * 5.0) / 1_000_000
-        assert abs(econ.classifier_overhead - expected_clf) < 1e-9
+        assert abs(econ.classifier_overhead_usd - expected_clf) < 1e-9
         # net_savings = baseline - routed - overhead
-        expected_net = econ.requested_baseline_cost - econ.routed_cost - econ.classifier_overhead
-        assert abs(econ.net_savings - expected_net) < 1e-9
+        expected_net = econ.opus_baseline_cost - econ.routed_cost - econ.classifier_overhead_usd
+        assert abs(econ.net_savings_usd - expected_net) < 1e-9
 
     def test_cache_tokens_included_in_cost_basis(self):
         """cache_creation_tokens and cache_read_tokens are priced in the cost basis."""
         # opus pricing: cache_write=$6.25/M, cache_read=$0.50/M
-        # Use same model for requested and routed to isolate cache math (no savings).
+        # Route to opus so baseline and routed match, isolating cache math (no savings).
         econ = routing_economics(
-            requested_model='opus',
             routed_model='opus',
             classifier_model='haiku',
             input_tokens=0,
@@ -907,7 +905,7 @@ class TestRoutingEconomics:
         )
         assert econ.pricing_available is True
         expected_cost = 6.25 + 0.50  # $6.25/M write + $0.50/M read
-        assert abs(econ.requested_baseline_cost - expected_cost) < 1e-6
+        assert abs(econ.opus_baseline_cost - expected_cost) < 1e-6
         assert abs(econ.routed_cost - expected_cost) < 1e-6
         # Same model → no savings (and no classifier overhead)
-        assert abs(econ.net_savings) < 1e-6
+        assert abs(econ.net_savings_usd) < 1e-6

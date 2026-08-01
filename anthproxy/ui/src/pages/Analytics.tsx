@@ -119,6 +119,41 @@ export default function Analytics() {
               </table>
             </div>
           </div>
+
+          {/* Routing Economics */}
+          {(() => {
+            const routedCost = costData.items.reduce((a, r) => a + r.cost_usd, 0);
+            const netSavings = costData.items.reduce((a, r) => a + (r.net_savings_usd ?? 0), 0);
+            const clfOverhead = costData.items.reduce((a, r) => a + (r.classifier_overhead_usd ?? 0), 0);
+            const opusBaseline = routedCost + netSavings + clfOverhead;
+            const hasEconomics = costData.items.some(
+              (r) => r.net_savings_usd != null || r.classifier_overhead_usd != null
+            );
+            if (!hasEconomics) return null;
+            const cards = [
+              { label: 'Opus Baseline', value: opusBaseline, tone: 'text-gray-800' },
+              { label: 'Routed Cost', value: routedCost, tone: 'text-gray-800' },
+              { label: 'Classifier Overhead', value: clfOverhead, tone: 'text-amber-600' },
+              {
+                label: 'Net Savings',
+                value: netSavings,
+                tone: netSavings >= 0 ? 'text-green-600' : 'text-red-600',
+              },
+            ];
+            return (
+              <div className="bg-white shadow rounded-lg p-5">
+                <h3 className="text-sm font-medium text-gray-700 mb-4">Routing Economics</h3>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {cards.map(({ label, value, tone }) => (
+                    <div key={label} className="rounded-lg border border-gray-100 p-4">
+                      <div className="text-xs text-gray-500 uppercase tracking-wide">{label}</div>
+                      <div className={`mt-1 text-xl font-semibold ${tone}`}>${value.toFixed(5)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
 

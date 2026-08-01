@@ -19,6 +19,7 @@ export interface Session {
   total_cache_creation: number;
   total_cache_read: number;
   estimated_cost_usd: number;
+  net_savings_usd: number | null;
   excerpt?: Excerpt | null;
 }
 
@@ -89,6 +90,8 @@ export interface CostRow {
   cache_read: number;
   cost_usd: number;
   cache_savings_usd: number;
+  net_savings_usd: number | null;
+  classifier_overhead_usd: number | null;
 }
 
 export interface ConfigChange {
@@ -233,6 +236,8 @@ export interface StatsRow {
   cache_creation_tokens: number;
   cost_usd: number;
   cache_savings_usd: number;
+  net_savings_usd: number | null;
+  classifier_overhead_usd: number | null;
   active_time_secs: number;
 }
 

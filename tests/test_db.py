@@ -2823,8 +2823,8 @@ class TestBusySecsWindow:
 class TestWeightedBlendMigration:
     """_apply_migration_7 adds 5 new columns; record_request stores them."""
 
-    def test_schema_version_is_9(self):
-        assert _SCHEMA_VERSION == 9
+    def test_schema_version_is_10(self):
+        assert _SCHEMA_VERSION == 10
 
     def test_migration_7_adds_columns(self):
         fd, path = tempfile.mkstemp(suffix='.db')
@@ -3095,6 +3095,110 @@ class TestNumericScoreMigration:
             row = db.get_request(row_id)
             assert row is not None
             assert row['user_prompt_tier'] is None
+        finally:
+            db.close()
+            os.unlink(path)
+
+
+class TestRoutingEconomicsMigration:
+    """Migration 9: add net_savings_usd and classifier_overhead_usd columns."""
+
+    def _apply_through_migration_8(self):
+        """Return an open in-memory connection with migrations 0-8 applied (v9)."""
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        from anthproxy.db import _MIGRATIONS
+        for i in range(9):
+            with conn:
+                _MIGRATIONS[i](conn)
+                conn.execute(f"PRAGMA user_version = {i + 1};")
+        return conn
+
+    def test_migration_9_adds_economics_columns(self):
+        conn = self._apply_through_migration_8()
+        from anthproxy.db import _apply_migration_9
+        with conn:
+            _apply_migration_9(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+        assert 'net_savings_usd' in cols
+        assert 'classifier_overhead_usd' in cols
+        conn.close()
+
+    def test_migration_9_columns_default_null(self):
+        conn = self._apply_through_migration_8()
+        from anthproxy.db import _apply_migration_9
+        with conn:
+            _apply_migration_9(conn)
+            conn.execute(
+                "INSERT INTO requests(session_id, requested_model, backend, status) "
+                "VALUES('s', 'm', 'b', 'success')"
+            )
+        row = conn.execute(
+            "SELECT net_savings_usd, classifier_overhead_usd FROM requests"
+        ).fetchone()
+        assert row['net_savings_usd'] is None
+        assert row['classifier_overhead_usd'] is None
+        conn.close()
+
+
+class TestRecordRequestEconomics:
+    """record_request persists economics only for applied=True requests."""
+
+    def _fetch(self, db, rowid):
+        return db._conn.execute(
+            "SELECT net_savings_usd, classifier_overhead_usd FROM requests WHERE id = ?",
+            (rowid,),
+        ).fetchone()
+
+    def test_applied_persists_economics(self):
+        db, path = _make_db()
+        try:
+            rowid = db.record_request(
+                session_id='sess-econ',
+                conversation_anchor=None,
+                routing_decision=_make_decision(routed='haiku', applied=True),
+                stats_dict=dict(_DEFAULT_STATS),
+                duration_ms=100,
+                backend='anthropic',
+                status='success',
+                net_savings_usd=4.0,
+                classifier_overhead_usd=0.001,
+            )
+            row = self._fetch(db, rowid)
+            assert row['net_savings_usd'] == pytest.approx(4.0)
+            assert row['classifier_overhead_usd'] == pytest.approx(0.001)
+        finally:
+            db.close()
+            os.unlink(path)
+
+    def test_not_applied_forces_null(self):
+        db, path = _make_db()
+        try:
+            rowid = db.record_request(
+                session_id='sess-econ',
+                conversation_anchor=None,
+                routing_decision=_make_decision(routed='sonnet', applied=False),
+                stats_dict=dict(_DEFAULT_STATS),
+                duration_ms=100,
+                backend='anthropic',
+                status='success',
+                net_savings_usd=4.0,
+                classifier_overhead_usd=0.001,
+            )
+            row = self._fetch(db, rowid)
+            assert row['net_savings_usd'] is None
+            assert row['classifier_overhead_usd'] is None
+        finally:
+            db.close()
+            os.unlink(path)
+
+    def test_defaults_null_when_not_passed(self):
+        db, path = _make_db()
+        try:
+            rowid = _insert(db, decision=_make_decision(applied=True))
+            row = self._fetch(db, rowid)
+            assert row['net_savings_usd'] is None
+            assert row['classifier_overhead_usd'] is None
         finally:
             db.close()
             os.unlink(path)
