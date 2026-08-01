@@ -736,12 +736,13 @@ def prepare_routing(handler, payload, sess_key):
         elif routing.reason_code == 'missing_final_user_text':
             cached = handler.registry.session_routed_tier(ctx_key)
             if cached is not None:
-                # No-upgrade cap: never replay a cached tier above the
-                # effective routing baseline (lock if active, else client model).
-                _cap_baseline = baseline_model or routing.requested_model
+                # No-upgrade cap: never replay a cached tier above the client's
+                # requested model. baseline_model lock participates in fresh
+                # routing decisions but must not override a prior classifier
+                # result replayed from cache.
                 capped = _cap_cached_tier(
                     cached,
-                    _cap_baseline,
+                    routing.requested_model,
                     label_map=snapshot.config.auto_model_routing_classification,
                 )
                 payload['model'] = capped

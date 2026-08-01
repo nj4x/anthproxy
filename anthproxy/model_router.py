@@ -1641,15 +1641,10 @@ def route_model(
         if summary.final_is_tool_result_only:
             # Agentic tool_result continuation: the client sends the base model
             # on every turn unconditionally; 'requested' carries no downgrade intent.
-            # Bypass the no-upgrade cap, but when baseline_model lock is active,
-            # cap against the baseline to enforce the lock.
-            if baseline_model:
-                capped = _cap_cached_tier(
-                    cached_session_tier, routing_baseline,
-                    label_map=config.auto_model_routing_classification,
-                )
-            else:
-                capped = cached_session_tier
+            # Bypass the no-upgrade cap entirely — baseline_model lock participates
+            # in fresh routing decisions but must not override a prior classifier
+            # result replayed from cache.
+            capped = cached_session_tier
             payload['model'] = capped
             return ModelRoutingDecision(
                 requested_model=requested,
@@ -1661,10 +1656,11 @@ def route_model(
                 classifier_mode='walkback_cache',
             )
         # Non-tool_result walkback (image-only, transcript-only, etc.):
-        # Apply the no-upgrade cap so a prior expensive task cannot hijack
-        # a new simpler request via walkback (the production session_cached_walkback bug).
+        # Apply the no-upgrade cap against the client's requested model only.
+        # baseline_model lock participates in fresh routing decisions but must
+        # not override a prior classifier result replayed from cache.
         capped = _cap_cached_tier(
-            cached_session_tier, routing_baseline,
+            cached_session_tier, requested,
             label_map=config.auto_model_routing_classification,
         )
         payload['model'] = capped
@@ -1709,13 +1705,10 @@ def route_model(
             and summary.is_short_affirmation):
         if cached_session_tier is not None:
             # Cached path: inherit immediately, no classifier call.
-            if baseline_model:
-                capped = _cap_cached_tier(
-                    cached_session_tier, routing_baseline,
-                    label_map=config.auto_model_routing_classification,
-                )
-            else:
-                capped = cached_session_tier
+            # No cap — affirmations are continuations of the prior task; the
+            # baseline_model lock participates in fresh routing decisions but
+            # must not override a prior classifier result replayed from cache.
+            capped = cached_session_tier
             payload['model'] = capped
             return ModelRoutingDecision(
                 requested_model=requested,

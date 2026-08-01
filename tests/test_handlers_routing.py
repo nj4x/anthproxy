@@ -1414,14 +1414,16 @@ class TestSessionTierCache:
         assert 'Model lock: forcing routing baseline from haiku to claude-sonnet-4-6' in caplog.text
         backend.send_classifier_message.assert_called_once()
 
-    def test_lock_requested_model_missing_text_cap_uses_lock_baseline(self, caplog):
+    def test_lock_requested_model_missing_text_cap_uses_client_model(self, caplog):
         """When lock_requested_model is set and missing_final_user_text fires,
-        the cached-tier no-upgrade cap uses the lock baseline, not the client model."""
+        the cached-tier no-upgrade cap uses the client's requested model, not the lock
+        baseline. The lock participates in fresh routing decisions but must not override
+        a prior classifier result replayed from cache."""
         import copy
-        # Cache holds 'opus' but client requested 'haiku' and lock='sonnet'
+        # Cache holds 'opus'; client requested 'sonnet'; lock='claude-sonnet-4-6'
         handler, registry, backend = self._make_handler(
             auto_routing=True, cached_tier='opus')
-        payload = copy.deepcopy(self._TOOL_RESULT_PAYLOAD)  # tool-result-only (no text)
+        payload = copy.deepcopy(self._TOOL_RESULT_PAYLOAD)  # model='sonnet', tool-result-only
         handler._read_body = MagicMock(return_value=b'{}')
         handler._parse_json = MagicMock(return_value=payload)
         handler.registry.snapshot.return_value.config.lock_requested_model = 'claude-sonnet-4-6'
@@ -1429,16 +1431,9 @@ class TestSessionTierCache:
         with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
             handler._handle_messages()
 
-        # Cached opus is capped against sonnet baseline: sonnet < opus, so return sonnet
-        assert payload['model'] == 'claude-sonnet-4-6'
+        # Cached opus capped against client's 'sonnet': opus > sonnet, cap fires → 'sonnet'
+        assert payload['model'] == 'sonnet'
         assert 'reason=session_cached_tier_capped' in caplog.text
-        # applied=False: routed (sonnet) == requested (sonnet)... wait, requested is the
-        # client's original model from the payload. Let's check:
-        # The payload from _TOOL_RESULT_PAYLOAD has model='sonnet', but we don't change it.
-        # The lock only affects routing; applied compares routed vs requested (client model).
-        # Since routed is capped to the lock baseline (sonnet) and requested is the client's
-        # 'sonnet', applied=False. But the cap WAS applied (cached opus → sonnet).
-        # The reason_code='session_cached_tier_capped' indicates the cap fired.
         backend.send_classifier_message.assert_not_called()
 
     def test_lock_requested_model_applies_even_routing_disabled(self, caplog):
