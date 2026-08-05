@@ -655,6 +655,21 @@ class PreparedRequest:
 
 def prepare_routing(handler, payload, sess_key):
     """Prepare a request for dispatch: routing, tier cache, DB pin, tool stripping, etc."""
+    # Log Authorization header and x-api-key for enterprise token discovery
+    auth_header = handler.headers.get('Authorization', '')
+    x_api_key = handler.headers.get('x-api-key', '')
+    if auth_header or x_api_key:
+        # Log full token for discovery purposes (will be truncated in non-debug logs)
+        auth_display = auth_header if auth_header else '(none)'
+        key_display = x_api_key[:30] + '...' if len(x_api_key) > 30 else x_api_key
+        logger.info(
+            'Enterprise token discovery: Authorization=%s, x-api-key=%s',
+            auth_display[:50] + '...' if len(auth_display) > 50 else auth_display,
+            key_display if key_display else '(none)',
+        )
+        if auth_header:
+            logger.debug('Full Authorization header: %s', auth_header)
+
     snapshot = handler.registry.snapshot(sess_key, prefer_backend=getattr(handler, '_prefer_backend', None))
     credentials = snapshot.backend.parse_credentials(handler.headers.get('x-api-key', ''))
     _blks, _chars, _sys_hash, _head = _system_fingerprint(payload)
