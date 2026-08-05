@@ -1022,7 +1022,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 retry_after: float | None = getattr(exc, 'retry_after', None)
 
                 if snapshot.name == 'oauth':
-                    self.registry.mark_oauth_cooldown(snapshot.credentials, retry_after)
+                    # Retry-After > 0 → transient cooldown; absent or zero →
+                    # spend-cap exhaustion, park the token until the next UTC month.
+                    if retry_after is not None and retry_after > 0:
+                        self.registry.mark_oauth_cooldown(snapshot.credentials, retry_after)
+                    else:
+                        self.registry.mark_oauth_cap_exhausted(snapshot.credentials)
 
                 # Session-subscription lock: record exhaustion so the next
                 # request from this session resolves to the other subscription
@@ -1164,9 +1169,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             yield from generator
         except AnthropicRequestError as exc:
             if exc.status_code == 429:
-                self.registry.mark_oauth_cooldown(
-                    snapshot.credentials, getattr(exc, 'retry_after', None),
-                )
+                retry_after = getattr(exc, 'retry_after', None)
+                if retry_after is not None and retry_after > 0:
+                    self.registry.mark_oauth_cooldown(snapshot.credentials, retry_after)
+                else:
+                    self.registry.mark_oauth_cap_exhausted(snapshot.credentials)
             raise
 
     def _dispatch(self, payload: dict, snapshot, attempt: int,

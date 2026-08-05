@@ -258,6 +258,68 @@ def test_mark_cooldown_defaults_and_extends_monotonically():
     assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(0.0)
 
 
+def test_mark_cap_exhausted_blocks_until_next_utc_month():
+    # A live 429 with no Retry-After guidance is spend-cap exhaustion (the token
+    # was eligible, so its cached usage still reads under-cap): park it until the
+    # next UTC calendar month rather than a short cooldown.
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    registry = OAuthTokenRegistry(monotonic=clock.mono, utcnow=clock.now)
+    credential = registry.observe('secret')
+    registry.record_probe_success(credential.generation, _usage(25.0), health_ok=True)
+    assert registry.snapshot().eligible is True
+
+    assert registry.mark_cap_exhausted(999) is False  # unknown generation
+    assert registry.mark_cap_exhausted(credential.generation) is True
+
+    snapshot = registry.snapshot()
+    assert snapshot.monthly_blocked is True
+    assert snapshot.eligible is False
+
+    # The block clears only at the next UTC calendar month boundary.  Usage is
+    # still stamped in August (usage_month mismatch), so the token remains
+    # ineligible until the next probe writes fresh September data.
+    clock.wall = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+    snapshot_sep = registry.snapshot()
+    assert snapshot_sep.monthly_blocked is False
+    assert snapshot_sep.eligible is False
+
+
+def test_indeterminate_probe_does_not_clear_provisional_monthly_block():
+    # record_probe_success with unparseable/indeterminate usage (valid=False)
+    # must not wipe a genuine 429-driven monthly block — a probe hiccup should
+    # not silently lift a month-long park.
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    registry = OAuthTokenRegistry(monotonic=clock.mono, utcnow=clock.now)
+    credential = registry.observe('secret')
+    registry.record_probe_success(credential.generation, _usage(25.0), health_ok=True)
+    registry.mark_cap_exhausted(credential.generation)
+    assert registry.snapshot().monthly_blocked is True
+
+    # Malformed usage (is_enabled=False → valid=False, cap_reached=False).
+    registry.record_probe_success(
+        credential.generation, _usage(is_enabled=False), health_ok=True,
+    )
+
+    assert registry.snapshot().monthly_blocked is True
+
+
+def test_under_cap_probe_clears_provisional_monthly_block():
+    # A 429-driven month block is provisional: the next usage probe that reads
+    # under-cap this month is authoritative and un-parks the token, bounding the
+    # cost of a false-positive (a transient 429 that carried no Retry-After).
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    registry = OAuthTokenRegistry(monotonic=clock.mono, utcnow=clock.now)
+    credential = registry.observe('secret')
+    registry.record_probe_success(credential.generation, _usage(25.0), health_ok=True)
+    registry.mark_cap_exhausted(credential.generation)
+    assert registry.snapshot().monthly_blocked is True
+
+    registry.record_probe_success(credential.generation, _usage(30.0), health_ok=True)
+
+    assert registry.snapshot().monthly_blocked is False
+    assert registry.snapshot().eligible is True
+
+
 def test_set_wake_registers_callback_for_observe():
     registry = OAuthTokenRegistry()
     wakeups = []

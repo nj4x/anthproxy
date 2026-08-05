@@ -248,6 +248,13 @@ class BackendRegistry:
             return False
         return self._oauth_registry.mark_cooldown(credential.generation, retry_after)
 
+    def mark_oauth_cap_exhausted(
+        self, credential: 'OAuthRequestCredentials | None',
+    ) -> bool:
+        if self._oauth_registry is None or credential is None:
+            return False
+        return self._oauth_registry.mark_cap_exhausted(credential.generation)
+
     def snapshot_for_request(
         self,
         session_key: str | None = None,

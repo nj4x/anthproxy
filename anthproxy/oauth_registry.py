@@ -143,7 +143,7 @@ class OAuthTokenRegistry:
     def record_probe_success(self, generation: int, usage: dict, health_ok: bool) -> bool:
         now = self._monotonic()
         wall = self._utcnow()
-        _burn, _valid, cap_reached = _usage_burn(usage)
+        _burn, valid, cap_reached = _usage_burn(usage)
         with self._lock:
             state = self._states.get(generation)
             if state is None:
@@ -153,8 +153,16 @@ class OAuthTokenRegistry:
             state.usage_month = (wall.year, wall.month)
             state.health_ok = health_ok
             state.probing = False
+            # Usage is authoritative for cap state only when the probe produced a
+            # valid reading (enabled, parseable, non-negative).  Set the monthly
+            # block when capped; clear any provisional 429-driven block only when
+            # a fresh probe *confirms* under-cap (valid and not capped).  Leave
+            # monthly_blocked_until unchanged on indeterminate/unparseable usage
+            # so a probe hiccup cannot silently lift a genuine month-long park.
             if cap_reached:
                 state.monthly_blocked_until = _next_month(wall)
+            elif valid:
+                state.monthly_blocked_until = None
             return True
 
     def record_probe_failure(self, generation: int, stage: str) -> bool:
@@ -180,6 +188,22 @@ class OAuthTokenRegistry:
                 state.cooldown_until,
                 self._monotonic() + max(0.0, duration),
             )
+            return True
+
+    def mark_cap_exhausted(self, generation: int) -> bool:
+        """Park a token until the next UTC month after a spend-cap 429.
+
+        Used when an OAuth 429 carries no Retry-After guidance: the token was
+        eligible (last probe under-cap), so the 429 itself is the exhaustion
+        signal.  The block is provisional — the next under-cap probe clears it
+        (see :meth:`record_probe_success`), bounding a false-positive park.
+        """
+        wall = self._utcnow()
+        with self._lock:
+            state = self._states.get(generation)
+            if state is None:
+                return False
+            state.monthly_blocked_until = _next_month(wall)
             return True
 
     def tick(self, force: bool = False, background: bool = False) -> OAuthTokenSnapshot:

@@ -200,6 +200,91 @@ class TestOAuthRateLimit:
 
         handler.registry.mark_oauth_cooldown.assert_called_once_with(credential, 12)
 
+    def test_nonstream_429_zero_retry_after_marks_cap_exhausted(self):
+        # retry_after=0.0 is not useful guidance (token still unavailable);
+        # treat it the same as absent: park until the next UTC month.
+        handler = object.__new__(ProxyRequestHandler)
+        handler.registry = MagicMock()
+        handler.selector = MagicMock()
+        handler.stats_collector = None
+        handler.session_db = None
+        handler.headers = {}
+        handler._req_start = time.monotonic()
+        handler._send_json = MagicMock()
+        credential = SimpleNamespace(generation=5)
+        snapshot = _fake_snapshot('oauth', MagicMock())
+        snapshot.credentials = credential
+        snapshot.backend.parse_credentials.return_value = {}
+        snapshot.backend.send_message.side_effect = AnthropicRequestError(
+            'limited', error_type='rate_limit_error', status_code=429, retry_after=0.0,
+        )
+        handler.registry.snapshot_for_request.return_value = snapshot
+        handler.registry.session_context.return_value = (0, 1.0)
+        handler._validate_content_type = MagicMock()
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value={'model': 'haiku', 'messages': []})
+        handler._extract_prompt_capture = MagicMock(return_value={})
+        handler._no_classifier = False
+        handler._prefer_backend = None
+        snapshot.config.auto_model_routing = False
+
+        handler._handle_messages()
+
+        handler.registry.mark_oauth_cap_exhausted.assert_called_once_with(credential)
+        handler.registry.mark_oauth_cooldown.assert_not_called()
+
+    def test_nonstream_429_without_retry_after_marks_cap_exhausted(self):
+        handler = object.__new__(ProxyRequestHandler)
+        handler.registry = MagicMock()
+        handler.selector = MagicMock()
+        handler.stats_collector = None
+        handler.session_db = None
+        handler.headers = {}
+        handler._req_start = time.monotonic()
+        handler._send_json = MagicMock()
+        credential = SimpleNamespace(generation=4)
+        snapshot = _fake_snapshot('oauth', MagicMock())
+        snapshot.credentials = credential
+        snapshot.backend.parse_credentials.return_value = {}
+        snapshot.backend.send_message.side_effect = AnthropicRequestError(
+            'limited', error_type='rate_limit_error', status_code=429, retry_after=None,
+        )
+        handler.registry.snapshot_for_request.return_value = snapshot
+        handler.registry.session_context.return_value = (0, 1.0)
+        handler._validate_content_type = MagicMock()
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value={'model': 'haiku', 'messages': []})
+        handler._extract_prompt_capture = MagicMock(return_value={})
+        handler._no_classifier = False
+        handler._prefer_backend = None
+        snapshot.config.auto_model_routing = False
+
+        handler._handle_messages()
+
+        handler.registry.mark_oauth_cap_exhausted.assert_called_once_with(credential)
+        handler.registry.mark_oauth_cooldown.assert_not_called()
+        handler.selector.on_rate_limited.assert_not_called()
+
+    def test_streaming_429_without_retry_after_marks_cap_exhausted(self):
+        handler = object.__new__(ProxyRequestHandler)
+        handler.registry = MagicMock()
+        credential = SimpleNamespace(generation=7)
+        snapshot = _fake_snapshot('oauth', MagicMock())
+        snapshot.credentials = credential
+
+        def limited():
+            raise AnthropicRequestError(
+                'limited', error_type='rate_limit_error', status_code=429,
+            )
+            yield
+
+        wrapped = handler._oauth_cooldown_wrapper(limited(), snapshot)
+        with pytest.raises(AnthropicRequestError):
+            next(wrapped)
+
+        handler.registry.mark_oauth_cap_exhausted.assert_called_once_with(credential)
+        handler.registry.mark_oauth_cooldown.assert_not_called()
+
     def test_streaming_429_marks_cooldown(self):
         handler = object.__new__(ProxyRequestHandler)
         handler.registry = MagicMock()
