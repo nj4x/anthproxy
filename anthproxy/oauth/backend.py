@@ -24,6 +24,9 @@ from ..mapper.anthropic_protocol import (
     MESSAGES_PATH,
     USER_AGENT,
 )
+# TODO(arch): move build_body, merge_betas, resolve_model to mapper/anthropic_transform.py
+# to avoid importing from sibling anthropic backend package. These are shared Anthropic-
+# protocol transformation functions, not anthropic-backend-specific. See issue #13 refactor.
 from ..anthropic.mapper import (
     build_body,
     merge_betas,

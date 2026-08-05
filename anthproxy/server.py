@@ -22,6 +22,7 @@ from .backends_registry import (  # noqa: F401
 )
 from .config import Config
 from .constants import SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
+from .oauth_registry import _USAGE_TTL_SECONDS
 from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,14 @@ class BackendRegistry:
             and oauth.burn is not None
             and oauth.burn < personal_burn
             and not math.isclose(oauth.burn, personal_burn, rel_tol=1e-6)
+        )
+        _log_oauth_selection(
+            session_key, oauth_credential, oauth,
+            personal_name, personal_burn,
+            chosen='oauth' if oauth_wins else personal_name,
+            reason=_oauth_decision_reason(
+                oauth_credential, oauth, oauth_wins, personal_burn,
+            ),
         )
         if oauth_wins:
             with self._state_lock:
