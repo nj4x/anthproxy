@@ -1,11 +1,12 @@
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from anthproxy.config import Config
-from anthproxy.oauth_registry import OAuthTokenRegistry
+from anthproxy.oauth_registry import OAuthTokenRegistry, OAuthTokenSnapshot
 from anthproxy.selector import AutoSelector
-from anthproxy.server import BackendRegistry
+from anthproxy.server import BackendRegistry, _oauth_decision_reason
 
 
 class _Backend:
@@ -125,6 +126,181 @@ def test_invalid_oauth_preference_falls_back_to_personal():
     )
 
     assert snapshot.name == 'anthropic'
+
+
+def test_snapshot_logs_enterprise_choice_at_info(caplog):
+    oauth_registry, credential = _eligible_oauth(1.0)
+    registry = _registry(oauth_registry)
+
+    with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
+        registry.snapshot_for_request(oauth_credential=credential)
+
+    record = next(
+        r for r in caplog.records if 'OAuth backend selection' in r.message
+    )
+    assert record.levelno == logging.INFO
+    assert 'chosen=oauth' in record.getMessage()
+    assert 'enterprise_token=yes' in record.getMessage()
+    assert 'below personal' in record.getMessage()
+
+
+def test_snapshot_logs_personal_choice_at_debug_with_tie_reason(caplog):
+    oauth_registry, credential = _eligible_oauth(20.0)
+    registry = _registry(oauth_registry)
+    oauth_burn = oauth_registry.snapshot().burn
+    registry.set_personal_candidates_resolver(
+        lambda: (SimpleNamespace(name='anthropic', burn=oauth_burn),)
+    )
+
+    with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
+        registry.snapshot_for_request(oauth_credential=credential)
+
+    record = next(
+        r for r in caplog.records if 'OAuth backend selection' in r.message
+    )
+    assert record.levelno == logging.DEBUG
+    assert 'chosen=anthropic' in record.getMessage()
+    assert 'at or below enterprise' in record.getMessage()
+
+
+def test_snapshot_logs_no_enterprise_token_reason(caplog):
+    registry = _registry(OAuthTokenRegistry())
+
+    with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
+        registry.snapshot_for_request()
+
+    record = next(
+        r for r in caplog.records if 'OAuth backend selection' in r.message
+    )
+    assert 'enterprise_token=no' in record.getMessage()
+    assert 'reason=no enterprise token on request' in record.getMessage()
+
+
+def test_snapshot_logs_cooldown_reason(caplog):
+    oauth_registry, credential = _eligible_oauth(1.0)
+    oauth_registry.mark_cooldown(credential.generation, retry_after=120.0)
+    registry = _registry(oauth_registry)
+
+    with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
+        registry.snapshot_for_request(oauth_credential=credential)
+
+    record = next(
+        r for r in caplog.records if 'OAuth backend selection' in r.message
+    )
+    assert record.levelno == logging.DEBUG
+    assert 'chosen=anthropic' in record.getMessage()
+    assert 'enterprise in cooldown' in record.getMessage()
+
+
+def test_mark_oauth_cooldown_logs_info(caplog):
+    oauth_registry, credential = _eligible_oauth(1.0)
+    registry = _registry(oauth_registry)
+
+    with caplog.at_level(logging.INFO, logger='anthproxy.server'):
+        registry.mark_oauth_cooldown(credential, retry_after=90.0)
+
+    assert any(
+        'enterprise token 429: cooldown 90s' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_mark_oauth_cap_exhausted_logs_info(caplog):
+    oauth_registry, credential = _eligible_oauth(1.0)
+    registry = _registry(oauth_registry)
+
+    with caplog.at_level(logging.INFO, logger='anthproxy.server'):
+        registry.mark_oauth_cap_exhausted(credential)
+
+    assert any(
+        'spend-cap exhausted' in r.getMessage() for r in caplog.records
+    )
+
+
+def _ineligible(**overrides):
+    """Return an OAuthTokenSnapshot with eligible=False and specified fields."""
+    defaults = dict(
+        eligible=False,
+        cooldown_remaining_seconds=0.0,
+        monthly_blocked=False,
+        health_ok=True,
+        burn=50.0,
+        usage_age_seconds=0.0,
+        usage_stale=False,
+    )
+    defaults.update(overrides)
+    return OAuthTokenSnapshot(**defaults)
+
+
+def test_reason_no_credential():
+    assert _oauth_decision_reason(None, None, False, 40.0) == 'no enterprise token on request'
+
+
+def test_reason_oauth_not_tracked():
+    cred = object()
+    assert _oauth_decision_reason(cred, None, False, 40.0) == 'enterprise token not tracked'
+
+
+def test_reason_oauth_wins():
+    snap = OAuthTokenSnapshot(eligible=True, burn=10.0)
+    cred = object()
+    reason = _oauth_decision_reason(cred, snap, True, 40.0)
+    assert 'enterprise weekly 10.0% below personal 40.0%' == reason
+
+
+def test_reason_cooldown():
+    snap = _ineligible(cooldown_remaining_seconds=90.0)
+    assert 'enterprise in cooldown (90s remaining)' == _oauth_decision_reason(
+        object(), snap, False, 40.0
+    )
+
+
+def test_reason_monthly_blocked():
+    snap = _ineligible(monthly_blocked=True)
+    assert _oauth_decision_reason(object(), snap, False, 40.0) == (
+        'enterprise spend-cap parked for the month'
+    )
+
+
+def test_reason_health_not_confirmed():
+    snap = _ineligible(health_ok=None)
+    assert _oauth_decision_reason(object(), snap, False, 40.0) == (
+        'enterprise health check not confirmed'
+    )
+
+
+def test_reason_burn_none_ineligible():
+    snap = _ineligible(burn=None)
+    assert _oauth_decision_reason(object(), snap, False, 40.0) == (
+        'enterprise usage reading unavailable'
+    )
+
+
+def test_reason_usage_age_none():
+    snap = _ineligible(usage_age_seconds=None)
+    assert _oauth_decision_reason(object(), snap, False, 40.0) == (
+        'enterprise usage not yet probed'
+    )
+
+
+def test_reason_usage_stale():
+    snap = _ineligible(usage_age_seconds=400.0, usage_stale=True)
+    reason = _oauth_decision_reason(object(), snap, False, 40.0)
+    assert reason.startswith('enterprise usage cache expired')
+    assert '400s old' in reason
+
+
+def test_reason_prior_month():
+    snap = _ineligible()
+    assert _oauth_decision_reason(object(), snap, False, 40.0) == (
+        'enterprise usage from a prior month'
+    )
+
+
+def test_reason_eligible_lost():
+    snap = OAuthTokenSnapshot(eligible=True, burn=40.0)
+    reason = _oauth_decision_reason(object(), snap, False, 40.0)
+    assert 'personal weekly 40.0% at or below enterprise 40.0%' == reason
 
 
 def test_selector_wake_runs_registry_tick_promptly():

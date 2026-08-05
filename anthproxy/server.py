@@ -22,10 +22,84 @@ from .backends_registry import (  # noqa: F401
 )
 from .config import Config
 from .constants import SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
-from .oauth_registry import _USAGE_TTL_SECONDS
 from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
+
+
+def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn):
+    """Explain why enterprise (oauth) was or was not chosen over personal.
+
+    ``oauth`` is an ``OAuthTokenSnapshot`` (or None when the request carried no
+    tracked enterprise token).  ``oauth_wins`` is the final comparison result.
+    """
+    if oauth_credential is None:
+        return 'no enterprise token on request'
+    if oauth is None:
+        return 'enterprise token not tracked'
+    if oauth_wins:
+        return (
+            f'enterprise weekly {oauth.burn:.1f}% below '
+            f'personal {personal_burn:.1f}%'
+        )
+    if not oauth.eligible:
+        if oauth.cooldown_remaining_seconds > 0:
+            return (
+                'enterprise in cooldown '
+                f'({oauth.cooldown_remaining_seconds:.0f}s remaining)'
+            )
+        if oauth.monthly_blocked:
+            return 'enterprise spend-cap parked for the month'
+        if oauth.health_ok is not True:
+            return 'enterprise health check not confirmed'
+        if oauth.burn is None:
+            return 'enterprise usage reading unavailable'
+        if oauth.usage_age_seconds is None:
+            return 'enterprise usage not yet probed'
+        if oauth.usage_stale:
+            return (
+                'enterprise usage cache expired '
+                f'({oauth.usage_age_seconds:.0f}s old)'
+            )
+        return 'enterprise usage from a prior month'
+    if oauth.burn is None:
+        return 'enterprise usage reading unavailable'
+    return (
+        f'personal weekly {personal_burn:.1f}% at or below '
+        f'enterprise {oauth.burn:.1f}%'
+    )
+
+
+def _log_oauth_selection(session_key, oauth_credential, oauth,
+                         personal_name, personal_burn, chosen, reason):
+    """Emit one observability line for the enterprise-vs-personal decision.
+
+    DEBUG for the common personal outcome; INFO when the enterprise token is
+    chosen (a divergence from the personal baseline worth surfacing).
+    """
+    level = logging.INFO if chosen == 'oauth' else logging.DEBUG
+    if not logger.isEnabledFor(level):
+        return
+    if oauth is not None and oauth.burn is not None:
+        enterprise_weekly = f'{oauth.burn:.1f}%'
+    elif oauth is not None:
+        enterprise_weekly = 'unknown'
+    else:
+        enterprise_weekly = 'n/a'
+    session_label = f'{session_key[:16]}…' if session_key else '-'
+    logger.log(
+        level,
+        'OAuth backend selection (session=%s): enterprise_token=%s '
+        'enterprise_weekly=%s personal=%s personal_weekly=%.1f%% '
+        'chosen=%s reason=%s',
+        session_label,
+        'yes' if oauth_credential is not None else 'no',
+        enterprise_weekly,
+        personal_name,
+        personal_burn,
+        chosen,
+        reason,
+    )
 
 
 class BackendError(Exception):
@@ -247,14 +321,26 @@ class BackendRegistry:
     ) -> bool:
         if self._oauth_registry is None or credential is None:
             return False
-        return self._oauth_registry.mark_cooldown(credential.generation, retry_after)
+        ok = self._oauth_registry.mark_cooldown(credential.generation, retry_after)
+        if ok:
+            logger.info(
+                'OAuth enterprise token 429: cooldown %s',
+                f'{retry_after:.0f}s' if retry_after is not None else 'default',
+            )
+        return ok
 
     def mark_oauth_cap_exhausted(
         self, credential: 'OAuthRequestCredentials | None',
     ) -> bool:
         if self._oauth_registry is None or credential is None:
             return False
-        return self._oauth_registry.mark_cap_exhausted(credential.generation)
+        ok = self._oauth_registry.mark_cap_exhausted(credential.generation)
+        if ok:
+            logger.info(
+                'OAuth enterprise token 429: spend-cap exhausted, '
+                'parked until next UTC month',
+            )
+        return ok
 
     def snapshot_for_request(
         self,

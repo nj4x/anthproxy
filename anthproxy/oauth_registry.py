@@ -29,6 +29,7 @@ class OAuthTokenSnapshot:
     monthly_blocked: bool = False
     burn: float | None = None
     eligible: bool = False
+    usage_stale: bool = False
 
 
 @dataclasses.dataclass
@@ -119,6 +120,7 @@ class OAuthTokenRegistry:
         monthly_blocked = monthly_blocked or (
             cap_reached and usage_month == (wall.year, wall.month)
         )
+        usage_stale = age is not None and age > _USAGE_TTL_SECONDS
         eligible = (
             age is not None
             and age <= _USAGE_TTL_SECONDS
@@ -138,6 +140,7 @@ class OAuthTokenRegistry:
             monthly_blocked=monthly_blocked,
             burn=burn,
             eligible=eligible,
+            usage_stale=usage_stale,
         )
 
     def record_probe_success(self, generation: int, usage: dict, health_ok: bool) -> bool:
