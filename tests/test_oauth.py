@@ -45,6 +45,27 @@ def test_send_message_reuses_anthropic_mapper(monkeypatch):
     assert request.kwargs['headers']['Authorization'] == 'Bearer enterprise-secret'
 
 
+def test_send_message_stream_uses_selected_bearer_token(monkeypatch):
+    response = MagicMock()
+    response.status = 200
+    response.read.side_effect = [b'data: {"type": "message_start"}\n\n', b'']
+    connection = MagicMock()
+    connection.getresponse.return_value = response
+    monkeypatch.setattr('anthproxy.oauth.backend._make_connection', lambda: connection)
+    backend = OAuthBackend()
+
+    chunks = list(backend.send_message_stream(
+        {'model': 'haiku', 'messages': [{'role': 'user', 'content': 'hi'}]},
+        {'oauth': OAuthRequestCredentials(2, 'enterprise-secret')},
+        Config(),
+    ))
+
+    assert any('message_start' in chunk for chunk in chunks)
+    request = connection.request.call_args
+    assert request.kwargs['headers']['Authorization'] == 'Bearer enterprise-secret'
+    assert request.kwargs['headers']['Accept'] == 'text/event-stream'
+
+
 def test_send_message_attaches_retry_after_on_429(monkeypatch):
     response = MagicMock()
     response.status = 429
