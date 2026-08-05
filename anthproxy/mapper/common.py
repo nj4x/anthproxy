@@ -159,6 +159,10 @@ def strip_codex_thinking_blocks(messages):
     so the conversation continues; foreign reasoning state is opaque to the
     target provider anyway.
 
+    Also drops ``redacted_thinking`` blocks whose ``data`` carries a foreign
+    prefix — those are rejected as "Invalid ``data`` in ``redacted_thinking``
+    block" by the same providers.
+
     Returns the original list unchanged when nothing is stripped.
     """
     if not messages:
@@ -175,12 +179,7 @@ def strip_codex_thinking_blocks(messages):
             continue
         filtered = [
             b for b in content
-            if not (
-                isinstance(b, dict)
-                and b.get('type') == 'thinking'
-                and isinstance(b.get('signature', ''), str)
-                and b['signature'].startswith(_FOREIGN_SIG_PREFIXES)
-            )
+            if not _is_foreign_thinking_block(b)
         ]
         if len(filtered) == len(content):
             result.append(msg)
@@ -191,6 +190,21 @@ def strip_codex_thinking_blocks(messages):
         # alternation (user→assistant→user) stays valid.
         result.append({**msg, 'content': filtered or [{'type': 'text', 'text': ''}]})
     return result if changed else messages
+
+
+def _is_foreign_thinking_block(block) -> bool:
+    """True when ``block`` is a thinking/redacted_thinking block foreign to the
+    Anthropic/Bedrock providers (carries a ``codexenc:`` or ``or:`` sentinel)."""
+    if not isinstance(block, dict):
+        return False
+    btype = block.get('type')
+    if btype == 'thinking':
+        sig = block.get('signature', '')
+        return isinstance(sig, str) and sig.startswith(_FOREIGN_SIG_PREFIXES)
+    if btype == 'redacted_thinking':
+        data = block.get('data', '')
+        return isinstance(data, str) and data.startswith(_FOREIGN_SIG_PREFIXES)
+    return False
 
 
 def sse_event(event_type, payload):

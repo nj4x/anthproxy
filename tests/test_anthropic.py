@@ -1013,6 +1013,47 @@ class TestNeedsAccessRefresh:
 
 
 # ---------------------------------------------------------------------------
+# _classify_refresh_error — invalid_grant recognition
+# ---------------------------------------------------------------------------
+
+class TestClassifyRefreshError:
+    """The Anthropic token endpoint returns ``{"error":"invalid_grant",
+    "error_description":"Refresh token expired"}`` (RFC 6749 §5.2 shape) when
+    the refresh token is dead.  _classify_refresh_error must treat this as
+    terminal so the OAuth flow triggers re-login instead of retrying forever.
+    """
+
+    def test_invalid_grant_with_refresh_token_description_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"invalid_grant","error_description":"Refresh token expired"}'
+        assert _classify_refresh_error(400, body) == 'invalid_grant_refresh_token'
+
+    def test_invalid_grant_with_lowercase_description_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"invalid_grant","error_description":"refresh token revoked"}'
+        assert _classify_refresh_error(400, body) == 'invalid_grant_refresh_token'
+
+    def test_invalid_grant_without_refresh_token_description_is_not_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"invalid_grant","error_description":"authorization code expired"}'
+        assert _classify_refresh_error(400, body) is None
+
+    def test_structured_code_refresh_token_expired_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":{"code":"refresh_token_expired"}}'
+        assert _classify_refresh_error(400, body) == 'refresh_token_expired'
+
+    def test_http_401_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        assert _classify_refresh_error(401, b'{}') == 'http_401'
+
+    def test_other_400_is_not_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"server_error","error_description":"transient"}'
+        assert _classify_refresh_error(400, body) is None
+
+
+# ---------------------------------------------------------------------------
 # load_credentials / _write_auth
 # ---------------------------------------------------------------------------
 

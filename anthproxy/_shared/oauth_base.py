@@ -150,6 +150,11 @@ _TERMINAL_ERROR_CODES = frozenset({
     'refresh_token_invalidated',
 })
 
+# OAuth2 standard error code for an expired/revoked/used refresh token. RFC 6749
+# §5.2. Anthropic's token endpoint returns this as a bare ``error`` string (not
+# a structured ``code``) with a human-readable ``error_description``.
+_INVALID_GRANT_CODE = 'invalid_grant'
+
 
 def _classify_refresh_error(status: int, body: bytes) -> str | None:
     """Return a terminal error code string if the refresh is permanently dead, else None."""
@@ -164,6 +169,14 @@ def _classify_refresh_error(status: int, body: bytes) -> str | None:
             code = data.get('code', '') or ''
         if code in _TERMINAL_ERROR_CODES:
             return code
+        # OAuth2 ``invalid_grant`` with a refresh-token-related description is
+        # terminal: the refresh token is expired, revoked, or already used.
+        # Transient invalid_grant (e.g. a malformed authorization_code exchange)
+        # does not reach this refresh-token code path.
+        if code == _INVALID_GRANT_CODE:
+            desc = str(data.get('error_description', '')).lower()
+            if 'refresh token' in desc:
+                return 'invalid_grant_refresh_token'
     except (json.JSONDecodeError, TypeError, AttributeError):
         pass
     if status == 401:

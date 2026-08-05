@@ -33,7 +33,7 @@ from ..anthropic.mapper import (
     resolve_model,
 )
 from ..config import Config
-from ..mapper import AnthropicRequestError, estimate_input_tokens
+from ..mapper import AnthropicRequestError, estimate_input_tokens, strip_all_thinking_blocks
 from ..oauth_registry import OAuthRequestCredentials
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,12 @@ def _send(
 ) -> tuple[http.client.HTTPSConnection, http.client.HTTPResponse]:
     selected = _credential(credentials)
     body = build_body(payload)
+    # Headers are built once before the loop because the oauth backend does not
+    # refresh tokens mid-loop (unlike anthropic/backend.py which rebuilds
+    # headers per-attempt after a 401-triggered refresh).  The access token
+    # comes from the per-request OAuthRequestCredentials and is immutable.
     headers = _request_headers(selected.access_token, merge_betas(payload), stream)
+    thinking_stripped = False
     for attempt in range(MAX_RETRIES + 1):
         connection = _make_connection()
         try:
@@ -109,6 +114,25 @@ def _send(
             except AnthropicRequestError as exc:
                 exc.retry_after = retry_after
                 raise
+        # Thinking/redacted_thinking blocks are model-specific: a block minted by
+        # a different model tier (or a foreign backend) is invalid for the
+        # requested model. After a routing switch the history may carry such
+        # blocks; strip all thinking blocks and retry once. Mirrors the recovery
+        # in anthropic/backend.py::_send_with_retries.
+        if (not thinking_stripped and response.status == 400
+                and b'thinking' in response_body
+                and (b'signature' in response_body or b'redacted_thinking' in response_body)):
+            messages = payload.get('messages')
+            if isinstance(messages, list):
+                stripped_msgs = strip_all_thinking_blocks(messages)
+                if stripped_msgs is not messages:
+                    body = build_body({**payload, 'messages': stripped_msgs})
+                    thinking_stripped = True
+                    logger.warning(
+                        'Retrying after thinking-block 400 with all thinking/'
+                        'redacted_thinking blocks stripped from history',
+                    )
+                    continue
         handle_error_response(
             response.status,
             response_body,
