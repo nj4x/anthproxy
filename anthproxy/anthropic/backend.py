@@ -34,7 +34,7 @@ from .mapper import (
     _resolve_model,
 )
 
-from .._shared.oauth_usage import fetch_oauth_usage, USAGE_PATH, USAGE_TIMEOUT_SECONDS  # noqa: F401
+from .._shared.oauth_usage import USAGE_PATH, USAGE_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
