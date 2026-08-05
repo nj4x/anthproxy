@@ -21,6 +21,7 @@ from anthproxy.anthropic.backend import (
     _fetch_usage,
     _handle_error_response,
     _max_weekly_utilization,
+    _usage_shape,
 )
 from anthproxy import model_config as _model_config
 from anthproxy.anthropic.mapper import (
@@ -82,6 +83,23 @@ class TestShouldRetry:
 
 
 class TestAnthropicUsage:
+    def test_usage_shape_redacts_all_values(self):
+        payload = {
+            'account_id': 'secret',
+            'spent': 12.34,
+            'enabled': True,
+            'window': {'resets_at': '2026-09-01', 'limit': None},
+            'items': [{'name': 'private'}],
+        }
+
+        assert _usage_shape(payload) == {
+            'account_id': 'str',
+            'spent': 'float',
+            'enabled': 'bool',
+            'window': {'resets_at': 'str', 'limit': 'null'},
+            'items': {'type': 'array', 'items': {'name': 'str'}},
+        }
+
     def _response(self, status, data=None, headers=None):
         response = MagicMock(spec=http.client.HTTPResponse)
         response.status = status

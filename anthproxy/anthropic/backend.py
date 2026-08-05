@@ -35,7 +35,6 @@ CLAUDE_CLI_VERSION = '2.1.88'
 USER_AGENT = f'claude-cli/{CLAUDE_CLI_VERSION} (external, cli)'
 USAGE_TIMEOUT_SECONDS = 5
 
-
 def _make_connection() -> http.client.HTTPSConnection:
     return _make_connection_shared(ANTHROPIC_HOST)
 
@@ -145,6 +144,44 @@ def _send_with_retries(payload: dict, config, lock: threading.Lock, stream: bool
         _handle_error_response(resp.status, resp_body)
 
     raise AnthropicRequestError('Anthropic request failed', error_type='api_error', status_code=502)
+
+
+def _usage_shape(value):
+    if isinstance(value, dict):
+        return {key: _usage_shape(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return {'type': 'array', 'items': _usage_shape(value[0]) if value else None}
+    if value is None:
+        return 'null'
+    return type(value).__name__
+
+
+def fetch_oauth_usage(access_token: str) -> dict:
+    conn = http.client.HTTPSConnection(ANTHROPIC_HOST, timeout=USAGE_TIMEOUT_SECONDS)
+    try:
+        conn.request('GET', USAGE_PATH, headers={
+            'Authorization': f'Bearer {access_token}',
+            'anthropic-version': ANTHROPIC_VERSION,
+            'anthropic-beta': 'oauth-2025-04-20',
+            'Accept': 'application/json',
+            'User-Agent': USER_AGENT,
+        })
+        resp = conn.getresponse()
+        body = resp.read()
+        status = resp.status
+    finally:
+        conn.close()
+
+    if status == 200:
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f'Unrecognized usage response from Anthropic: {exc}') from exc
+    if status == 429:
+        raise UsageRateLimitError(retry_after=_parse_retry_after(resp))
+    if status in (401, 403):
+        raise RuntimeError('Authentication failed for usage endpoint')
+    raise RuntimeError(f'Anthropic usage endpoint returned HTTP {status}')
 
 
 def _fetch_usage(config, lock: threading.Lock) -> dict:

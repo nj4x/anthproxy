@@ -2345,6 +2345,7 @@ class TestHandlerRouting:
         snap.session_subscription = False
         registry = MagicMock()
         registry.snapshot.return_value = snap
+        registry.snapshot_for_request.return_value = snap
         handler.registry = registry
         handler.config = snap.config
         handler.selector = None

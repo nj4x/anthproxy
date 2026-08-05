@@ -23,6 +23,7 @@ Selector modes
                    backends; bedrock is never used.
 """
 
+import dataclasses
 import logging
 import threading
 import time
@@ -42,6 +43,13 @@ _FALLBACK = "bedrock"
 
 # When weekly utilization is unknown, use this neutral value for comparisons.
 _UNKNOWN_WEEKLY = 50.0
+_PERSONAL_CACHE_TTL = 300.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PersonalCandidate:
+    name: str
+    burn: float
 
 
 class AutoSelector:
@@ -66,9 +74,11 @@ class AutoSelector:
         required by BackendRegistry's own locking model).
     """
 
-    def __init__(self, registry, config, interval: float | None = None):
+    def __init__(self, registry, config, interval: float | None = None,
+                 oauth_registry=None):
         self._registry = registry
         self._config = config
+        self._oauth_registry = oauth_registry
         self._interval = (
             interval if interval is not None else config.auto_backend_interval
         )
@@ -79,6 +89,8 @@ class AutoSelector:
         # five_hour_status() succeeds; used for exhausted backends where we
         # don't want to make a live network call.
         self._last_weekly: dict[str, float] = {}
+        self._last_status_at: dict[str, float] = {}
+        self._last_available: dict[str, bool | None] = {}
         # Selector mode: 'auto' | 'pinned' | 'subscription'.
         # 'pinned'      — auto-evaluation is suspended; _pinned holds the name.
         # 'subscription' — auto continues but only among subscription backends.
@@ -89,7 +101,10 @@ class AutoSelector:
         self._pinned: str | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        if self._oauth_registry is not None:
+            self._oauth_registry.set_wake(self.wake)
 
     # ------------------------------------------------------------------
     # Public API
@@ -114,9 +129,13 @@ class AutoSelector:
     def stop(self) -> None:
         """Signal the background thread to exit and wait for it."""
         self._stop.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+
+    def wake(self) -> None:
+        self._wake.set()
 
     def evaluate(self) -> str:
         """Pick and switch to the best backend right now.
@@ -142,6 +161,12 @@ class AutoSelector:
         if new_weekly:
             with self._lock:
                 self._last_weekly.update(new_weekly)
+        if statuses:
+            observed_at = time.time()
+            with self._lock:
+                for name, status in statuses.items():
+                    self._last_status_at[name] = observed_at
+                    self._last_available[name] = status.available
 
         active = self._registry.active_name()
         if best != active:
@@ -214,6 +239,12 @@ class AutoSelector:
         if new_weekly:
             with self._lock:
                 self._last_weekly.update(new_weekly)
+        if statuses:
+            observed_at = time.time()
+            with self._lock:
+                for backend_name, status in statuses.items():
+                    self._last_status_at[backend_name] = observed_at
+                    self._last_available[backend_name] = status.available
 
         if source_status is not None:
             statuses.setdefault(name, source_status)
@@ -280,6 +311,22 @@ class AutoSelector:
                 return "auto-selection: subscription-only"
         return "auto-selection: on"
 
+    def personal_candidates(self) -> tuple[PersonalCandidate, ...]:
+        now = time.time()
+        with self._lock:
+            exhausted = dict(self._exhausted_until)
+            weekly = dict(self._last_weekly)
+            status_at = dict(self._last_status_at)
+            available = dict(self._last_available)
+        candidates = []
+        for name in _PRIORITY:
+            if now < exhausted.get(name, 0) or available.get(name) is False:
+                continue
+            fresh = now - status_at.get(name, 0.0) <= _PERSONAL_CACHE_TTL
+            burn = weekly.get(name, _UNKNOWN_WEEKLY) if fresh else _UNKNOWN_WEEKLY
+            candidates.append(PersonalCandidate(name=name, burn=burn))
+        return tuple(sorted(candidates, key=lambda candidate: candidate.burn))
+
     def current_subscription_backend(self) -> str | None:
         """Return a subscription backend name from cached state only.
 
@@ -317,11 +364,16 @@ class AutoSelector:
 
     def _run(self) -> None:
         """Background poll loop: refresh tokens then (if auto-enabled) evaluate."""
-        while not self._stop.wait(self._interval):
-            self._tick()
+        while not self._stop.is_set():
+            self._wake.wait(self._interval)
+            self._wake.clear()
+            if not self._stop.is_set():
+                self._tick()
 
     def _tick(self) -> None:
         """One tick: refresh OAuth tokens and (when auto is active) re-evaluate."""
+        if self._oauth_registry is not None:
+            self._oauth_registry.tick(background=True)
         self._refresh_tokens()
         if self._config.auto_backend:
             try:

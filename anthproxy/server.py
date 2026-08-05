@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -52,6 +53,7 @@ class BackendSnapshot:
     config: Config
     session_pinned: bool = False
     session_subscription: bool = False
+    credentials: object | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,8 +186,9 @@ class BackendRegistry:
 
     _MAX_SESSION_OVERRIDES = 1024  # cap on the session override map size
 
-    def __init__(self, config: Config, initial_backend):
+    def __init__(self, config: Config, initial_backend, oauth_registry=None):
         self._config = config
+        self._oauth_registry = oauth_registry
         self._active = config.backend
         self._instances = {config.backend: initial_backend}
         self._state_lock = threading.Lock()
@@ -217,6 +220,83 @@ class BackendRegistry:
         # Called under _state_lock so it must be a leaf (no network I/O, no
         # registry callbacks).
         self._subscription_resolver = None
+        self._personal_candidates_resolver = None
+
+    def set_personal_candidates_resolver(self, resolver) -> None:
+        self._personal_candidates_resolver = resolver
+
+    def observe_oauth_credential(self, access_token: str):
+        if self._oauth_registry is None:
+            return None
+        return self._oauth_registry.observe(access_token)
+
+    def mark_oauth_cooldown(self, credential, retry_after: float | None = None) -> bool:
+        if self._oauth_registry is None or credential is None:
+            return False
+        return self._oauth_registry.mark_cooldown(credential.generation, retry_after)
+
+    def snapshot_for_request(
+        self,
+        session_key: str | None = None,
+        prefer_backend: str | None = None,
+        oauth_credential=None,
+    ) -> BackendSnapshot:
+        with self._state_lock:
+            override = self._session_overrides.get(session_key) if session_key is not None else None
+        if override is not None:
+            return self.snapshot(session_key, prefer_backend=prefer_backend)
+
+        if prefer_backend is not None:
+            return self.snapshot(session_key, prefer_backend=prefer_backend)
+
+        candidates = (
+            tuple(self._personal_candidates_resolver())
+            if self._personal_candidates_resolver is not None else ()
+        )
+        personal = min(candidates, key=lambda candidate: candidate.burn, default=None)
+        if personal is None:
+            base = self.snapshot(session_key)
+            personal_name = base.name
+            personal_burn = 100.0
+        else:
+            personal_name = personal.name
+            personal_burn = personal.burn
+
+        oauth = (
+            self._oauth_registry.snapshot(oauth_credential.generation)
+            if self._oauth_registry is not None and oauth_credential is not None
+            else None
+        )
+        oauth_valid = oauth is not None and oauth.eligible
+        oauth_wins = (
+            oauth_valid
+            and oauth.burn is not None
+            and oauth.burn < personal_burn
+            and not math.isclose(oauth.burn, personal_burn, rel_tol=1e-6)
+        )
+        if oauth_wins:
+            with self._state_lock:
+                backend = self._instances.get('oauth')
+            if backend is None:
+                backend = self._get_or_create('oauth')
+            request_config = dataclasses.replace(self._config, backend='oauth')
+            return BackendSnapshot(
+                name='oauth', backend=backend, config=request_config,
+                credentials=oauth_credential,
+            )
+
+        with self._state_lock:
+            backend = self._instances.get(personal_name)
+        if backend is None:
+            return self.snapshot(session_key)
+        request_config = dataclasses.replace(self._config, backend=personal_name)
+        session_routing_override = self.session_model_routing(session_key) \
+            if session_key is not None else None
+        if session_routing_override is not None:
+            request_config = dataclasses.replace(
+                request_config, auto_model_routing=session_routing_override,
+            )
+        return BackendSnapshot(name=personal_name, backend=backend, config=request_config)
 
     def snapshot(self, session_key: str | None = None,
                  prefer_backend: str | None = None) -> BackendSnapshot:
@@ -741,6 +821,7 @@ def create_server(config: Config, registry: BackendRegistry,
                   session_db=None) -> ThreadingHTTPServer:
     if selector is not None:
         registry.set_subscription_resolver(selector.current_subscription_backend)
+        registry.set_personal_candidates_resolver(selector.personal_candidates)
     handler_class = make_handler_class(registry, config, selector, stats_collector,
                                        session_db=session_db)
     server = ThreadingHTTPServer((config.host, config.port), handler_class)

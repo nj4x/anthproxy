@@ -36,7 +36,10 @@ class BackendDiscoveryError(Exception):
 RESERVED_NAMES: frozenset[str] = frozenset(VALID_BACKEND_MODES) | {SESSION_SUBSCRIPTION_SENTINEL}
 
 # Canonical order for user-facing lists (CLI choices, help text, etc.).
-_DECLARED_ORDER: tuple[str, ...] = ('bedrock', 'codex', 'anthropic', 'local', 'openrouter')
+_DECLARED_ORDER: tuple[str, ...] = (
+    'bedrock', 'codex', 'anthropic', 'local', 'openrouter',
+)
+_INTERNAL_BACKENDS: frozenset[str] = frozenset({'oauth'})
 
 _BACKENDS: dict[str, type] = {}
 
@@ -89,7 +92,10 @@ def backend_names() -> tuple[str, ...]:
             'backend registry is empty — did you forget to call discover_backends()?'
         )
     declared = [n for n in _DECLARED_ORDER if n in _BACKENDS]
-    extras = sorted(n for n in _BACKENDS if n not in _DECLARED_ORDER)
+    extras = sorted(
+        n for n in _BACKENDS
+        if n not in _DECLARED_ORDER and n not in _INTERNAL_BACKENDS
+    )
     return tuple(declared + extras)
 
 

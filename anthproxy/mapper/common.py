@@ -18,11 +18,13 @@ def anthropic_error_payload(type_, message):
 
 
 class AnthropicRequestError(Exception):
-    def __init__(self, message, error_type='invalid_request_error', status_code=400):
+    def __init__(self, message, error_type='invalid_request_error', status_code=400,
+                 retry_after=None):
         super().__init__(message)
         self.message = message
         self.error_type = error_type
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def _count_chars(obj):

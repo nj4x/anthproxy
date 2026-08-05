@@ -17,6 +17,7 @@ from anthproxy.handlers import (
     _session_key,
     _session_short_id,
     _system_fingerprint,
+    prepare_routing,
 )
 from anthproxy.stats import RoutingEconomics
 
@@ -35,6 +36,12 @@ def _handler_with_registry(registry):
     # default to the identity so a bare MagicMock registry doesn't break routing.
     if isinstance(registry, MagicMock):
         registry.session_context.return_value = (0, 1.0)
+        registry.snapshot_for_request.side_effect = (
+            lambda *args, **kwargs: registry.snapshot(
+                args[0] if args else None,
+                prefer_backend=kwargs.get('prefer_backend'),
+            )
+        )
     # do_POST normally initializes these; tests call _handle_* directly.
     handler._ctx_key = None
     handler._route_est = 0
@@ -79,7 +86,138 @@ def _fake_snapshot(name, backend, session_pinned=False, session_subscription=Fal
     snapshot.config.auto_model_routing_system_prompt_preview_limit = 500
     snapshot.session_pinned = session_pinned
     snapshot.session_subscription = session_subscription
+    snapshot.credentials = None
     return snapshot
+
+
+class TestOAuthRequestRouting:
+    def test_observes_bearer_before_request_snapshot(self):
+        calls = []
+        credential = SimpleNamespace(generation=1)
+        backend = MagicMock()
+        snapshot = _fake_snapshot('oauth', backend)
+        snapshot.credentials = credential
+        registry = MagicMock()
+        registry.observe_oauth_credential.side_effect = (
+            lambda token: calls.append(('observe', token)) or credential
+        )
+        registry.session_context.return_value = (0, 1.0)
+        handler = _handler_with_registry(registry)
+        registry.snapshot_for_request.side_effect = (
+            lambda *args, **kwargs: calls.append(('snapshot', kwargs['oauth_credential'])) or snapshot
+        )
+        handler.headers = {'Authorization': 'Bearer enterprise-secret', 'x-api-key': 'personal-key'}
+        handler._extract_prompt_capture = MagicMock(return_value={})
+        snapshot.config.auto_model_routing = False
+
+        prepared = prepare_routing(handler, {'model': 'haiku', 'messages': []}, None)
+
+        assert calls == [('observe', 'enterprise-secret'), ('snapshot', credential)]
+        assert prepared.credentials == {'oauth': credential}
+        backend.parse_credentials.assert_not_called()
+
+    def test_personal_selection_never_receives_bearer(self):
+        credential = SimpleNamespace(generation=1)
+        backend = MagicMock()
+        backend.parse_credentials.return_value = {'api_key': 'personal-key'}
+        snapshot = _fake_snapshot('anthropic', backend)
+        snapshot.credentials = None
+        registry = MagicMock()
+        registry.observe_oauth_credential.return_value = credential
+        registry.session_context.return_value = (0, 1.0)
+        handler = _handler_with_registry(registry)
+        registry.snapshot_for_request.side_effect = None
+        registry.snapshot_for_request.return_value = snapshot
+        handler.headers = {'Authorization': 'Bearer enterprise-secret', 'x-api-key': 'personal-key'}
+        handler._extract_prompt_capture = MagicMock(return_value={})
+        snapshot.config.auto_model_routing = False
+
+        prepared = prepare_routing(handler, {'model': 'haiku', 'messages': []}, None)
+
+        assert prepared.credentials == {'api_key': 'personal-key'}
+        backend.parse_credentials.assert_called_once_with('personal-key')
+
+
+class TestOAuthRateLimit:
+    def test_nonstream_429_marks_cooldown_without_personal_retry(self):
+        handler = object.__new__(ProxyRequestHandler)
+        handler.registry = MagicMock()
+        handler.selector = MagicMock()
+        handler.stats_collector = None
+        handler.session_db = None
+        handler.headers = {}
+        handler._req_start = time.monotonic()
+        handler._send_json = MagicMock()
+        credential = SimpleNamespace(generation=4)
+        snapshot = _fake_snapshot('oauth', MagicMock())
+        snapshot.credentials = credential
+        snapshot.backend.parse_credentials.return_value = {}
+        snapshot.backend.send_message.side_effect = AnthropicRequestError(
+            'limited', error_type='rate_limit_error', status_code=429, retry_after=12,
+        )
+        handler.registry.snapshot_for_request.return_value = snapshot
+        handler.registry.session_context.return_value = (0, 1.0)
+        handler._validate_content_type = MagicMock()
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value={'model': 'haiku', 'messages': []})
+        handler._extract_prompt_capture = MagicMock(return_value={})
+        handler._no_classifier = False
+        handler._prefer_backend = None
+        snapshot.config.auto_model_routing = False
+
+        handler._handle_messages()
+
+        handler.registry.mark_oauth_cooldown.assert_called_once_with(credential, 12)
+        handler.selector.on_rate_limited.assert_not_called()
+
+    def test_client_retry_after_does_not_override_upstream_cooldown(self):
+        handler = object.__new__(ProxyRequestHandler)
+        handler.registry = MagicMock()
+        handler.selector = MagicMock()
+        handler.stats_collector = None
+        handler.session_db = None
+        handler.headers = {'Retry-After': '999999'}
+        handler._req_start = time.monotonic()
+        handler._send_json = MagicMock()
+        credential = SimpleNamespace(generation=4)
+        snapshot = _fake_snapshot('oauth', MagicMock())
+        snapshot.credentials = credential
+        snapshot.backend.send_message.side_effect = AnthropicRequestError(
+            'limited', error_type='rate_limit_error', status_code=429, retry_after=12,
+        )
+        handler.registry.snapshot_for_request.return_value = snapshot
+        handler.registry.observe_oauth_credential.return_value = credential
+        handler.registry.session_context.return_value = (0, 1.0)
+        handler._validate_content_type = MagicMock()
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value={'model': 'haiku', 'messages': []})
+        handler._extract_prompt_capture = MagicMock(return_value={})
+        handler._no_classifier = False
+        handler._prefer_backend = None
+        snapshot.config.auto_model_routing = False
+
+        handler._handle_messages()
+
+        handler.registry.mark_oauth_cooldown.assert_called_once_with(credential, 12)
+
+    def test_streaming_429_marks_cooldown(self):
+        handler = object.__new__(ProxyRequestHandler)
+        handler.registry = MagicMock()
+        credential = SimpleNamespace(generation=7)
+        snapshot = _fake_snapshot('oauth', MagicMock())
+        snapshot.credentials = credential
+
+        def limited():
+            raise AnthropicRequestError(
+                'limited', error_type='rate_limit_error', status_code=429, retry_after=9,
+            )
+            yield
+
+        wrapped = handler._oauth_cooldown_wrapper(limited(), snapshot)
+        with pytest.raises(AnthropicRequestError):
+            next(wrapped)
+
+        handler.registry.mark_oauth_cooldown.assert_called_once_with(credential, 9)
 
 
 class TestFreshSessionLocalCommands:
@@ -343,8 +481,10 @@ class TestRoutingLogs:
         backend.parse_credentials.return_value = {'token': 'ok'}
         backend.count_tokens.return_value = {'input_tokens': 1}
         registry = MagicMock()
-        registry.snapshot.return_value = _fake_snapshot('codex', backend)
+        registry.observe_oauth_credential.return_value = None
         handler = _handler_with_registry(registry)
+        registry.snapshot_for_request.side_effect = None
+        registry.snapshot_for_request.return_value = _fake_snapshot('codex', backend)
         handler.headers = {'x-api-key': 'secret'}
         handler._validate_content_type = MagicMock()
         handler._read_body = MagicMock(return_value=b'{}')
@@ -354,6 +494,34 @@ class TestRoutingLogs:
             handler._handle_count_tokens()
 
         assert 'operation=count_tokens backend=codex' in caplog.text
+
+    def test_count_tokens_routes_bearer_with_oauth_credentials(self):
+        credential = SimpleNamespace(generation=3)
+        backend = MagicMock()
+        backend.count_tokens.return_value = {'input_tokens': 1}
+        snapshot = _fake_snapshot('oauth', backend)
+        snapshot.credentials = credential
+        registry = MagicMock()
+        registry.observe_oauth_credential.return_value = credential
+        handler = _handler_with_registry(registry)
+        registry.snapshot_for_request.side_effect = None
+        registry.snapshot_for_request.return_value = snapshot
+        handler.headers = {'Authorization': 'Bearer enterprise-secret'}
+        handler._validate_content_type = MagicMock()
+        handler._read_body = MagicMock(return_value=b'{}')
+        handler._parse_json = MagicMock(return_value={'model': 'sonnet', 'messages': []})
+
+        handler._handle_count_tokens()
+
+        registry.observe_oauth_credential.assert_called_once_with('enterprise-secret')
+        registry.snapshot_for_request.assert_called_once_with(
+            None, prefer_backend=None, oauth_credential=credential,
+        )
+        backend.count_tokens.assert_called_once_with(
+            {'model': 'sonnet', 'messages': []},
+            {'oauth': credential},
+            snapshot.config,
+        )
 
     def test_cache_logs_bedrock_backend_without_leaking_secret(self, caplog):
         backend = MagicMock()
@@ -1898,6 +2066,12 @@ def _disconnect_handler(payload, *, stream, backend_result):
         backend.send_message.return_value = backend_result
     registry = MagicMock()
     registry.snapshot.return_value = _fake_snapshot('anthropic', backend)
+    registry.snapshot_for_request.side_effect = (
+        lambda *args, **kwargs: registry.snapshot(
+            args[0] if args else None,
+            prefer_backend=kwargs.get('prefer_backend'),
+        )
+    )
     registry.session_routed_tier.return_value = None
     handler = object.__new__(ProxyRequestHandler)
     handler.registry = registry
@@ -1986,6 +2160,12 @@ class TestClientDisconnect:
         backend.send_message_stream.return_value = real_backend_gen()
         registry = MagicMock()
         registry.snapshot.return_value = _fake_snapshot('anthropic', backend)
+        registry.snapshot_for_request.side_effect = (
+            lambda *args, **kwargs: registry.snapshot(
+                args[0] if args else None,
+                prefer_backend=kwargs.get('prefer_backend'),
+            )
+        )
         registry.session_routed_tier.return_value = None
 
         handler = object.__new__(ProxyRequestHandler)
@@ -2281,6 +2461,12 @@ class TestStatsFailureRecording:
             _fake_snapshot('anthropic', backend, session_pinned=False),
             _fake_snapshot('bedrock', second_backend, session_pinned=False),
         ]
+        registry.snapshot_for_request.side_effect = (
+            lambda *args, **kwargs: registry.snapshot(
+                args[0] if args else None,
+                prefer_backend=kwargs.get('prefer_backend'),
+            )
+        )
         selector = MagicMock()
         selector.is_paused.return_value = False
         selector.on_rate_limited.return_value = 'bedrock'
