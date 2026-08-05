@@ -45,6 +45,48 @@ def test_send_message_reuses_anthropic_mapper(monkeypatch):
     assert request.kwargs['headers']['Authorization'] == 'Bearer enterprise-secret'
 
 
+def test_send_message_attaches_retry_after_on_429(monkeypatch):
+    response = MagicMock()
+    response.status = 429
+    response.read.return_value = json.dumps(
+        {'error': {'type': 'rate_limit_error', 'message': 'slow down'}}
+    ).encode()
+    response.getheader.side_effect = lambda name, default='': (
+        {'Retry-After': '12'}.get(name, default)
+    )
+    connection = MagicMock()
+    connection.getresponse.return_value = response
+    monkeypatch.setattr('anthproxy.oauth.backend._make_connection', lambda: connection)
+    backend = OAuthBackend()
+
+    with pytest.raises(AnthropicRequestError) as excinfo:
+        backend.send_message(
+            {'model': 'haiku', 'messages': [{'role': 'user', 'content': 'hi'}]},
+            {'oauth': OAuthRequestCredentials(1, 'enterprise-secret')},
+            Config(),
+        )
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after == 12.0
+
+
+def test_count_tokens_falls_back_to_estimate_on_failure(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AnthropicRequestError('upstream down', error_type='api_error', status_code=502)
+
+    monkeypatch.setattr('anthproxy.oauth.backend._send', boom)
+    backend = OAuthBackend()
+
+    result = backend.count_tokens(
+        {'model': 'haiku', 'messages': [{'role': 'user', 'content': 'hello there'}]},
+        {'oauth': OAuthRequestCredentials(1, 'enterprise-secret')},
+        Config(),
+    )
+
+    assert isinstance(result['input_tokens'], int)
+    assert result['model'].startswith('claude-haiku')
+
+
 def test_model_aliases_match_anthropic():
     from anthproxy import model_config
 

@@ -22,17 +22,21 @@ from .._shared.http_util import (
 from ..config import Config
 from ..mapper import AnthropicRequestError, estimate_input_tokens, strip_all_thinking_blocks
 from .auth import force_refresh, get_access
-from .mapper import _build_body, _merge_betas, _resolve_model
+from .mapper import (
+    ANTHROPIC_HOST,
+    ANTHROPIC_VERSION,
+    CLAUDE_CLI_VERSION,  # noqa: F401
+    COUNT_TOKENS_PATH,
+    MESSAGES_PATH,
+    USER_AGENT,
+    _build_body,
+    _merge_betas,
+    _resolve_model,
+)
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_HOST = 'api.anthropic.com'
-MESSAGES_PATH = '/v1/messages?beta=true'
-COUNT_TOKENS_PATH = '/v1/messages/count_tokens?beta=true'
 USAGE_PATH = '/api/oauth/usage'
-ANTHROPIC_VERSION = '2023-06-01'
-CLAUDE_CLI_VERSION = '2.1.88'
-USER_AGENT = f'claude-cli/{CLAUDE_CLI_VERSION} (external, cli)'
 USAGE_TIMEOUT_SECONDS = 5
 
 def _make_connection() -> http.client.HTTPSConnection:
@@ -144,16 +148,6 @@ def _send_with_retries(payload: dict, config, lock: threading.Lock, stream: bool
         _handle_error_response(resp.status, resp_body)
 
     raise AnthropicRequestError('Anthropic request failed', error_type='api_error', status_code=502)
-
-
-def _usage_shape(value):
-    if isinstance(value, dict):
-        return {key: _usage_shape(child) for key, child in value.items()}
-    if isinstance(value, list):
-        return {'type': 'array', 'items': _usage_shape(value[0]) if value else None}
-    if value is None:
-        return 'null'
-    return type(value).__name__
 
 
 def fetch_oauth_usage(access_token: str) -> dict:

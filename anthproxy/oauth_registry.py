@@ -115,7 +115,7 @@ class OAuthTokenRegistry:
                 and wall < state.monthly_blocked_until
             )
             fingerprint = state.fingerprint
-        burn, usage_valid, cap_reached = _usage_burn(usage, wall)
+        burn, usage_valid, cap_reached = _usage_burn(usage)
         monthly_blocked = monthly_blocked or (
             cap_reached and usage_month == (wall.year, wall.month)
         )
@@ -143,7 +143,7 @@ class OAuthTokenRegistry:
     def record_probe_success(self, generation: int, usage: dict, health_ok: bool) -> bool:
         now = self._monotonic()
         wall = self._utcnow()
-        _burn, _valid, cap_reached = _usage_burn(usage, wall)
+        _burn, _valid, cap_reached = _usage_burn(usage)
         with self._lock:
             state = self._states.get(generation)
             if state is None:
@@ -228,7 +228,13 @@ def _next_month(now: dt.datetime) -> dt.datetime:
     return dt.datetime(now.year, now.month + 1, 1, tzinfo=dt.timezone.utc)
 
 
-def _usage_burn(usage: dict | None, now: dt.datetime) -> tuple[float | None, bool, bool]:
+def _usage_burn(usage: dict | None) -> tuple[float | None, bool, bool]:
+    # ``burn`` is the raw percent of the monthly quota consumed (0-100), the
+    # same "how full is this quota window" measure the selector already uses
+    # for personal weekly utilization.  Keeping both sides on the raw-percent
+    # scale is what makes the oauth-vs-personal comparison in
+    # ``snapshot_for_request`` meaningful; a pace-projected rate would not be
+    # comparable to the personal side's raw snapshot.
     if not isinstance(usage, dict):
         return None, False, False
     extra = usage.get('extra_usage')
@@ -243,10 +249,5 @@ def _usage_burn(usage: dict | None, now: dt.datetime) -> tuple[float | None, boo
     enabled = extra.get('is_enabled') is True
     cap_reached = extra.get('spend_limit_reached') is True or utilization >= 100.0
     valid = enabled and monthly_limit > 0 and used_credits >= 0 and utilization >= 0
-    month_start = dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
-    month_end = _next_month(now)
-    elapsed = (now - month_start).total_seconds()
-    duration = (month_end - month_start).total_seconds()
-    elapsed_fraction = max(elapsed / duration, 1 / duration)
-    burn = utilization / elapsed_fraction if valid else None
+    burn = utilization if valid else None
     return burn, valid, cap_reached

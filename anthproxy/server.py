@@ -4,7 +4,13 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from http.server import ThreadingHTTPServer
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .oauth_registry import OAuthRequestCredentials
+    from .selector import PersonalCandidate
 
 from .backends_registry import (  # noqa: F401
     BackendDiscoveryError,
@@ -53,7 +59,7 @@ class BackendSnapshot:
     config: Config
     session_pinned: bool = False
     session_subscription: bool = False
-    credentials: object | None = None
+    credentials: 'OAuthRequestCredentials | None' = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -222,15 +228,22 @@ class BackendRegistry:
         self._subscription_resolver = None
         self._personal_candidates_resolver = None
 
-    def set_personal_candidates_resolver(self, resolver) -> None:
+    def set_personal_candidates_resolver(
+        self, resolver: 'Callable[[], tuple[PersonalCandidate, ...]]',
+    ) -> None:
         self._personal_candidates_resolver = resolver
 
-    def observe_oauth_credential(self, access_token: str):
+    def observe_oauth_credential(
+        self, access_token: str,
+    ) -> 'OAuthRequestCredentials | None':
         if self._oauth_registry is None:
             return None
         return self._oauth_registry.observe(access_token)
 
-    def mark_oauth_cooldown(self, credential, retry_after: float | None = None) -> bool:
+    def mark_oauth_cooldown(
+        self, credential: 'OAuthRequestCredentials | None',
+        retry_after: float | None = None,
+    ) -> bool:
         if self._oauth_registry is None or credential is None:
             return False
         return self._oauth_registry.mark_cooldown(credential.generation, retry_after)
@@ -239,7 +252,7 @@ class BackendRegistry:
         self,
         session_key: str | None = None,
         prefer_backend: str | None = None,
-        oauth_credential=None,
+        oauth_credential: 'OAuthRequestCredentials | None' = None,
     ) -> BackendSnapshot:
         with self._state_lock:
             override = self._session_overrides.get(session_key) if session_key is not None else None

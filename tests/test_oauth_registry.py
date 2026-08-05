@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from anthproxy.oauth_registry import OAuthTokenRegistry
+from anthproxy.oauth_registry import _MAX_TOKENS, OAuthTokenRegistry
 
 
 class _Clock:
@@ -45,7 +45,7 @@ def test_new_token_is_redacted_and_ineligible_until_probed():
     assert wakeups == [True]
 
 
-def test_tick_records_usage_health_and_calendar_month_burn():
+def test_tick_records_usage_health_and_raw_utilization_burn():
     clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
     registry = OAuthTokenRegistry(
         usage_probe=lambda token: _usage(25.0),
@@ -58,10 +58,30 @@ def test_tick_records_usage_health_and_calendar_month_burn():
     registry.tick()
     snapshot = registry.snapshot()
 
-    elapsed = 15 / 31
+    # burn is the raw monthly utilization percent, independent of how far into
+    # the month it is, so it stays comparable to personal weekly utilization.
     assert snapshot.eligible is True
-    assert snapshot.burn == pytest.approx(25.0 / elapsed)
+    assert snapshot.burn == pytest.approx(25.0)
     assert registry.credentials(credential.generation) == credential
+
+
+def test_burn_is_independent_of_day_of_month():
+    # Regression: burn must not be inflated early in the month.  A projected
+    # end-of-month rate made a lightly-used token look "full" on day 1 and
+    # systematically excluded it from routing against personal weekly burn.
+    def burn_on(day: int) -> float:
+        clock = _Clock(dt.datetime(2026, 8, day, tzinfo=dt.timezone.utc))
+        registry = OAuthTokenRegistry(
+            usage_probe=lambda token: _usage(10.0),
+            monotonic=clock.mono,
+            utcnow=clock.now,
+        )
+        registry.observe('secret-token')
+        registry.tick()
+        return registry.snapshot().burn
+
+    assert burn_on(1) == pytest.approx(10.0)
+    assert burn_on(28) == pytest.approx(10.0)
 
 
 def test_tokens_keep_isolated_probe_state():
@@ -173,3 +193,113 @@ def test_probe_failure_is_generation_safe_and_requests_health_retry():
     snapshot = registry.snapshot()
     assert snapshot.health_ok is False
     assert snapshot.eligible is False
+
+
+def test_usage_stage_failure_clears_cached_usage():
+    registry = OAuthTokenRegistry()
+    credential = registry.observe('secret')
+    registry.record_probe_success(credential.generation, _usage(), health_ok=True)
+    assert registry.snapshot(credential.generation).eligible is True
+
+    assert registry.record_probe_failure(credential.generation, 'usage') is True
+    snapshot = registry.snapshot(credential.generation)
+    assert snapshot.usage is None
+    assert snapshot.usage_age_seconds is None
+    assert snapshot.eligible is False
+
+
+def test_observe_evicts_oldest_beyond_max_tokens():
+    registry = OAuthTokenRegistry()
+    first = registry.observe('token-0')
+    for index in range(1, _MAX_TOKENS + 1):
+        registry.observe(f'token-{index}')
+
+    # The oldest token is evicted once capacity is exceeded; its generation
+    # no longer resolves and re-observing mints a fresh generation.
+    assert registry.credentials(first.generation) is None
+    reobserved = registry.observe('token-0')
+    assert reobserved.generation != first.generation
+
+
+def test_observe_reobservation_keeps_token_from_eviction():
+    registry = OAuthTokenRegistry()
+    first = registry.observe('token-0')
+    for index in range(1, _MAX_TOKENS):
+        registry.observe(f'token-{index}')
+
+    # Re-observing moves token-0 to most-recent, so the next insert evicts
+    # token-1 (now oldest) instead of token-0.
+    assert registry.observe('token-0') == first
+    second_gen = registry.credentials(first.generation + 1)  # token-1
+    registry.observe('token-new')
+
+    assert registry.credentials(first.generation) == first
+    assert second_gen is not None
+    assert registry.credentials(first.generation + 1) is None
+
+
+def test_mark_cooldown_defaults_and_extends_monotonically():
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    registry = OAuthTokenRegistry(monotonic=clock.mono, utcnow=clock.now)
+    credential = registry.observe('secret')
+
+    assert registry.mark_cooldown(999) is False  # unknown generation
+
+    assert registry.mark_cooldown(credential.generation) is True  # default 300s
+    assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(300.0)
+
+    # A shorter cooldown must not shorten the existing longer one.
+    registry.mark_cooldown(credential.generation, 10)
+    assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(300.0)
+
+    # A negative retry_after is floored at zero (no negative extension).
+    clock.monotonic += 300
+    registry.mark_cooldown(credential.generation, -5)
+    assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(0.0)
+
+
+def test_set_wake_registers_callback_for_observe():
+    registry = OAuthTokenRegistry()
+    wakeups = []
+    registry.set_wake(lambda: wakeups.append(True))
+
+    registry.observe('secret')
+
+    assert wakeups == [True]
+
+
+def test_tick_force_reprobes_before_ttl():
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    calls = []
+    registry = OAuthTokenRegistry(
+        usage_probe=lambda token: calls.append(token) or _usage(),
+        monotonic=clock.mono,
+        utcnow=clock.now,
+    )
+    registry.observe('secret')
+
+    registry.tick()
+    registry.tick()  # within TTL: no re-probe
+    assert calls == ['secret']
+
+    registry.tick(force=True)  # force ignores TTL
+    assert calls == ['secret', 'secret']
+
+
+def test_tick_background_probes_on_worker_threads():
+    ran_off_main = []
+    main_thread = threading.current_thread()
+    done = threading.Event()
+
+    def probe(token):
+        ran_off_main.append(threading.current_thread() is not main_thread)
+        done.set()
+        return _usage()
+
+    registry = OAuthTokenRegistry(usage_probe=probe)
+    registry.observe('secret')
+
+    registry.tick(background=True)
+
+    assert done.wait(timeout=1)
+    assert ran_off_main == [True]

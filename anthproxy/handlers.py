@@ -26,6 +26,11 @@ from .model_router import route_model as _route_model
 from .request_text import _WRAPPER_TAGS, last_transcript_user_turn as _last_transcript_user_turn
 from .request_text import strip_reminders as _strip_reminders_shared
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .oauth_registry import OAuthRequestCredentials
+
 logger = logging.getLogger(__name__)
 
 # Client-side socket teardown — the client (e.g. Claude Code) cancelled an
@@ -653,7 +658,7 @@ class PreparedRequest:
     prompt_capture: dict
 
 
-def _oauth_credential(handler):
+def _oauth_credential(handler) -> 'OAuthRequestCredentials | None':
     authorization = handler.headers.get('Authorization', '')
     scheme, separator, token = authorization.partition(' ')
     if separator and scheme.lower() == 'bearer' and token.strip():

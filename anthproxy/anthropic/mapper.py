@@ -8,7 +8,17 @@ from ..mapper import strip_codex_thinking_blocks as _strip_codex_thinking_blocks
 logger = logging.getLogger(__name__)
 
 REQUIRED_BETAS = ('claude-code-20250219', 'oauth-2025-04-20')
-_CLAUDE_CLI_VERSION = '2.1.88'
+
+# Anthropic wire-protocol constants.  These live in the mapper (which owns
+# protocol shaping) so any backend speaking the Anthropic protocol — the
+# personal `anthropic` backend and the enterprise `oauth` backend — can import
+# them without depending on a sibling backend module.
+ANTHROPIC_HOST = 'api.anthropic.com'
+ANTHROPIC_VERSION = '2023-06-01'
+MESSAGES_PATH = '/v1/messages?beta=true'
+COUNT_TOKENS_PATH = '/v1/messages/count_tokens?beta=true'
+CLAUDE_CLI_VERSION = '2.1.222'
+USER_AGENT = f'claude-cli/{CLAUDE_CLI_VERSION} (external, cli)'
 _CC_SYSTEM_PREFIX = 'You are Claude Code, Anthropic\'s official CLI for Claude.'
 MAX_CACHE_CONTROL_BLOCKS = 4
 def resolve_model(model: str) -> str:

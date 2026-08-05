@@ -17,14 +17,16 @@ from .._shared.http_util import (
     read_sse_lines,
     should_retry,
 )
-from ..anthropic.backend import (
+from ..anthropic.mapper import (
     ANTHROPIC_HOST,
     ANTHROPIC_VERSION,
     COUNT_TOKENS_PATH,
     MESSAGES_PATH,
     USER_AGENT,
+    build_body,
+    merge_betas,
+    resolve_model,
 )
-from ..anthropic.mapper import build_body, merge_betas, resolve_model
 from ..config import Config
 from ..mapper import AnthropicRequestError, estimate_input_tokens
 from ..oauth_registry import OAuthRequestCredentials
@@ -60,7 +62,9 @@ def _credential(credentials: dict) -> OAuthRequestCredentials:
     return selected
 
 
-def _send(payload: dict, credentials: dict, stream: bool, path: str = MESSAGES_PATH):
+def _send(
+    payload: dict, credentials: dict, stream: bool, path: str = MESSAGES_PATH,
+) -> tuple[http.client.HTTPSConnection, http.client.HTTPResponse]:
     selected = _credential(credentials)
     body = build_body(payload)
     headers = _request_headers(selected.access_token, merge_betas(payload), stream)
