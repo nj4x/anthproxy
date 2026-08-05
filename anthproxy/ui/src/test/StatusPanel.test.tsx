@@ -10,7 +10,10 @@ import { api } from '../api/client';
 import { StatusPanel } from '../components/StatusPanel';
 import type { StatusResponse } from '../api/types';
 
-function statusWithUsage(subscription_usage: StatusResponse['subscription_usage']): StatusResponse {
+function statusWithUsage(
+  subscription_usage: StatusResponse['subscription_usage'],
+  overrides: Partial<StatusResponse> = {},
+): StatusResponse {
   return {
     active_backend: 'anthropic',
     routing_enabled: false,
@@ -21,6 +24,7 @@ function statusWithUsage(subscription_usage: StatusResponse['subscription_usage'
     backends: [],
     session_overrides: [],
     subscription_usage,
+    ...overrides,
   };
 }
 
@@ -142,5 +146,88 @@ describe('StatusPanel usage meters', () => {
       (element) => element.getAttribute('style')?.includes('left:'),
     );
     expect(greenHead).toBeUndefined();
+  });
+});
+
+describe('StatusPanel enterprise token card', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('renders an eligible enterprise token card with quota burn', async () => {
+    renderStatus(statusWithUsage({}, {
+      enterprise_token: {
+        present: true,
+        eligible: true,
+        burn_pct: 42,
+        cooldown_remaining_seconds: 0,
+        monthly_blocked: false,
+        usage_age_seconds: 10,
+        usage_stale: false,
+      },
+    }));
+
+    await screen.findByText('Enterprise token');
+    expect(screen.getByText('Eligible')).toBeInTheDocument();
+    expect(screen.getByText('42% used')).toBeInTheDocument();
+  });
+
+  it('shows the spend-cap state when monthly_blocked', async () => {
+    renderStatus(statusWithUsage({}, {
+      enterprise_token: {
+        present: true,
+        eligible: false,
+        burn_pct: 100,
+        cooldown_remaining_seconds: 0,
+        monthly_blocked: true,
+        usage_age_seconds: 5,
+        usage_stale: false,
+      },
+    }));
+
+    await screen.findByText('Enterprise token');
+    expect(screen.getByText('Spend cap reached')).toBeInTheDocument();
+  });
+
+  it('omits the card when no token has been observed', async () => {
+    renderStatus(statusWithUsage({
+      anthropic: {
+        five_hour: { used_tokens: null, limit_tokens: null, pct: 10, reset_at: null, reset_in_secs: 3600, window_hours: 5 },
+      },
+    }, {
+      enterprise_token: {
+        present: false,
+        eligible: false,
+        burn_pct: null,
+        cooldown_remaining_seconds: 0,
+        monthly_blocked: false,
+        usage_age_seconds: null,
+        usage_stale: false,
+      },
+    }));
+
+    await screen.findByText('5-hour window');
+    expect(screen.queryByText('Enterprise token')).not.toBeInTheDocument();
+  });
+});
+
+describe('StatusPanel backend labels', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('renders the oauth backend as "Enterprise"', async () => {
+    renderStatus(statusWithUsage({}, {
+      active_backend: 'oauth',
+      backends: [
+        { name: 'oauth', active: true, available: true },
+        { name: 'anthropic', active: false, available: true },
+      ],
+    }));
+
+    await screen.findByText('Enterprise');
+    expect(screen.queryByText('oauth')).not.toBeInTheDocument();
   });
 });

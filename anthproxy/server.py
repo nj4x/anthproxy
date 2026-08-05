@@ -800,6 +800,28 @@ class BackendRegistry:
                 }
         return result
 
+    def oauth_token_status(self) -> dict | None:
+        """Return the enterprise OAuth token health as a JSON-serialisable dict.
+
+        Reads the latest-generation snapshot from the OAuth token registry — no
+        network I/O.  Returns ``None`` when no OAuth registry is configured.
+        ``present`` is ``False`` until a token has been observed in this process
+        lifetime (generation 0), in which case the remaining fields carry the
+        default snapshot values.
+        """
+        if self._oauth_registry is None:
+            return None
+        snap = self._oauth_registry.snapshot()
+        return {
+            'present': snap.generation > 0,
+            'eligible': snap.eligible,
+            'burn_pct': snap.burn,
+            'cooldown_remaining_seconds': snap.cooldown_remaining_seconds,
+            'monthly_blocked': snap.monthly_blocked,
+            'usage_age_seconds': snap.usage_age_seconds,
+            'usage_stale': snap.usage_stale,
+        }
+
     def usage_snapshot(self) -> dict:
         """Return cached subscription usage without making network calls.
 

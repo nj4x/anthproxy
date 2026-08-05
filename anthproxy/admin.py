@@ -465,6 +465,7 @@ def _get_status(registry, db, *, selector=None) -> tuple[int, dict]:
         'backends': _build_backends_list(status),
         'session_overrides': session_overrides,
         'subscription_usage': subscription_usage,
+        'enterprise_token': registry.oauth_token_status(),
         'auto_selection': selector.status_line() if selector is not None else None,
     }
 

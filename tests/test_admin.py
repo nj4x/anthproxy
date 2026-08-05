@@ -38,6 +38,7 @@ def _make_registry(*, backend_names=None, active='bedrock', switch_result=None):
     registry.config = cfg
     registry.usage_snapshot.return_value = {}
     registry.cached_subscription_instances.return_value = {}
+    registry.oauth_token_status.return_value = None
     return registry
 
 
@@ -1513,6 +1514,29 @@ class TestGetStatus:
         db = _make_db()
         admin.handle_get('/admin/status', {}, registry, db)
         registry.usage_snapshot.assert_called_once()
+
+    def test_enterprise_token_from_registry(self):
+        registry = _make_registry()
+        db = _make_db()
+        registry.oauth_token_status.return_value = {
+            'present': True,
+            'eligible': True,
+            'burn_pct': 12.5,
+            'cooldown_remaining_seconds': 0.0,
+            'monthly_blocked': False,
+            'usage_age_seconds': 4.0,
+            'usage_stale': False,
+        }
+        _, body = admin.handle_get('/admin/status', {}, registry, db)
+        assert body['enterprise_token']['present'] is True
+        assert body['enterprise_token']['burn_pct'] == 12.5
+
+    def test_enterprise_token_none_when_no_registry(self):
+        registry = _make_registry()
+        db = _make_db()
+        registry.oauth_token_status.return_value = None
+        _, body = admin.handle_get('/admin/status', {}, registry, db)
+        assert body['enterprise_token'] is None
 
 
 class TestGetStatusSelector:

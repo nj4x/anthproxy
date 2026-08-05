@@ -2,6 +2,7 @@ import { Fragment, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { api } from '../api/client';
 import type { StatsResponse, StatsRow, BackendsResponse } from '../api/types';
+import { backendLabel } from '../utils';
 
 const PERIODS = [
   { label: 'Day', value: 'day' },
@@ -38,7 +39,7 @@ function DataRow({ row, bold }: { row: StatsRow; bold?: boolean }) {
     : 'hover:bg-gray-50';
   return (
     <tr className={cls}>
-      <td className="px-3 py-2 text-gray-700">{row.backend || '—'}</td>
+      <td className="px-3 py-2 text-gray-700">{row.backend ? backendLabel(row.backend) : '—'}</td>
       <td className="px-3 py-2 text-gray-700">{row.model_tier || '—'}</td>
       <td className="px-3 py-2 text-right text-gray-700">{row.requests.toLocaleString()}</td>
       <td className="px-3 py-2 text-right text-gray-700">{row.input_tokens.toLocaleString()}</td>
@@ -134,7 +135,7 @@ export default function Stats() {
           <option value="">All Backends</option>
           <option value="subscription">Subscription</option>
           {backendNames.map((name) => (
-            <option key={name} value={name}>{name}</option>
+            <option key={name} value={name}>{backendLabel(name)}</option>
           ))}
         </select>
       </div>

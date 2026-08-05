@@ -206,6 +206,16 @@ export interface BackendUsage {
   age_secs?: number | null;
 }
 
+export interface EnterpriseToken {
+  present: boolean;
+  eligible: boolean;
+  burn_pct: number | null;
+  cooldown_remaining_seconds: number;
+  monthly_blocked: boolean;
+  usage_age_seconds: number | null;
+  usage_stale: boolean;
+}
+
 export interface StatusResponse {
   active_backend: string;
   auto_selection?: string | null;
@@ -217,6 +227,7 @@ export interface StatusResponse {
   backends: BackendAvailability[];
   session_overrides: SessionOverride[];
   subscription_usage: Record<string, BackendUsage>;
+  enterprise_token?: EnterpriseToken | null;
 }
 
 // POST /admin/global/backend response

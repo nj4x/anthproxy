@@ -4,7 +4,7 @@ import useSWR from 'swr';
 import { api } from '../api/client';
 import type { SessionsResponse } from '../api/types';
 import { ExcerptHighlight } from '../components/ExcerptHighlight';
-import { parseSessionId } from '../utils';
+import { parseSessionId, backendLabel } from '../utils';
 
 const PAGE_SIZE = 20;
 
@@ -133,7 +133,7 @@ export default function Sessions() {
                           {s.net_savings_usd == null ? '—' : `$${s.net_savings_usd.toFixed(2)}`}
                         </td>
                         <td className="px-4 py-3 text-gray-600 text-xs">
-                          {s.pinned_backend ?? <span className="text-gray-400">auto</span>}
+                          {s.pinned_backend ? backendLabel(s.pinned_backend) : <span className="text-gray-400">auto</span>}
                         </td>
                         <td className="px-4 py-3 text-gray-600 text-xs">
                           {s.pinned_tier ?? <span className="text-gray-400">auto</span>}

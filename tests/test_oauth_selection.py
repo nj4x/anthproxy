@@ -217,6 +217,37 @@ def test_mark_oauth_cap_exhausted_logs_info(caplog):
     )
 
 
+def test_oauth_token_status_none_without_registry():
+    config = Config(backend='anthropic')
+    registry = BackendRegistry(config, _Backend('anthropic'))
+
+    assert registry.oauth_token_status() is None
+
+
+def test_oauth_token_status_absent_before_observation():
+    registry = _registry(OAuthTokenRegistry())
+
+    status = registry.oauth_token_status()
+
+    assert status['present'] is False
+    assert status['eligible'] is False
+    assert status['burn_pct'] is None
+
+
+def test_oauth_token_status_reports_eligible_fields():
+    oauth_registry, _ = _eligible_oauth(12.5)
+    registry = _registry(oauth_registry)
+
+    status = registry.oauth_token_status()
+
+    assert status['present'] is True
+    assert status['eligible'] is True
+    assert status['burn_pct'] == 12.5
+    assert status['monthly_blocked'] is False
+    assert status['usage_stale'] is False
+    assert status['cooldown_remaining_seconds'] == 0.0
+
+
 def _ineligible(**overrides):
     """Return an OAuthTokenSnapshot with eligible=False and specified fields."""
     defaults = dict(

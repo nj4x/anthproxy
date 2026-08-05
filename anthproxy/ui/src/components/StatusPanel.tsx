@@ -1,7 +1,8 @@
 import useSWR from 'swr';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
-import type { StatusResponse, UsageWindow, CreditsWindow } from '../api/types';
+import type { StatusResponse, UsageWindow, CreditsWindow, EnterpriseToken } from '../api/types';
+import { backendLabel } from '../utils';
 
 function formatAge(ageSecs: number | null | undefined): string | null {
   if (ageSecs == null) return null;
@@ -168,6 +169,51 @@ function CreditsSection({ credits: c }: { credits: CreditsWindow }) {
   );
 }
 
+function EnterpriseTokenCard({ token }: { token: EnterpriseToken }) {
+  const ageLabel = formatAge(token.usage_age_seconds);
+  const statusLabel =
+    token.monthly_blocked ? 'Spend cap reached' :
+    token.cooldown_remaining_seconds > 0 ? `Cooling down ${Math.ceil(token.cooldown_remaining_seconds)}s` :
+    token.eligible ? 'Eligible' :
+    'Not eligible';
+  const statusColor =
+    token.monthly_blocked ? 'bg-red-100 text-red-800' :
+    token.cooldown_remaining_seconds > 0 ? 'bg-amber-100 text-amber-800' :
+    token.eligible ? 'bg-green-100 text-green-800' :
+    'bg-gray-100 text-gray-600';
+  const burn = token.burn_pct;
+
+  return (
+    <div className="bg-gray-50 rounded-lg p-4 min-w-48 space-y-3">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-gray-700">Enterprise token</span>
+        {ageLabel != null && (
+          <span className="text-xs text-gray-400">updated {ageLabel}{token.usage_stale ? ' (stale)' : ''}</span>
+        )}
+      </div>
+      <div className="flex items-center gap-2">
+        <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${statusColor}`}>
+          {statusLabel}
+        </span>
+      </div>
+      <div>
+        <div className="text-xs text-gray-500 mb-1">Monthly quota</div>
+        <div className="text-sm text-gray-700">
+          {burn != null ? `${burn.toFixed(0)}% used` : '—'}
+        </div>
+        {burn != null && (
+          <div className="mt-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all ${burn >= 100 ? 'bg-red-500' : burn >= 80 ? 'bg-amber-500' : 'bg-blue-500'}`}
+              style={{ width: `${Math.min(burn, 100)}%` }}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function StatusPanel() {
   const { data, error } = useSWR<StatusResponse>(
     'status',
@@ -190,7 +236,7 @@ export function StatusPanel() {
       <div className="px-5 py-3 flex flex-wrap items-center gap-3">
         <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Active Backend</span>
         <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-indigo-100 text-indigo-800">
-          {data.active_backend}
+          {backendLabel(data.active_backend)}
         </span>
         <div className="flex flex-wrap gap-2">
           {data.backends.filter(b => b.name !== data.active_backend).map((b) => {
@@ -200,7 +246,7 @@ export function StatusPanel() {
               'bg-gray-100 text-gray-600';
             return (
               <span key={b.name} className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}`}>
-                {b.available === null ? `${b.name} (Unknown)` : b.name}
+                {b.available === null ? `${backendLabel(b.name)} (Unknown)` : backendLabel(b.name)}
               </span>
             );
           })}
@@ -260,7 +306,7 @@ export function StatusPanel() {
                         {label}
                       </Link>
                     </td>
-                    <td className="py-1 text-gray-600">{o.pinned_backend ?? '—'}</td>
+                    <td className="py-1 text-gray-600">{o.pinned_backend ? backendLabel(o.pinned_backend) : '—'}</td>
                     <td className="py-1 text-gray-600">{o.pinned_tier ?? '—'}</td>
                   </tr>
                 );
@@ -271,10 +317,13 @@ export function StatusPanel() {
       )}
 
       {/* Subscription usage */}
-      {Object.keys(data.subscription_usage).length > 0 && (
+      {(Object.keys(data.subscription_usage).length > 0 || data.enterprise_token?.present) && (
         <div className="px-5 py-4">
           <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-3">Subscription Usage</div>
           <div className="flex flex-wrap gap-4">
+            {data.enterprise_token?.present && (
+              <EnterpriseTokenCard token={data.enterprise_token} />
+            )}
             {Object.entries(data.subscription_usage).map(([name, usage]) => {
               const ageLabel = formatAge(usage.age_secs);
               return (

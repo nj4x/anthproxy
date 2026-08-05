@@ -5,7 +5,7 @@ import { api } from '../api/client';
 import type { SessionDetail as SessionDetailType, TraceResponse, RequestRecord, BackendsResponse } from '../api/types';
 import { RequestDetailDrawer } from '../components/RequestDetailDrawer';
 import { ExcerptHighlight } from '../components/ExcerptHighlight';
-import { parseSessionId, parseConversationAnchor } from '../utils';
+import { parseSessionId, parseConversationAnchor, backendLabel } from '../utils';
 
 const TIERS = ['haiku', 'sonnet', 'opus', 'fable'];
 const TRACE_PAGE_SIZE = 100;
@@ -197,7 +197,7 @@ export default function SessionDetail() {
             >
               <option value="">Auto</option>
               {backendNames.map((name) => (
-                <option key={name} value={name}>{name}</option>
+                <option key={name} value={name}>{backendLabel(name)}</option>
               ))}
             </select>
             <button
@@ -358,7 +358,7 @@ export default function SessionDetail() {
                     <td className="px-3 py-2 text-right text-gray-600">
                       {r.duration_ms != null ? r.duration_ms.toLocaleString() : '—'}
                     </td>
-                    <td className="px-3 py-2 text-gray-600">{r.backend}</td>
+                    <td className="px-3 py-2 text-gray-600">{backendLabel(r.backend)}</td>
                     <td className="px-3 py-2 text-center text-gray-600">
                       {r.applied === 1 ? '✓' : '—'}
                     </td>
