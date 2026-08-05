@@ -81,7 +81,7 @@ def main():
             anthropic_auth.ensure_credentials(config)
 
     backend = build_backend(config.backend, config)
-    from .anthropic.backend import fetch_oauth_usage
+    from ._shared.oauth_usage import fetch_oauth_usage
     from .oauth_registry import OAuthTokenRegistry
 
     oauth_registry = OAuthTokenRegistry(usage_probe=fetch_oauth_usage)

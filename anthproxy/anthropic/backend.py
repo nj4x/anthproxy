@@ -34,10 +34,9 @@ from .mapper import (
     _resolve_model,
 )
 
-logger = logging.getLogger(__name__)
+from .._shared.oauth_usage import fetch_oauth_usage, USAGE_PATH, USAGE_TIMEOUT_SECONDS  # noqa: F401
 
-USAGE_PATH = '/api/oauth/usage'
-USAGE_TIMEOUT_SECONDS = 5
+logger = logging.getLogger(__name__)
 
 def _make_connection() -> http.client.HTTPSConnection:
     return _make_connection_shared(ANTHROPIC_HOST)
@@ -148,34 +147,6 @@ def _send_with_retries(payload: dict, config, lock: threading.Lock, stream: bool
         _handle_error_response(resp.status, resp_body)
 
     raise AnthropicRequestError('Anthropic request failed', error_type='api_error', status_code=502)
-
-
-def fetch_oauth_usage(access_token: str) -> dict:
-    conn = http.client.HTTPSConnection(ANTHROPIC_HOST, timeout=USAGE_TIMEOUT_SECONDS)
-    try:
-        conn.request('GET', USAGE_PATH, headers={
-            'Authorization': f'Bearer {access_token}',
-            'anthropic-version': ANTHROPIC_VERSION,
-            'anthropic-beta': 'oauth-2025-04-20',
-            'Accept': 'application/json',
-            'User-Agent': USER_AGENT,
-        })
-        resp = conn.getresponse()
-        body = resp.read()
-        status = resp.status
-    finally:
-        conn.close()
-
-    if status == 200:
-        try:
-            return json.loads(body)
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise ValueError(f'Unrecognized usage response from Anthropic: {exc}') from exc
-    if status == 429:
-        raise UsageRateLimitError(retry_after=_parse_retry_after(resp))
-    if status in (401, 403):
-        raise RuntimeError('Authentication failed for usage endpoint')
-    raise RuntimeError(f'Anthropic usage endpoint returned HTTP {status}')
 
 
 def _fetch_usage(config, lock: threading.Lock) -> dict:

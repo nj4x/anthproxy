@@ -17,12 +17,14 @@ from .._shared.http_util import (
     read_sse_lines,
     should_retry,
 )
-from ..anthropic.mapper import (
+from ..mapper.anthropic_protocol import (
     ANTHROPIC_HOST,
     ANTHROPIC_VERSION,
     COUNT_TOKENS_PATH,
     MESSAGES_PATH,
     USER_AGENT,
+)
+from ..anthropic.mapper import (
     build_body,
     merge_betas,
     resolve_model,
