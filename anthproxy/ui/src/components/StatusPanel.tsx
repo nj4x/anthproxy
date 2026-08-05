@@ -201,6 +201,11 @@ function EnterpriseTokenCard({ token }: { token: EnterpriseToken }) {
         <div className="text-sm text-gray-700">
           {burn != null ? `${burn.toFixed(0)}% used` : '—'}
         </div>
+        {token.used_usd != null && token.total_usd != null && (
+          <div className="text-xs text-gray-500 mt-0.5">
+            ${token.used_usd.toFixed(2)} of ${token.total_usd.toFixed(2)}
+          </div>
+        )}
         {burn != null && (
           <div className="mt-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
             <div

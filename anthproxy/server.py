@@ -812,10 +812,21 @@ class BackendRegistry:
         if self._oauth_registry is None:
             return None
         snap = self._oauth_registry.snapshot()
+        extra = (snap.usage or {}).get('extra_usage') or {}
+        try:
+            used_usd = float(extra['used_credits'])
+        except (KeyError, TypeError, ValueError):
+            used_usd = None
+        try:
+            total_usd = float(extra['monthly_limit'])
+        except (KeyError, TypeError, ValueError):
+            total_usd = None
         return {
             'present': snap.generation > 0,
             'eligible': snap.eligible,
             'burn_pct': snap.burn,
+            'used_usd': used_usd,
+            'total_usd': total_usd,
             'cooldown_remaining_seconds': snap.cooldown_remaining_seconds,
             'monthly_blocked': snap.monthly_blocked,
             'usage_age_seconds': snap.usage_age_seconds,

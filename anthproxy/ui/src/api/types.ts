@@ -210,6 +210,8 @@ export interface EnterpriseToken {
   present: boolean;
   eligible: boolean;
   burn_pct: number | null;
+  used_usd: number | null;
+  total_usd: number | null;
   cooldown_remaining_seconds: number;
   monthly_blocked: boolean;
   usage_age_seconds: number | null;
