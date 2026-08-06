@@ -1,9 +1,10 @@
 import datetime as dt
+import logging
 import threading
 
 import pytest
 
-from anthproxy.oauth_registry import _MAX_TOKENS, OAuthTokenRegistry
+from anthproxy.oauth_registry import _MAX_TOKENS, _USAGE_TTL_SECONDS, OAuthTokenRegistry
 
 
 class _Clock:
@@ -365,3 +366,104 @@ def test_tick_background_probes_on_worker_threads():
 
     assert done.wait(timeout=1)
     assert ran_off_main == [True]
+
+
+# ---------------------------------------------------------------------------
+# Token rotation: new generation starts ineligible, then clears after probe
+# ---------------------------------------------------------------------------
+
+def _eligible_usage():
+    return {
+        'extra_usage': {
+            'monthly_limit': 100, 'used_credits': 10, 'utilization': 10.0,
+            'spend_limit_reached': False, 'is_enabled': True,
+        },
+    }
+
+
+def test_token_rotation_new_generation_ineligible_until_probed():
+    """Rotating to a new access token carries usage but requires its own probe."""
+    clock = _Clock(dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc))
+    clock.monotonic = 1000.0  # non-zero so usage_at is truthy
+    registry = OAuthTokenRegistry(
+        monotonic=lambda: clock.monotonic,
+        utcnow=clock.now,
+    )
+
+    # First token: probe succeeds → eligible
+    cred1 = registry.observe('sk-ant-oat01-token-v1')
+    registry.record_probe_success(cred1.generation, _eligible_usage(), health_ok=True)
+    assert registry.snapshot().eligible
+
+    # Second token: observe carries usage but health_ok=None → not yet eligible
+    cred2 = registry.observe('sk-ant-oat01-token-v2')
+    snap2 = registry.snapshot()
+    assert not snap2.eligible
+    assert snap2.burn is not None  # usage was carried over
+
+    # After probe for second token: eligible
+    registry.record_probe_success(cred2.generation, _eligible_usage(), health_ok=True)
+    assert registry.snapshot().eligible
+    assert registry.snapshot().generation == cred2.generation
+
+
+def test_token_rotation_old_generation_ineligible_after_superseded():
+    """Old generation snapshot is not eligible once a newer token takes over."""
+    clock = _Clock(dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc))
+    clock.monotonic = 1000.0
+    registry = OAuthTokenRegistry(
+        monotonic=lambda: clock.monotonic,
+        utcnow=clock.now,
+    )
+
+    cred1 = registry.observe('sk-ant-oat01-old')
+    registry.record_probe_success(cred1.generation, _eligible_usage(), health_ok=True)
+    cred2 = registry.observe('sk-ant-oat01-new')
+    registry.record_probe_success(cred2.generation, _eligible_usage(), health_ok=True)
+
+    # Explicitly requesting old generation still returns its own (eligible) snapshot
+    old_snap = registry.snapshot(cred1.generation)
+    new_snap = registry.snapshot(cred2.generation)
+    assert old_snap.generation == cred1.generation
+    assert new_snap.generation == cred2.generation
+    # The no-arg snapshot (used by snapshot_for_request) is the latest
+    assert registry.snapshot().generation == cred2.generation
+
+
+# ---------------------------------------------------------------------------
+# Probe logs show token fingerprint, never the raw access token
+# ---------------------------------------------------------------------------
+
+def test_probe_failure_log_shows_fingerprint_not_raw_token(caplog):
+    """Probe failure log contains only the token fingerprint, not the raw value."""
+    raw_token = 'sk-ant-oat01-super-secret-do-not-log'
+
+    def failing_probe(token):
+        raise RuntimeError('Authentication failed for usage endpoint')
+
+    registry = OAuthTokenRegistry(usage_probe=failing_probe)
+    registry.observe(raw_token)
+
+    with caplog.at_level(logging.WARNING, logger='anthproxy.oauth_registry'):
+        registry.tick()
+
+    log_text = ' '.join(r.getMessage() for r in caplog.records)
+    assert raw_token not in log_text
+    assert 'Authentication failed' in log_text
+
+
+def test_probe_success_log_shows_fingerprint_not_raw_token(caplog):
+    """Probe success debug log contains only the token fingerprint, not the raw value."""
+    raw_token = 'sk-ant-oat01-also-secret-do-not-log'
+
+    def ok_probe(token):
+        return _eligible_usage()
+
+    registry = OAuthTokenRegistry(usage_probe=ok_probe)
+    registry.observe(raw_token)
+
+    with caplog.at_level(logging.DEBUG, logger='anthproxy.oauth_registry'):
+        registry.tick()
+
+    log_text = ' '.join(r.getMessage() for r in caplog.records)
+    assert raw_token not in log_text

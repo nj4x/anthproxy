@@ -1,7 +1,11 @@
+import datetime as dt
+import json
 import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from anthproxy.config import Config
 from anthproxy.oauth_registry import OAuthTokenRegistry, OAuthTokenSnapshot
@@ -361,3 +365,192 @@ def test_request_snapshot_path_does_not_call_health_or_usage_network():
     registry.snapshot_for_request(oauth_credential=credential)
 
     backend.five_hour_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# First-request routing while OAuth probe is in flight
+# ---------------------------------------------------------------------------
+
+def test_first_request_routes_personal_while_oauth_probing():
+    """Token observed but probe not yet complete → routes to personal."""
+    oauth_registry = OAuthTokenRegistry()
+    credential = oauth_registry.observe('sk-ant-oat01-fresh-token')
+    registry = _registry(oauth_registry)
+
+    snapshot = registry.snapshot_for_request(oauth_credential=credential)
+
+    assert snapshot.name == 'anthropic'
+    assert snapshot.credentials is None
+
+
+# ---------------------------------------------------------------------------
+# Stale / disabled / prior-month usage excluded from routing
+# ---------------------------------------------------------------------------
+
+def test_stale_usage_excludes_oauth_from_routing():
+    """usage_age > TTL → ineligible → routes to personal."""
+    clock = [1000.0]
+    oauth_registry = OAuthTokenRegistry(monotonic=lambda: clock[0])
+    credential = oauth_registry.observe('sk-ant-oat01-stale-token')
+    oauth_registry.record_probe_success(credential.generation, {
+        'extra_usage': {
+            'monthly_limit': 100, 'used_credits': 5, 'utilization': 5.0,
+            'spend_limit_reached': False, 'is_enabled': True,
+        },
+    }, health_ok=True)
+    clock[0] = 1000.0 + 301.0  # advance past 300s TTL
+    registry = _registry(oauth_registry)
+
+    snapshot = registry.snapshot_for_request(oauth_credential=credential)
+
+    assert snapshot.name == 'anthropic'
+
+
+def test_disabled_usage_excludes_oauth_from_routing():
+    """is_enabled=False → usage_valid=False → ineligible → routes to personal."""
+    oauth_registry = OAuthTokenRegistry()
+    credential = oauth_registry.observe('sk-ant-oat01-disabled')
+    oauth_registry.record_probe_success(credential.generation, {
+        'extra_usage': {
+            'monthly_limit': 100, 'used_credits': 10, 'utilization': 10.0,
+            'spend_limit_reached': False, 'is_enabled': False,
+        },
+    }, health_ok=True)
+    registry = _registry(oauth_registry)
+
+    snapshot = registry.snapshot_for_request(oauth_credential=credential)
+
+    assert snapshot.name == 'anthropic'
+
+
+def test_prior_month_usage_excludes_oauth_from_routing():
+    """usage_month != current month → ineligible despite fresh probe age."""
+    walls = [dt.datetime(2026, 7, 15, tzinfo=dt.timezone.utc)]
+    oauth_registry = OAuthTokenRegistry(utcnow=lambda: walls[0])
+    credential = oauth_registry.observe('sk-ant-oat01-old-month')
+    oauth_registry.record_probe_success(credential.generation, {
+        'extra_usage': {
+            'monthly_limit': 100, 'used_credits': 10, 'utilization': 10.0,
+            'spend_limit_reached': False, 'is_enabled': True,
+        },
+    }, health_ok=True)
+    walls[0] = dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)  # month flipped
+    registry = _registry(oauth_registry)
+
+    snapshot = registry.snapshot_for_request(oauth_credential=credential)
+
+    assert snapshot.name == 'anthropic'
+
+
+# ---------------------------------------------------------------------------
+# No personal candidates → 100% fallback burn → oauth wins
+# ---------------------------------------------------------------------------
+
+def test_no_personal_candidates_defaults_100pct_burn_oauth_wins():
+    """When personal_candidates is empty, personal_burn defaults to 100% and oauth wins."""
+    oauth_registry, credential = _eligible_oauth(50.0)
+    config = Config(backend='anthropic')
+    registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
+    registry._instances['oauth'] = _Backend('oauth')
+    registry.set_personal_candidates_resolver(lambda: ())  # all exhausted
+
+    snapshot = registry.snapshot_for_request(oauth_credential=credential)
+
+    assert snapshot.name == 'oauth'
+    assert snapshot.credentials == credential
+
+
+# ---------------------------------------------------------------------------
+# prefer_backend bypasses OAuth economics
+# ---------------------------------------------------------------------------
+
+def test_prefer_backend_bypasses_oauth_economics():
+    """prefer_backend routes to the explicit backend even when oauth would win."""
+    oauth_registry, credential = _eligible_oauth(0.01)  # very low burn
+    registry = _registry(oauth_registry)
+
+    snapshot = registry.snapshot_for_request(
+        prefer_backend='anthropic', oauth_credential=credential,
+    )
+
+    assert snapshot.name == 'anthropic'
+    assert snapshot.credentials is None
+
+
+# ---------------------------------------------------------------------------
+# No raw token in admin status or logs
+# ---------------------------------------------------------------------------
+
+def test_oauth_token_status_does_not_expose_raw_token():
+    """Admin status never includes the access_token value."""
+    raw_token = 'sk-ant-oat01-super-secret-token-xyz'
+    oauth_registry, _ = _eligible_oauth(10.0)
+    # Patch the observed token to use the sentinel raw value
+    oauth_registry2 = OAuthTokenRegistry()
+    credential = oauth_registry2.observe(raw_token)
+    oauth_registry2.record_probe_success(credential.generation, {
+        'extra_usage': {
+            'monthly_limit': 100, 'used_credits': 10, 'utilization': 10.0,
+            'spend_limit_reached': False, 'is_enabled': True,
+        },
+    }, health_ok=True)
+    config = Config(backend='anthropic')
+    br = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry2)
+
+    status = br.oauth_token_status()
+    status_str = json.dumps(status)
+
+    assert raw_token not in status_str
+    assert 'access_token' not in status
+
+
+def test_no_raw_token_in_selection_log(caplog):
+    """OAuth selection log never includes the raw access token."""
+    raw_token = 'sk-ant-oat01-do-not-log-this'
+    oauth_registry = OAuthTokenRegistry()
+    credential = oauth_registry.observe(raw_token)
+    oauth_registry.record_probe_success(credential.generation, {
+        'extra_usage': {
+            'monthly_limit': 100, 'used_credits': 1, 'utilization': 1.0,
+            'spend_limit_reached': False, 'is_enabled': True,
+        },
+    }, health_ok=True)
+    config = Config(backend='anthropic')
+    registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
+    registry._instances['oauth'] = _Backend('oauth')
+    registry.set_personal_candidates_resolver(
+        lambda: (SimpleNamespace(name='anthropic', burn=40.0),)
+    )
+
+    with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
+        registry.snapshot_for_request(oauth_credential=credential)
+
+    log_text = ' '.join(r.getMessage() for r in caplog.records)
+    assert raw_token not in log_text
+
+
+# ---------------------------------------------------------------------------
+# Dollar scaling: used_credits / monthly_limit use decimal_places
+# ---------------------------------------------------------------------------
+
+def test_oauth_token_status_dollar_amounts_scaled_by_decimal_places():
+    """used_credits and monthly_limit are divided by 10^decimal_places for USD display."""
+    oauth_registry = OAuthTokenRegistry()
+    credential = oauth_registry.observe('sk-ant-oat01-enterprise')
+    oauth_registry.record_probe_success(credential.generation, {
+        'extra_usage': {
+            'monthly_limit': 46600,
+            'used_credits': 6886,
+            'utilization': 14.77,
+            'spend_limit_reached': False,
+            'is_enabled': True,
+            'decimal_places': 2,
+        },
+    }, health_ok=True)
+    config = Config(backend='anthropic')
+    registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
+
+    status = registry.oauth_token_status()
+
+    assert status['used_usd'] == pytest.approx(68.86)
+    assert status['total_usd'] == pytest.approx(466.0)
