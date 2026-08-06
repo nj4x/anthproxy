@@ -8,11 +8,14 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 
+from ._shared import UsageRateLimitError
+
 
 logger = logging.getLogger(__name__)
 
 _USAGE_TTL_SECONDS = 300.0
 _DEFAULT_COOLDOWN_SECONDS = 300.0
+_MIN_PROBE_COOLDOWN_SECONDS = 60.0
 _MAX_TOKENS = 64
 
 
@@ -237,6 +240,7 @@ class OAuthTokenRegistry:
                 if (
                     not state.probing
                     and (force or due)
+                    and now >= state.cooldown_until
                     and self._usage_probe is not None
                 ):
                     state.probing = True
@@ -257,6 +261,16 @@ class OAuthTokenRegistry:
         fp = hashlib.sha256(credential.access_token.encode()).hexdigest()[:16]
         try:
             usage = self._usage_probe(credential.access_token)
+        except UsageRateLimitError as exc:
+            cooldown = exc.retry_after if exc.retry_after is not None else _DEFAULT_COOLDOWN_SECONDS
+            cooldown = max(cooldown, _MIN_PROBE_COOLDOWN_SECONDS)
+            logger.info(
+                'OAuth enterprise usage probe throttled (stage=usage, token=%s): %s; backing off %.0fs',
+                fp, exc, cooldown,
+            )
+            self.mark_cooldown(credential.generation, cooldown)
+            self.record_probe_failure(credential.generation, 'usage')
+            return
         except Exception as exc:
             logger.warning(
                 'OAuth enterprise usage probe failed (stage=usage, token=%s): %s: %s',
