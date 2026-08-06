@@ -206,14 +206,35 @@ function EnterpriseTokenCard({ token }: { token: EnterpriseToken }) {
             ${token.used_usd.toFixed(2)} of ${token.total_usd.toFixed(2)}
           </div>
         )}
-        {burn != null && (
-          <div className="mt-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all ${burn >= 100 ? 'bg-red-500' : burn >= 80 ? 'bg-amber-500' : 'bg-blue-500'}`}
-              style={{ width: `${Math.min(burn, 100)}%` }}
-            />
-          </div>
-        )}
+        {burn != null && (() => {
+          const pct = Math.min(burn, 100);
+          const barColor = burn >= 100 ? 'bg-red-500' : burn >= 80 ? 'bg-amber-500' : 'bg-blue-500';
+          // Pace reference for the calendar-month quota: fraction of the month
+          // already elapsed. No backend reset timestamp exists, so derive it
+          // client-side. Red head = burning ahead of pace; green = below.
+          const now = new Date();
+          const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+          const monthElapsedPct = ((now.getDate() - 1) / daysInMonth) * 100;
+          const hasRedHead = pct > monthElapsedPct;
+          const hasGreenHead = monthElapsedPct - pct > 0.5;
+          return (
+            <div className="mt-1 h-1.5 bg-gray-200 rounded-full overflow-hidden relative">
+              <div className={`absolute inset-y-0 left-0 ${barColor} transition-all`} style={{ width: `${pct}%` }} />
+              {hasRedHead && (
+                <div
+                  className="absolute inset-y-0 bg-red-500"
+                  style={{ left: `${monthElapsedPct}%`, width: `${pct - monthElapsedPct}%` }}
+                />
+              )}
+              {hasGreenHead && (
+                <div
+                  className="absolute inset-y-0 bg-green-500 opacity-40"
+                  style={{ left: `${pct}%`, width: `${monthElapsedPct - pct}%` }}
+                />
+              )}
+            </div>
+          );
+        })()}
       </div>
     </div>
   );
