@@ -95,6 +95,8 @@ class Config:
     auto_backend_mode: str = 'subscription'
     auto_backend_interval: float = 60.0
     auto_backend_weekly_margin: float = 5.0
+    auto_backend_pace_delta: str = 'on'
+    auto_backend_oauth_pace_deadband_pp: float = 3.0
     auto_model_routing: bool = False
     auto_model_routing_classifier_model: str = 'haiku'
     auto_model_routing_long_context_threshold: int = 150_000
@@ -210,6 +212,23 @@ def parse_args(argv=None) -> Config:
                         ' at least this far below the current active backend before the selector'
                         ' switches away from a healthy available incumbent, preventing flapping'
                         ' (default: 5, env: ANTHPROXY_AUTO_BACKEND_WEEKLY_MARGIN)')
+    p.add_argument('--auto-backend-pace-delta', dest='auto_backend_pace_delta',
+                   default=os.environ.get('ANTHPROXY_AUTO_BACKEND_PACE_DELTA', 'on'),
+                   choices=['on', 'off'],
+                   help='Rank backends by pace delta (burn%% minus elapsed%% of the quota'
+                        ' window) instead of raw burn%%, so a backend ahead of calendar/'
+                        ' time-to-reset pace loses to one behind pace regardless of window'
+                        ' length. "off" reverts to the prior raw-%% comparison'
+                        ' (default: on, env: ANTHPROXY_AUTO_BACKEND_PACE_DELTA)')
+    p.add_argument('--auto-backend-oauth-pace-deadband-pp',
+                   dest='auto_backend_oauth_pace_deadband_pp', type=float,
+                   default=float(os.environ.get(
+                       'ANTHPROXY_AUTO_BACKEND_OAUTH_PACE_DEADBAND_PP', '3')),
+                   help='Dead-band in percentage points for the enterprise-vs-personal'
+                        ' pace-delta gate: enterprise wins only when its pace delta is more'
+                        ' than this far below the personal representative, preventing flapping'
+                        ' when deltas cross (default: 3, env:'
+                        ' ANTHPROXY_AUTO_BACKEND_OAUTH_PACE_DEADBAND_PP)')
     p.add_argument('--auto-model-routing', dest='auto_model_routing',
                    action=argparse.BooleanOptionalAction,
                    default=_env_bool('ANTHPROXY_AUTO_MODEL_ROUTING', False),

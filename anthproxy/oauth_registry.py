@@ -1,3 +1,4 @@
+import calendar
 import dataclasses
 import datetime as dt
 import hashlib
@@ -33,6 +34,7 @@ class OAuthTokenSnapshot:
     burn: float | None = None
     eligible: bool = False
     usage_stale: bool = False
+    month_elapsed_pct: float = 0.0
 
 
 @dataclasses.dataclass
@@ -136,6 +138,7 @@ class OAuthTokenRegistry:
             cap_reached and usage_month == (wall.year, wall.month)
         )
         usage_stale = age is not None and age > _USAGE_TTL_SECONDS
+        month_elapsed_pct = _month_elapsed_pct(wall)
         eligible = (
             age is not None
             and age <= _USAGE_TTL_SECONDS
@@ -156,6 +159,7 @@ class OAuthTokenRegistry:
             burn=burn,
             eligible=eligible,
             usage_stale=usage_stale,
+            month_elapsed_pct=month_elapsed_pct,
         )
 
     def record_probe_success(self, generation: int, usage: dict, health_ok: bool) -> bool:
@@ -282,6 +286,17 @@ class OAuthTokenRegistry:
             fp, valid, burn, health_ok,
         )
         self.record_probe_success(credential.generation, usage, health_ok=health_ok)
+
+
+def _month_elapsed_pct(now: dt.datetime) -> float:
+    """Fraction of the current UTC month already elapsed by calendar day, 0–100.
+
+    Matches the real spend-cap reset boundary (UTC month rollover).  ``day`` is
+    1-based, so day 1 yields 0.0 and the last day yields ``(n-1)/n × 100``; the
+    result is in ``[0, ~96.8]`` by construction, needing no clamp.
+    """
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+    return (now.day - 1) / days_in_month * 100.0
 
 
 def _next_month(now: dt.datetime) -> dt.datetime:

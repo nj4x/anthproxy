@@ -227,25 +227,47 @@ def _usage_failure_markdown(message: str) -> str:
 _WEEKLY_KEYS = ('seven_day', 'seven_day_sonnet', 'seven_day_opus')
 
 
-def _max_weekly_utilization(usage: dict) -> float | None:
-    """Highest utilization across all weekly windows present in the payload.
+_WEEKLY_WINDOW_HOURS = 168.0
+
+
+def _parse_iso_ts(value) -> float | None:
+    """Parse an ISO 8601 reset timestamp to a POSIX float, or None."""
+    if not value:
+        return None
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _max_weekly_window(usage: dict) -> tuple[float | None, float | None]:
+    """Return ``(max_utilization, resets_at)`` across the weekly windows.
 
     Anthropic exposes up to three weekly windows (overall, Sonnet, Opus). The
     binding weekly constraint is whichever is closest to its cap, so the
-    selector should react to the max. Returns None when no window has a
-    numeric utilization.
+    selector reacts to the max. ``resets_at`` is the POSIX reset timestamp of
+    that same max window (so reset always pairs with the burn it paces); None
+    when that window lacks a parseable ``resets_at``. Returns ``(None, None)``
+    when no window has a numeric utilization.
     """
-    values = []
+    best_util: float | None = None
+    best_resets_at: float | None = None
     for key in _WEEKLY_KEYS:
         window = usage.get(key)
-        if isinstance(window, dict):
-            util = window.get('utilization')
-            if util is not None:
-                try:
-                    values.append(float(util))
-                except (TypeError, ValueError):
-                    pass
-    return max(values) if values else None
+        if not isinstance(window, dict):
+            continue
+        util = window.get('utilization')
+        if util is None:
+            continue
+        try:
+            util_val = float(util)
+        except (TypeError, ValueError):
+            continue
+        if best_util is None or util_val > best_util:
+            best_util = util_val
+            best_resets_at = _parse_iso_ts(window.get('resets_at'))
+    return best_util, best_resets_at
 
 
 class AnthropicBackend(SubscriptionBackend, Backend):
@@ -281,28 +303,26 @@ class AnthropicBackend(SubscriptionBackend, Backend):
             return FiveHourStatus(available=None, resets_at=None)
 
         utilization = window.get('utilization')
-        resets_at_str = window.get('resets_at')
+        resets_at = _parse_iso_ts(window.get('resets_at'))
 
-        resets_at: float | None = None
-        if resets_at_str:
-            try:
-                import datetime as _dt
-                dt = _dt.datetime.fromisoformat(resets_at_str.replace('Z', '+00:00'))
-                resets_at = dt.timestamp()
-            except Exception:
-                pass
-
-        weekly_utilization = _max_weekly_utilization(usage) if isinstance(usage, dict) else None
+        weekly_utilization, weekly_resets_at = _max_weekly_window(usage)
+        weekly_window_hours = (
+            _WEEKLY_WINDOW_HOURS if weekly_utilization is not None else None
+        )
 
         try:
             pct = float(utilization)
             available = pct < 100.0
         except (TypeError, ValueError):
             return FiveHourStatus(available=None, resets_at=resets_at,
-                                  weekly_utilization=weekly_utilization)
+                                  weekly_utilization=weekly_utilization,
+                                  weekly_resets_at=weekly_resets_at,
+                                  weekly_window_hours=weekly_window_hours)
 
         return FiveHourStatus(available=available, resets_at=resets_at,
-                              utilization=pct, weekly_utilization=weekly_utilization)
+                              utilization=pct, weekly_utilization=weekly_utilization,
+                              weekly_resets_at=weekly_resets_at,
+                              weekly_window_hours=weekly_window_hours)
 
     def parse_credentials(self, api_key: str) -> dict:
         return {}

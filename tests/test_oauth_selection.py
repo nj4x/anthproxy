@@ -10,7 +10,7 @@ import pytest
 from anthproxy.config import Config
 from anthproxy.handlers import ProxyRequestHandler, prepare_routing
 from anthproxy.oauth_registry import OAuthTokenRegistry, OAuthTokenSnapshot
-from anthproxy.selector import AutoSelector
+from anthproxy.selector import AutoSelector, PersonalCandidate
 from anthproxy.server import BackendRegistry, _oauth_decision_reason
 
 
@@ -61,11 +61,11 @@ def test_personal_candidates_treat_stale_usage_as_neutral_burn():
 
 
 def _registry(oauth_registry):
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
     registry._instances['oauth'] = _Backend('oauth')
     registry.set_personal_candidates_resolver(
-        lambda: (SimpleNamespace(name='anthropic', burn=40.0),)
+        lambda: (PersonalCandidate(name='anthropic', burn=40.0),)
     )
     return registry
 
@@ -100,7 +100,7 @@ def test_snapshot_for_request_tie_favors_personal():
     registry = _registry(oauth_registry)
     oauth_burn = oauth_registry.snapshot().burn
     registry.set_personal_candidates_resolver(
-        lambda: (SimpleNamespace(name='anthropic', burn=oauth_burn),)
+        lambda: (PersonalCandidate(name='anthropic', burn=oauth_burn),)
     )
 
     snapshot = registry.snapshot_for_request(oauth_credential=credential)
@@ -154,7 +154,7 @@ def test_snapshot_logs_personal_choice_at_debug_with_tie_reason(caplog):
     registry = _registry(oauth_registry)
     oauth_burn = oauth_registry.snapshot().burn
     registry.set_personal_candidates_resolver(
-        lambda: (SimpleNamespace(name='anthropic', burn=oauth_burn),)
+        lambda: (PersonalCandidate(name='anthropic', burn=oauth_burn),)
     )
 
     with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
@@ -223,7 +223,7 @@ def test_mark_oauth_cap_exhausted_logs_info(caplog):
 
 
 def test_oauth_token_status_none_without_registry():
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     registry = BackendRegistry(config, _Backend('anthropic'))
 
     assert registry.oauth_token_status() is None
@@ -450,7 +450,7 @@ def test_prior_month_usage_excludes_oauth_from_routing():
 def test_no_personal_candidates_defaults_100pct_burn_oauth_wins():
     """When personal_candidates is empty, personal_burn defaults to 100% and oauth wins."""
     oauth_registry, credential = _eligible_oauth(50.0)
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
     registry._instances['oauth'] = _Backend('oauth')
     registry.set_personal_candidates_resolver(lambda: ())  # all exhausted
@@ -495,7 +495,7 @@ def test_oauth_token_status_does_not_expose_raw_token():
             'spend_limit_reached': False, 'is_enabled': True,
         },
     }, health_ok=True)
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     br = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry2)
 
     status = br.oauth_token_status()
@@ -516,11 +516,11 @@ def test_no_raw_token_in_selection_log(caplog):
             'spend_limit_reached': False, 'is_enabled': True,
         },
     }, health_ok=True)
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
     registry._instances['oauth'] = _Backend('oauth')
     registry.set_personal_candidates_resolver(
-        lambda: (SimpleNamespace(name='anthropic', burn=40.0),)
+        lambda: (PersonalCandidate(name='anthropic', burn=40.0),)
     )
 
     with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
@@ -548,7 +548,7 @@ def test_oauth_token_status_dollar_amounts_scaled_by_decimal_places():
             'decimal_places': 2,
         },
     }, health_ok=True)
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     registry = BackendRegistry(config, _Backend('anthropic'), oauth_registry=oauth_registry)
 
     status = registry.oauth_token_status()
@@ -576,11 +576,11 @@ class _PersonalBackend:
 
 
 def _integration_registry(oauth_registry, personal_burn):
-    config = Config(backend='anthropic')
+    config = Config(backend='anthropic', auto_backend_pace_delta='off')
     registry = BackendRegistry(config, _PersonalBackend(), oauth_registry=oauth_registry)
     registry._instances['oauth'] = _Backend('oauth')
     registry.set_personal_candidates_resolver(
-        lambda: (SimpleNamespace(name='anthropic', burn=personal_burn),)
+        lambda: (PersonalCandidate(name='anthropic', burn=personal_burn),)
     )
     return registry
 

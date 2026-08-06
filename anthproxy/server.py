@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from .oauth_registry import OAuthRequestCredentials
     from .selector import PersonalCandidate
 
+from .selector import _pace_enabled
+
 from .backends_registry import (  # noqa: F401
     BackendDiscoveryError,
     backend_names,
@@ -30,18 +32,30 @@ logger = logging.getLogger(__name__)
 # as fully exhausted (100%) so any eligible OAuth candidate with real headroom wins.
 _UNKNOWN_PERSONAL_BURN = 100.0
 
+# Neutral elapsed% used in pace-delta computation when the window elapsed is
+# unknown (transient fetch gap, OpenRouter, unknown-window candidate).
+_NEUTRAL_ELAPSED = 50.0
 
-def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn):
+
+def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn,
+                           pace_on=False, oauth_delta=None, personal_delta=None):
     """Explain why enterprise (oauth) was or was not chosen over personal.
 
     ``oauth`` is an ``OAuthTokenSnapshot`` (or None when the request carried no
     tracked enterprise token).  ``oauth_wins`` is the final comparison result.
+    When ``pace_on`` the win/lose messages reference pace deltas
+    (``burn − elapsed``); otherwise they reference raw burn%.
     """
     if oauth_credential is None:
         return 'no enterprise token on request'
     if oauth is None:
         return 'enterprise token not tracked'
     if oauth_wins:
+        if pace_on:
+            return (
+                f'enterprise pace delta {oauth_delta:.1f}pp below '
+                f'personal {personal_delta:.1f}pp'
+            )
         return (
             f'enterprise weekly {oauth.burn:.1f}% below '
             f'personal {personal_burn:.1f}%'
@@ -68,6 +82,11 @@ def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn):
         return 'enterprise usage from a prior month'
     if oauth.burn is None:
         return 'enterprise usage reading unavailable'
+    if pace_on:
+        return (
+            f'personal pace delta {personal_delta:.1f}pp at or below '
+            f'enterprise {oauth_delta:.1f}pp (dead-band applied)'
+        )
     return (
         f'personal weekly {personal_burn:.1f}% at or below '
         f'enterprise {oauth.burn:.1f}%'
@@ -364,14 +383,20 @@ class BackendRegistry:
             tuple(self._personal_candidates_resolver())
             if self._personal_candidates_resolver is not None else ()
         )
-        personal = min(candidates, key=lambda candidate: candidate.burn, default=None)
+        # The resolver already returns candidates ordered by the active ranking
+        # (min pace delta with pace on, min raw burn with pace off), so the
+        # representative is the first — a lower-delta candidate is never
+        # eliminated before the OAuth comparison.
+        personal = candidates[0] if candidates else None
         if personal is None:
             base = self.snapshot(session_key)
             personal_name = base.name
             personal_burn = _UNKNOWN_PERSONAL_BURN
+            personal_elapsed = None
         else:
             personal_name = personal.name
             personal_burn = personal.burn
+            personal_elapsed = personal.weekly_elapsed_pct
 
         oauth = (
             self._oauth_registry.snapshot(oauth_credential.generation)
@@ -379,18 +404,40 @@ class BackendRegistry:
             else None
         )
         oauth_valid = oauth is not None and oauth.eligible
-        oauth_wins = (
-            oauth_valid
-            and oauth.burn is not None
-            and oauth.burn < personal_burn
-            and not math.isclose(oauth.burn, personal_burn, rel_tol=1e-6)
-        )
+        pace_on = _pace_enabled(self._config)
+        oauth_delta = None
+        personal_delta = None
+        if not pace_on:
+            oauth_wins = (
+                oauth_valid
+                and oauth.burn is not None
+                and oauth.burn < personal_burn
+                and not math.isclose(oauth.burn, personal_burn, rel_tol=1e-6)
+            )
+        else:
+            deadband = getattr(
+                self._config, 'auto_backend_oauth_pace_deadband_pp', 3.0,
+            )
+            personal_elapsed_val = (
+                personal_elapsed if personal_elapsed is not None else _NEUTRAL_ELAPSED
+            )
+            personal_delta = personal_burn - personal_elapsed_val
+            if oauth_valid and oauth.burn is not None:
+                oauth_delta = oauth.burn - oauth.month_elapsed_pct
+            # Strict '<' with the dead-band: equality (or within the band) keeps
+            # the incumbent personal backend.
+            oauth_wins = (
+                oauth_delta is not None
+                and oauth_delta < personal_delta - deadband
+            )
         _log_oauth_selection(
             session_key, oauth_credential, oauth,
             personal_name, personal_burn,
             chosen='oauth' if oauth_wins else personal_name,
             reason=_oauth_decision_reason(
                 oauth_credential, oauth, oauth_wins, personal_burn,
+                pace_on=pace_on, oauth_delta=oauth_delta,
+                personal_delta=personal_delta,
             ),
         )
         if oauth_wins:
