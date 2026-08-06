@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from anthproxy.config import Config
+from anthproxy.handlers import ProxyRequestHandler, prepare_routing
 from anthproxy.oauth_registry import OAuthTokenRegistry, OAuthTokenSnapshot
 from anthproxy.selector import AutoSelector
 from anthproxy.server import BackendRegistry, _oauth_decision_reason
@@ -554,3 +555,103 @@ def test_oauth_token_status_dollar_amounts_scaled_by_decimal_places():
 
     assert status['used_usd'] == pytest.approx(68.86)
     assert status['total_usd'] == pytest.approx(466.0)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: real OAuthTokenRegistry + real BackendRegistry driven through
+# handlers.prepare_routing().  The per-layer tests above exercise either the
+# registry decision (snapshot_for_request, real registry) or the handler wiring
+# (prepare_routing, mocked registry); these join both in one flow so the seam
+# between them is covered — a Bearer header is observed by the real registry,
+# its probed usage drives the real routing decision, and the resulting
+# credentials reach the handler's PreparedRequest.  Classifier routing is
+# bypassed (_no_classifier) to isolate credential selection.
+# ---------------------------------------------------------------------------
+
+class _PersonalBackend:
+    name = 'anthropic'
+
+    def parse_credentials(self, api_key):
+        return {'api_key': api_key}
+
+
+def _integration_registry(oauth_registry, personal_burn):
+    config = Config(backend='anthropic')
+    registry = BackendRegistry(config, _PersonalBackend(), oauth_registry=oauth_registry)
+    registry._instances['oauth'] = _Backend('oauth')
+    registry.set_personal_candidates_resolver(
+        lambda: (SimpleNamespace(name='anthropic', burn=personal_burn),)
+    )
+    return registry
+
+
+def _integration_handler(registry, headers):
+    handler = object.__new__(ProxyRequestHandler)
+    handler.registry = registry
+    handler.config = registry._config
+    handler.session_db = None
+    handler.headers = headers
+    handler._prefer_backend = None
+    handler._no_classifier = True
+    handler._extract_prompt_capture = lambda payload, routing=None: {}
+    handler._log_tag = lambda: 'test'
+    return handler
+
+
+def test_prepare_routing_selects_enterprise_when_oauth_has_lower_burn():
+    oauth_registry, _credential = _eligible_oauth(1.0)
+    registry = _integration_registry(oauth_registry, personal_burn=40.0)
+    handler = _integration_handler(registry, {
+        'Authorization': 'Bearer enterprise',
+        'x-api-key': 'personal-key',
+    })
+
+    prepared = prepare_routing(handler, {'model': 'haiku', 'messages': []}, None)
+
+    assert prepared.snapshot.name == 'oauth'
+    assert 'oauth' in prepared.credentials
+    assert prepared.credentials['oauth'].access_token == 'enterprise'
+    # Personal x-api-key must never be parsed when enterprise wins.
+    assert 'api_key' not in prepared.credentials
+
+
+def test_prepare_routing_falls_back_to_personal_when_oauth_ties():
+    # Tie favours personal: oauth burn == personal burn.
+    oauth_registry, _credential = _eligible_oauth(20.0)
+    oauth_burn = oauth_registry.snapshot().burn
+    registry = _integration_registry(oauth_registry, personal_burn=oauth_burn)
+    handler = _integration_handler(registry, {
+        'Authorization': 'Bearer enterprise',
+        'x-api-key': 'personal-key',
+    })
+
+    prepared = prepare_routing(handler, {'model': 'haiku', 'messages': []}, None)
+
+    assert prepared.snapshot.name == 'anthropic'
+    assert prepared.credentials == {'api_key': 'personal-key'}
+
+
+def test_prepare_routing_falls_back_to_personal_when_oauth_in_cooldown():
+    oauth_registry, credential = _eligible_oauth(1.0)
+    oauth_registry.mark_cooldown(credential.generation, 300)
+    registry = _integration_registry(oauth_registry, personal_burn=40.0)
+    handler = _integration_handler(registry, {
+        'Authorization': 'Bearer enterprise',
+        'x-api-key': 'personal-key',
+    })
+
+    prepared = prepare_routing(handler, {'model': 'haiku', 'messages': []}, None)
+
+    assert prepared.snapshot.name == 'anthropic'
+    assert prepared.credentials == {'api_key': 'personal-key'}
+
+
+def test_prepare_routing_uses_personal_when_no_bearer_token():
+    oauth_registry, _credential = _eligible_oauth(1.0)
+    registry = _integration_registry(oauth_registry, personal_burn=40.0)
+    handler = _integration_handler(registry, {'x-api-key': 'personal-key'})
+
+    prepared = prepare_routing(handler, {'model': 'haiku', 'messages': []}, None)
+
+    assert prepared.snapshot.name == 'anthropic'
+    assert prepared.credentials == {'api_key': 'personal-key'}
