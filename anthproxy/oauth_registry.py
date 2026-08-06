@@ -88,13 +88,14 @@ class OAuthTokenRegistry:
             # is maintained across token rotation (one enterprise account, new
             # access_token on expiry).  The probe for the new token will refresh it;
             # snapshot() recomputes age and eligible from usage_at so TTL semantics
-            # are preserved automatically.
+            # are preserved automatically.  Do NOT carry over health_ok — the new
+            # token must prove its own validity via probe, else a revoked/wrongly-
+            # scoped token would be used anyway.
             prev_state = self._states.get(self._latest_generation)
             if prev_state is not None and prev_state.usage is not None:
                 state.usage = prev_state.usage
                 state.usage_at = prev_state.usage_at
                 state.usage_month = prev_state.usage_month
-                state.health_ok = prev_state.health_ok
             self._states[credential.generation] = state
             self._fingerprints[fingerprint] = credential.generation
             self._latest_generation = credential.generation
