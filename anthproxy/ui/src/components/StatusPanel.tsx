@@ -155,8 +155,13 @@ function CreditsSection({ credits: c }: { credits: CreditsWindow }) {
     <div>
       <div className="text-xs text-gray-500 mb-1">Credits</div>
       <div className="text-sm text-gray-700">
-        ${c.used_usd?.toFixed(2) ?? '—'} / ${c.total_usd?.toFixed(2) ?? '—'}
+        {c.pct != null ? `${c.pct.toFixed(0)}% used` : '—'}
       </div>
+      {c.used_usd != null && c.total_usd != null && (
+        <div className="text-xs text-gray-500 mt-0.5">
+          ${c.used_usd.toFixed(2)} of ${c.total_usd.toFixed(2)}
+        </div>
+      )}
       {c.total_usd != null && (
         <div className="mt-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
           <div
