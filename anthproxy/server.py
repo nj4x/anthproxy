@@ -814,11 +814,16 @@ class BackendRegistry:
         snap = self._oauth_registry.snapshot()
         extra = (snap.usage or {}).get('extra_usage') or {}
         try:
-            used_usd = float(extra['used_credits'])
+            dp = int(extra.get('decimal_places') or 2)
+            scale = 10 ** dp
+        except (TypeError, ValueError):
+            scale = 100
+        try:
+            used_usd = float(extra['used_credits']) / scale
         except (KeyError, TypeError, ValueError):
             used_usd = None
         try:
-            total_usd = float(extra['monthly_limit'])
+            total_usd = float(extra['monthly_limit']) / scale
         except (KeyError, TypeError, ValueError):
             total_usd = None
         return {

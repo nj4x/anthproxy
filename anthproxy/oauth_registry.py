@@ -1,11 +1,14 @@
 import dataclasses
 import datetime as dt
 import hashlib
+import logging
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 
+
+logger = logging.getLogger(__name__)
 
 _USAGE_TTL_SECONDS = 300.0
 _DEFAULT_COOLDOWN_SECONDS = 300.0
@@ -81,6 +84,17 @@ class OAuthTokenRegistry:
             self._generation += 1
             credential = OAuthRequestCredentials(self._generation, access_token)
             state = _TokenState(credential=credential, fingerprint=fingerprint)
+            # Carry over fresh usage from the previous latest token so eligibility
+            # is maintained across token rotation (one enterprise account, new
+            # access_token on expiry).  The probe for the new token will refresh it;
+            # snapshot() recomputes age and eligible from usage_at so TTL semantics
+            # are preserved automatically.
+            prev_state = self._states.get(self._latest_generation)
+            if prev_state is not None and prev_state.usage is not None:
+                state.usage = prev_state.usage
+                state.usage_at = prev_state.usage_at
+                state.usage_month = prev_state.usage_month
+                state.health_ok = prev_state.health_ok
             self._states[credential.generation] = state
             self._fingerprints[fingerprint] = credential.generation
             self._latest_generation = credential.generation
@@ -235,17 +249,31 @@ class OAuthTokenRegistry:
         return self.snapshot()
 
     def _probe(self, credential: OAuthRequestCredentials, health_due: bool) -> None:
+        fp = hashlib.sha256(credential.access_token.encode()).hexdigest()[:16]
         try:
             usage = self._usage_probe(credential.access_token)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                'OAuth enterprise usage probe failed (stage=usage, token=%s): %s: %s',
+                fp, type(exc).__name__, exc,
+            )
             self.record_probe_failure(credential.generation, 'usage')
             return
         if health_due and self._health_probe is not None:
             try:
                 self._health_probe(credential.access_token)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    'OAuth enterprise health probe failed (stage=health, token=%s): %s: %s',
+                    fp, type(exc).__name__, exc,
+                )
                 self.record_probe_failure(credential.generation, 'health')
                 return
+        burn, valid, _cap = _usage_burn(usage)
+        logger.debug(
+            'OAuth enterprise usage probe ok (token=%s): valid=%s burn=%s',
+            fp, valid, burn,
+        )
         self.record_probe_success(credential.generation, usage, health_ok=True)
 
 
