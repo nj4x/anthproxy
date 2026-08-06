@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 class UsageRateLimitError(RuntimeError):
     retry_after: float | None = None
 
+    def __str__(self) -> str:
+        if self.retry_after is None:
+            return 'no retry guidance'
+        return f'retry after {self.retry_after}s'
+
 
 @dataclasses.dataclass(frozen=True)
 class FiveHourStatus:
