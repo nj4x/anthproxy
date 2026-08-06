@@ -26,6 +26,10 @@ from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
 
+# Personal-burn stand-in when no personal candidate is resolvable: treat personal
+# as fully exhausted (100%) so any eligible OAuth candidate with real headroom wins.
+_UNKNOWN_PERSONAL_BURN = 100.0
+
 
 def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn):
     """Explain why enterprise (oauth) was or was not chosen over personal.
@@ -364,7 +368,7 @@ class BackendRegistry:
         if personal is None:
             base = self.snapshot(session_key)
             personal_name = base.name
-            personal_burn = 100.0
+            personal_burn = _UNKNOWN_PERSONAL_BURN
         else:
             personal_name = personal.name
             personal_burn = personal.burn

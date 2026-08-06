@@ -23,7 +23,7 @@ from anthproxy.anthropic.backend import (
     _max_weekly_utilization,
 )
 from anthproxy import model_config as _model_config
-from anthproxy.anthropic.mapper import (
+from anthproxy.mapper.anthropic_transform import (
     REQUIRED_BETAS,
     _CC_SYSTEM_PREFIX,
     _build_body,

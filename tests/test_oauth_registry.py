@@ -4,7 +4,12 @@ import threading
 
 import pytest
 
-from anthproxy.oauth_registry import _MAX_TOKENS, _USAGE_TTL_SECONDS, OAuthTokenRegistry
+from anthproxy.oauth_registry import (
+    _MAX_TOKENS,
+    _USAGE_TTL_SECONDS,
+    OAuthTokenRegistry,
+    _next_month,
+)
 
 
 class _Clock:
@@ -166,6 +171,11 @@ def test_monthly_cap_stays_blocked_until_next_utc_month():
     clock.wall = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
     assert registry.snapshot().eligible is False
     assert registry.snapshot().monthly_blocked is False
+
+
+def test_next_month_rolls_december_into_january_of_next_year():
+    result = _next_month(dt.datetime(2026, 12, 15, tzinfo=dt.timezone.utc))
+    assert result == dt.datetime(2027, 1, 1, tzinfo=dt.timezone.utc)
 
 
 def test_refresh_does_not_repeat_successful_health_probe():

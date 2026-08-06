@@ -570,7 +570,7 @@ class TestSentinel:
 
     def test_sentinel_not_forwarded_to_anthropic_mapper(self):
         """Anthropic mapper strips _anthproxy_internal_classifier before building body."""
-        from anthproxy.anthropic.mapper import _build_body
+        from anthproxy.mapper.anthropic_transform import _build_body
         payload = {
             '_anthproxy_internal_classifier': True,
             '_anthropic_beta': [],

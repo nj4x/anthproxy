@@ -22,7 +22,7 @@ from .._shared.http_util import (
 from ..config import Config
 from ..mapper import AnthropicRequestError, estimate_input_tokens, strip_all_thinking_blocks
 from .auth import force_refresh, get_access
-from .mapper import (
+from ..mapper.anthropic_transform import (
     ANTHROPIC_HOST,
     ANTHROPIC_VERSION,
     CLAUDE_CLI_VERSION,  # noqa: F401
