@@ -260,9 +260,11 @@ class OAuthTokenRegistry:
             )
             self.record_probe_failure(credential.generation, 'usage')
             return
+        health_ok = False
         if health_due and self._health_probe is not None:
             try:
                 self._health_probe(credential.access_token)
+                health_ok = True
             except Exception as exc:
                 logger.warning(
                     'OAuth enterprise health probe failed (stage=health, token=%s): %s: %s',
@@ -270,12 +272,16 @@ class OAuthTokenRegistry:
                 )
                 self.record_probe_failure(credential.generation, 'health')
                 return
+        else:
+            # No health probe configured or not due; successful usage probe
+            # implies token validity, so mark as healthy.
+            health_ok = True
         burn, valid, _cap = _usage_burn(usage)
         logger.debug(
-            'OAuth enterprise usage probe ok (token=%s): valid=%s burn=%s',
-            fp, valid, burn,
+            'OAuth enterprise usage probe ok (token=%s): valid=%s burn=%s health_ok=%s',
+            fp, valid, burn, health_ok,
         )
-        self.record_probe_success(credential.generation, usage, health_ok=True)
+        self.record_probe_success(credential.generation, usage, health_ok=health_ok)
 
 
 def _next_month(now: dt.datetime) -> dt.datetime:
