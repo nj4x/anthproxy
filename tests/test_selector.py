@@ -1011,7 +1011,7 @@ class TestNoteExhausted(unittest.TestCase):
 class TestWeeklyNoneCachePreservation(unittest.TestCase):
     """Verify that a None weekly_utilization preserves the _last_weekly cache.
 
-    This is the selector-level consequence of _max_weekly_utilization returning
+    This is the selector-level consequence of _max_weekly_window returning
     None (e.g. for a lone malformed seven_day window).  Selector.py:403-404
     only writes new_weekly when the value is non-None, so the cache is left
     untouched and the previously-seen numeric value is reused on the next tick.

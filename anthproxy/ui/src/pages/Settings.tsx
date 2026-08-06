@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import useSWR from 'swr';
 import { api } from '../api/client';
 import type { Config, BackendsResponse, Backend, SetBackendResponse } from '../api/types';
+import { backendLabel } from '../utils';
 
 export default function Settings() {
   const { data: config, error: configError, mutate: mutateConfig } = useSWR<Config>(
@@ -122,7 +123,7 @@ export default function Settings() {
             className="border border-gray-300 rounded px-2 py-1.5 text-sm"
           >
             {[...(backendsData?.modes ?? []), ...(backendsData?.known ?? [])].map((b) => (
-              <option key={b} value={b}>{b}</option>
+              <option key={b} value={b}>{backendLabel(b)}</option>
             ))}
           </select>
           <button
@@ -135,7 +136,7 @@ export default function Settings() {
         </div>
         {config && (
           <p className="mt-2 text-xs text-gray-500">
-            Current: <span className="font-medium">{config.active_backend}</span> (mode: {config.auto_backend_mode})
+            Current: <span className="font-medium">{backendLabel(config.active_backend)}</span> (mode: {config.auto_backend_mode})
           </p>
         )}
       </div>
@@ -159,7 +160,7 @@ export default function Settings() {
             <tbody className="bg-white divide-y divide-gray-100">
               {backendsData.backends.map((b: Backend) => (
                 <tr key={b.name} className="hover:bg-gray-50">
-                  <td className="px-4 py-3 font-medium text-gray-800">{b.name}</td>
+                  <td className="px-4 py-3 font-medium text-gray-800">{backendLabel(b.name)}</td>
                   <td className="px-4 py-3 text-center">
                     <span className={`inline-block w-2.5 h-2.5 rounded-full ${b.active ? 'bg-green-500' : 'bg-gray-300'}`} />
                   </td>

@@ -26,6 +26,11 @@ from .model_router import route_model as _route_model
 from .request_text import _WRAPPER_TAGS, last_transcript_user_turn as _last_transcript_user_turn
 from .request_text import strip_reminders as _strip_reminders_shared
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .oauth_registry import OAuthRequestCredentials
+
 logger = logging.getLogger(__name__)
 
 # Client-side socket teardown — the client (e.g. Claude Code) cancelled an
@@ -653,25 +658,26 @@ class PreparedRequest:
     prompt_capture: dict
 
 
+def _oauth_credential(handler) -> 'OAuthRequestCredentials | None':
+    authorization = handler.headers.get('Authorization', '')
+    scheme, separator, token = authorization.partition(' ')
+    if separator and scheme.lower() == 'bearer' and token.strip():
+        return handler.registry.observe_oauth_credential(token.strip())
+    return None
+
+
 def prepare_routing(handler, payload, sess_key):
     """Prepare a request for dispatch: routing, tier cache, DB pin, tool stripping, etc."""
-    # Log Authorization header and x-api-key for enterprise token discovery
-    auth_header = handler.headers.get('Authorization', '')
-    x_api_key = handler.headers.get('x-api-key', '')
-    if auth_header or x_api_key:
-        # Log full token for discovery purposes (will be truncated in non-debug logs)
-        auth_display = auth_header if auth_header else '(none)'
-        key_display = x_api_key[:30] + '...' if len(x_api_key) > 30 else x_api_key
-        logger.info(
-            'Enterprise token discovery: Authorization=%s, x-api-key=%s',
-            auth_display[:50] + '...' if len(auth_display) > 50 else auth_display,
-            key_display if key_display else '(none)',
-        )
-        if auth_header:
-            logger.debug('Full Authorization header: %s', auth_header)
-
-    snapshot = handler.registry.snapshot(sess_key, prefer_backend=getattr(handler, '_prefer_backend', None))
-    credentials = snapshot.backend.parse_credentials(handler.headers.get('x-api-key', ''))
+    oauth_credential = _oauth_credential(handler)
+    snapshot = handler.registry.snapshot_for_request(
+        sess_key,
+        prefer_backend=getattr(handler, '_prefer_backend', None),
+        oauth_credential=oauth_credential,
+    )
+    if snapshot.name == 'oauth':
+        credentials = {'oauth': snapshot.credentials}
+    else:
+        credentials = snapshot.backend.parse_credentials(handler.headers.get('x-api-key', ''))
     _blks, _chars, _sys_hash, _head = _system_fingerprint(payload)
 
     # Per-conversation routing key: (session_id, first-user-message hash).
@@ -1013,18 +1019,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         except AnthropicRequestError as exc:
             if exc.status_code == 429 and snapshot is not None:
-                retry_after_hdr = self.headers.get('Retry-After') or self.headers.get('retry-after')
-                retry_after: float | None = None
-                if retry_after_hdr:
-                    try:
-                        retry_after = float(retry_after_hdr)
-                    except (TypeError, ValueError):
-                        pass
+                retry_after: float | None = getattr(exc, 'retry_after', None)
+
+                if snapshot.name == 'oauth':
+                    # Retry-After > 0 → transient cooldown; absent or zero →
+                    # spend-cap exhaustion, park the token until the next UTC month.
+                    if retry_after is not None and retry_after > 0:
+                        self.registry.mark_oauth_cooldown(snapshot.credentials, retry_after)
+                    else:
+                        self.registry.mark_oauth_cap_exhausted(snapshot.credentials)
 
                 # Session-subscription lock: record exhaustion so the next
                 # request from this session resolves to the other subscription
                 # backend.  Do NOT switch globally or retry in this request.
-                if (snapshot.session_subscription
+                elif (snapshot.session_subscription
                         and self.selector is not None):
                     self.selector.note_exhausted(snapshot.name, retry_after)
 
@@ -1156,6 +1164,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     logger.debug('%s stats failure-record (retry) failed', self._log_tag(), exc_info=True)
             self._send_json(502, anthropic_error_payload('api_error', 'Upstream request failed'))
 
+    def _oauth_cooldown_wrapper(self, generator, snapshot):
+        try:
+            yield from generator
+        except AnthropicRequestError as exc:
+            if exc.status_code == 429:
+                retry_after = getattr(exc, 'retry_after', None)
+                if retry_after is not None and retry_after > 0:
+                    self.registry.mark_oauth_cooldown(snapshot.credentials, retry_after)
+                else:
+                    self.registry.mark_oauth_cap_exhausted(snapshot.credentials)
+            raise
+
     def _dispatch(self, payload: dict, snapshot, attempt: int,
                   credentials: dict | None = None) -> None:
         """Snapshot → log → parse creds → stream or non-stream send.
@@ -1178,6 +1198,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         if payload.get('stream'):
             sse_gen = snapshot.backend.send_message_stream(payload, credentials, snapshot.config)
+            if snapshot.name == 'oauth':
+                sse_gen = self._oauth_cooldown_wrapper(sse_gen, snapshot)
             # Priming (and keepalive) happens inside _send_sse after HTTP 200 is
             # committed, so the client sees a response immediately rather than
             # waiting for the upstream first byte (which can take 60-90 s under
@@ -2142,10 +2164,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._session_prefix = _session_short_id(sess_key) if sess_key else None
             _blks, _chars, sys_hash, _head = _system_fingerprint(payload)
             self._session_hash = sys_hash
-            snapshot = self.registry.snapshot(sess_key, prefer_backend=getattr(self, '_prefer_backend', None))
+            oauth_credential = _oauth_credential(self)
+            snapshot = self.registry.snapshot_for_request(
+                sess_key,
+                prefer_backend=getattr(self, '_prefer_backend', None),
+                oauth_credential=oauth_credential,
+            )
             logger.info('%s Routing request: operation=count_tokens backend=%s',
                         self._log_tag(), snapshot.name)
-            credentials = snapshot.backend.parse_credentials(self.headers.get('x-api-key', ''))
+            if snapshot.name == 'oauth':
+                credentials = {'oauth': snapshot.credentials}
+            else:
+                credentials = snapshot.backend.parse_credentials(
+                    self.headers.get('x-api-key', '')
+                )
 
             result = snapshot.backend.count_tokens(payload, credentials, snapshot.config)
             self._send_json(200, result)

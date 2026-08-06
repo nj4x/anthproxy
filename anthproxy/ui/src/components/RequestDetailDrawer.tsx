@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import useSWR from 'swr';
 import { api } from '../api/client';
 import type { RequestDetail, ClassifierSummary } from '../api/types';
+import { backendLabel } from '../utils';
 
 function CopyButton({ text, title }: { text: string; title?: string }) {
   const [copied, setCopied] = useState(false);
@@ -180,7 +181,7 @@ export function RequestDetailDrawer({ requestId, onClose }: Props) {
                   </div>
                   <div>
                     <dt className="text-xs text-gray-400 mb-0.5">Backend</dt>
-                    <dd className="text-gray-800 text-sm">{data.backend}</dd>
+                    <dd className="text-gray-800 text-sm">{backendLabel(data.backend)}</dd>
                   </div>
                   <div>
                     <dt className="text-xs text-gray-400 mb-0.5">Routed Model</dt>

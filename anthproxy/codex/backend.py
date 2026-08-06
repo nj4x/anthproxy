@@ -423,22 +423,38 @@ class CodexBackend(SubscriptionBackend, Backend):
         resets_at = status_window.get('reset_at')
 
         weekly_utilization: float | None = None
+        weekly_resets_at: float | None = None
+        weekly_window_hours: float | None = None
         if isinstance(weekly_window, dict):
             try:
                 weekly_utilization = float(weekly_window.get('used_percent', 0))
             except (TypeError, ValueError):
                 pass
+            weekly_reset = weekly_window.get('reset_at')
+            if isinstance(weekly_reset, (int, float)) and not isinstance(weekly_reset, bool):
+                weekly_resets_at = float(weekly_reset)
+            weekly_seconds = weekly_window.get('window_seconds')
+            if (
+                isinstance(weekly_seconds, (int, float))
+                and not isinstance(weekly_seconds, bool)
+                and weekly_seconds > 0
+            ):
+                weekly_window_hours = float(weekly_seconds) / 3600.0
 
         try:
             remaining_pct = float(remaining)
             available = remaining_pct > 0.0 and not limit_reached
         except (TypeError, ValueError):
             return FiveHourStatus(available=None, resets_at=resets_at,
-                                  weekly_utilization=weekly_utilization)
+                                  weekly_utilization=weekly_utilization,
+                                  weekly_resets_at=weekly_resets_at,
+                                  weekly_window_hours=weekly_window_hours)
 
         utilization = 100.0 - remaining_pct
         return FiveHourStatus(available=available, resets_at=resets_at,
-                              utilization=utilization, weekly_utilization=weekly_utilization)
+                              utilization=utilization, weekly_utilization=weekly_utilization,
+                              weekly_resets_at=weekly_resets_at,
+                              weekly_window_hours=weekly_window_hours)
 
     def parse_credentials(self, api_key: str) -> dict:
         return {}

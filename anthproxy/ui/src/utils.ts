@@ -3,6 +3,20 @@ export interface SessionLabel {
   tooltip: string;
 }
 
+const BACKEND_LABELS: Record<string, string> = {
+  oauth: 'Enterprise',
+};
+
+/**
+ * Human-facing label for a stored backend name.  The enterprise OAuth token is
+ * persisted as the bare backend name "oauth"; operators see it as "Enterprise".
+ * Unknown names pass through unchanged.
+ */
+export function backendLabel(name: string | null | undefined): string {
+  if (name == null) return '';
+  return BACKEND_LABELS[name] ?? name;
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_PREFIX_LENGTH = 8;
 const RAW_LABEL_MAX_LENGTH = 20;

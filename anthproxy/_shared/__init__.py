@@ -27,11 +27,18 @@ class FiveHourStatus:
     or None when unavailable.
     ``utilization`` is the 5-hour usage percentage (0–100) when known, else None.
     ``weekly_utilization`` is the weekly usage percentage (0–100) when known, else None.
+    ``weekly_resets_at`` is a POSIX timestamp for the reset of the weekly window
+    that supplied ``weekly_utilization`` (so reset always pairs with its burn),
+    or None when unavailable.
+    ``weekly_window_hours`` is the duration of that weekly window in hours
+    (168.0 for seven-day windows), or None when the provider gives no window size.
     """
     available: bool | None
     resets_at: float | None
     utilization: float | None = None
     weekly_utilization: float | None = None
+    weekly_resets_at: float | None = None
+    weekly_window_hours: float | None = None
 
 
 class SubscriptionBackend:

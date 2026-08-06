@@ -23,6 +23,7 @@ Selector modes
                    backends; bedrock is never used.
 """
 
+import dataclasses
 import logging
 import threading
 import time
@@ -42,6 +43,75 @@ _FALLBACK = "bedrock"
 
 # When weekly utilization is unknown, use this neutral value for comparisons.
 _UNKNOWN_WEEKLY = 50.0
+_PERSONAL_CACHE_TTL = 300.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PersonalCandidate:
+    name: str
+    burn: float
+    weekly_elapsed_pct: float | None = None
+
+
+def _pace_enabled(config) -> bool:
+    """True unless the pace-delta kill-switch is set to 'off'."""
+    return getattr(config, 'auto_backend_pace_delta', 'on') != 'off'
+
+
+def _weekly_elapsed_pct(
+    weekly_resets_at: float | None,
+    weekly_window_hours: float | None,
+    now: float,
+) -> float | None:
+    """Fraction of the weekly window elapsed by time, 0–100, or None.
+
+    Returns None when the window size or reset timestamp is unknown (→ ranked on
+    raw burn alongside other raw-only candidates). A stale reset
+    (``weekly_resets_at <= now``) yields ``0.0``: the window is about to roll, so
+    under ascending pace-delta ranking (``burn - elapsed``) the backend gets the
+    highest delta and is deprioritized while its burn reading is going stale.
+    """
+    if weekly_window_hours is None or weekly_window_hours <= 0:
+        return None
+    if weekly_resets_at is None:
+        return None
+    if weekly_resets_at <= now:
+        return 0.0
+    remaining = weekly_resets_at - now
+    return max(0.0, min(100.0, (1.0 - remaining / (weekly_window_hours * 3600.0)) * 100.0))
+
+
+def _pace_rank_key(burn: float, elapsed: float | None, pace_on: bool):
+    """Sort key implementing the ADR-0015 split-branch ranking.
+
+    Returns a ``(block, value)`` tuple so candidates with a known elapsed (the
+    pace-delta block, ``block=0``) rank ahead of raw-only candidates
+    (``block=1``) as a group, each block preserving its own ascending order.
+    With pace off everything is one raw-burn block. Callers that need a single
+    scalar key (e.g. for ``sorted``) can use ``key=lambda c: _pace_rank_key(...)``
+    and Python's tuple comparison does the block-then-value ordering.
+    """
+    if not pace_on or elapsed is None:
+        return (1, burn)
+    return (0, burn - elapsed)
+
+
+def _sort_personal_candidates(
+    candidates, pace_on: bool,
+) -> tuple[PersonalCandidate, ...]:
+    """Order personal candidates: pace-delta block then raw-only block.
+
+    With pace on, candidates that carry a known ``weekly_elapsed_pct`` sort
+    ascending by ``burn - weekly_elapsed_pct`` and rank ahead, as a group, of
+    candidates with no elapsed (OpenRouter, unknown windows) which sort ascending
+    by raw ``burn``. With pace off, all sort by raw ``burn``.
+    """
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda c: _pace_rank_key(c.burn, c.weekly_elapsed_pct, pace_on),
+        )
+    )
 
 
 class AutoSelector:
@@ -66,9 +136,11 @@ class AutoSelector:
         required by BackendRegistry's own locking model).
     """
 
-    def __init__(self, registry, config, interval: float | None = None):
+    def __init__(self, registry, config, interval: float | None = None,
+                 oauth_registry=None):
         self._registry = registry
         self._config = config
+        self._oauth_registry = oauth_registry
         self._interval = (
             interval if interval is not None else config.auto_backend_interval
         )
@@ -79,6 +151,13 @@ class AutoSelector:
         # five_hour_status() succeeds; used for exhausted backends where we
         # don't want to make a live network call.
         self._last_weekly: dict[str, float] = {}
+        # Last known weekly reset timestamp and window size, paired with
+        # _last_weekly, used to compute the pace-delta elapsed for cached
+        # (non-probed) candidates in personal_candidates().
+        self._last_weekly_resets_at: dict[str, float | None] = {}
+        self._last_weekly_window_hours: dict[str, float | None] = {}
+        self._last_status_at: dict[str, float] = {}
+        self._last_available: dict[str, bool | None] = {}
         # Selector mode: 'auto' | 'pinned' | 'subscription'.
         # 'pinned'      — auto-evaluation is suspended; _pinned holds the name.
         # 'subscription' — auto continues but only among subscription backends.
@@ -89,7 +168,10 @@ class AutoSelector:
         self._pinned: str | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        if self._oauth_registry is not None:
+            self._oauth_registry.set_wake(self.wake)
 
     # ------------------------------------------------------------------
     # Public API
@@ -114,9 +196,13 @@ class AutoSelector:
     def stop(self) -> None:
         """Signal the background thread to exit and wait for it."""
         self._stop.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+
+    def wake(self) -> None:
+        self._wake.set()
 
     def evaluate(self) -> str:
         """Pick and switch to the best backend right now.
@@ -142,6 +228,14 @@ class AutoSelector:
         if new_weekly:
             with self._lock:
                 self._last_weekly.update(new_weekly)
+        if statuses:
+            observed_at = time.time()
+            with self._lock:
+                for name, status in statuses.items():
+                    self._last_status_at[name] = observed_at
+                    self._last_available[name] = status.available
+                    self._last_weekly_resets_at[name] = status.weekly_resets_at
+                    self._last_weekly_window_hours[name] = status.weekly_window_hours
 
         active = self._registry.active_name()
         if best != active:
@@ -200,6 +294,8 @@ class AutoSelector:
                     if source_status.weekly_utilization is not None:
                         with self._lock:
                             self._last_weekly[name] = source_status.weekly_utilization
+                            self._last_weekly_resets_at[name] = source_status.weekly_resets_at
+                            self._last_weekly_window_hours[name] = source_status.weekly_window_hours
                         last_weekly_snapshot[name] = source_status.weekly_utilization
                 except Exception:
                     pass
@@ -214,6 +310,14 @@ class AutoSelector:
         if new_weekly:
             with self._lock:
                 self._last_weekly.update(new_weekly)
+        if statuses:
+            observed_at = time.time()
+            with self._lock:
+                for backend_name, status in statuses.items():
+                    self._last_status_at[backend_name] = observed_at
+                    self._last_available[backend_name] = status.available
+                    self._last_weekly_resets_at[backend_name] = status.weekly_resets_at
+                    self._last_weekly_window_hours[backend_name] = status.weekly_window_hours
 
         if source_status is not None:
             statuses.setdefault(name, source_status)
@@ -280,6 +384,33 @@ class AutoSelector:
                 return "auto-selection: subscription-only"
         return "auto-selection: on"
 
+    def personal_candidates(self) -> tuple[PersonalCandidate, ...]:
+        now = time.time()
+        with self._lock:
+            exhausted = dict(self._exhausted_until)
+            weekly = dict(self._last_weekly)
+            status_at = dict(self._last_status_at)
+            available = dict(self._last_available)
+            resets_at = dict(self._last_weekly_resets_at)
+            window_hours = dict(self._last_weekly_window_hours)
+        pace_on = _pace_enabled(self._config)
+        candidates = []
+        for name in _PRIORITY:
+            if now < exhausted.get(name, 0) or available.get(name) is False:
+                continue
+            fresh = now - status_at.get(name, 0.0) <= _PERSONAL_CACHE_TTL
+            burn = weekly.get(name, _UNKNOWN_WEEKLY) if fresh else _UNKNOWN_WEEKLY
+            # Gate elapsed behind the freshness check: a stale reading must not
+            # silently produce a contemporary elapsed% paired with a neutral burn.
+            elapsed = (
+                _weekly_elapsed_pct(resets_at.get(name), window_hours.get(name), now)
+                if fresh else None
+            )
+            candidates.append(
+                PersonalCandidate(name=name, burn=burn, weekly_elapsed_pct=elapsed)
+            )
+        return _sort_personal_candidates(candidates, pace_on)
+
     def current_subscription_backend(self) -> str | None:
         """Return a subscription backend name from cached state only.
 
@@ -317,11 +448,16 @@ class AutoSelector:
 
     def _run(self) -> None:
         """Background poll loop: refresh tokens then (if auto-enabled) evaluate."""
-        while not self._stop.wait(self._interval):
-            self._tick()
+        while not self._stop.is_set():
+            self._wake.wait(self._interval)
+            self._wake.clear()
+            if not self._stop.is_set():
+                self._tick()
 
     def _tick(self) -> None:
         """One tick: refresh OAuth tokens and (when auto is active) re-evaluate."""
+        if self._oauth_registry is not None:
+            self._oauth_registry.tick(background=True)
         self._refresh_tokens()
         if self._config.auto_backend:
             try:
@@ -446,7 +582,10 @@ class AutoSelector:
             )
 
             if status.available is True:
-                available_backends.append((name, effective_weekly))
+                elapsed = _weekly_elapsed_pct(
+                    status.weekly_resets_at, status.weekly_window_hours, now
+                )
+                available_backends.append((name, effective_weekly, elapsed))
 
             elif status.available is False:
                 if status.resets_at is not None:
@@ -472,12 +611,18 @@ class AutoSelector:
                 return _PRIORITY[0], statuses, new_exhausted, new_weekly
             return _FALLBACK, statuses, new_exhausted, new_weekly
 
-        # Sort available backends by weekly utilization (ascending).
-        # Unknown weekly → treated as _UNKNOWN_WEEKLY (50%) neutral value.
+        # Order available backends for the ranking sort key only.  The same
+        # _pace_rank_key used by _sort_personal_candidates drives the split-branch
+        # ordering here so the two sites cannot drift.  Unknown weekly →
+        # _UNKNOWN_WEEKLY (50%) neutral value.  STEP 1/STEP 2 below continue to
+        # compare raw weekly, never the delta.
+        pace_on = _pace_enabled(self._config)
         available_backends.sort(
-            key=lambda x: x[1] if x[1] is not None else _UNKNOWN_WEEKLY
+            key=lambda e: _pace_rank_key(
+                e[1] if e[1] is not None else _UNKNOWN_WEEKLY, e[2], pace_on,
+            )
         )
-        best_avail_name, best_avail_weekly = available_backends[0]
+        best_avail_name, best_avail_weekly = available_backends[0][0], available_backends[0][1]
         best_avail_val = (
             best_avail_weekly if best_avail_weekly is not None else _UNKNOWN_WEEKLY
         )

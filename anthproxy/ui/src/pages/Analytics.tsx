@@ -3,6 +3,7 @@ import useSWR from 'swr';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { api } from '../api/client';
 import type { CostResponse, RoutingResponse, CostRow } from '../api/types';
+import { backendLabel } from '../utils';
 
 const TIME_RANGES = ['1d', '7d', '30d'] as const;
 type TimeRange = typeof TIME_RANGES[number];
@@ -27,6 +28,9 @@ export default function Analytics() {
     ['routing', timeRange],
     () => api.getRouting(timeRange)
   );
+
+  const displayName = (name: string) =>
+    groupBy === 'backend' ? backendLabel(name) : name;
 
   return (
     <div className="space-y-6">
@@ -77,7 +81,7 @@ export default function Analytics() {
             <div className="bg-white shadow rounded-lg p-5">
               <h3 className="text-sm font-medium text-gray-700 mb-4">Cost by {groupBy}</h3>
               <ResponsiveContainer width="100%" height={220}>
-                <BarChart data={costData.items} margin={{ top: 4, right: 8, bottom: 4, left: 8 }}>
+                <BarChart data={costData.items.map((row) => ({ ...row, name: displayName(row.name) }))} margin={{ top: 4, right: 8, bottom: 4, left: 8 }}>
                   <XAxis dataKey="name" tick={{ fontSize: 11 }} />
                   <YAxis tick={{ fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(3)}`} />
                   <Tooltip formatter={(v: any) => typeof v === 'number' ? `$${v.toFixed(5)}` : String(v)} />
@@ -108,7 +112,7 @@ export default function Analytics() {
                 <tbody className="bg-white divide-y divide-gray-100">
                   {costData.items.map((row: CostRow) => (
                     <tr key={row.name} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 text-gray-800 font-medium">{row.name}</td>
+                      <td className="px-4 py-3 text-gray-800 font-medium">{displayName(row.name)}</td>
                       <td className="px-4 py-3 text-right text-gray-600">{row.requests.toLocaleString()}</td>
                       <td className="px-4 py-3 text-right text-gray-600">{row.input_tokens.toLocaleString()}</td>
                       <td className="px-4 py-3 text-right text-gray-600">{row.output_tokens.toLocaleString()}</td>

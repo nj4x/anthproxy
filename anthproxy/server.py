@@ -1,9 +1,18 @@
 import dataclasses
 import logging
+import math
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from http.server import ThreadingHTTPServer
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .oauth_registry import OAuthRequestCredentials
+    from .selector import PersonalCandidate
+
+from .selector import _pace_enabled
 
 from .backends_registry import (  # noqa: F401
     BackendDiscoveryError,
@@ -18,6 +27,102 @@ from .constants import SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
 from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
+
+# Personal-burn stand-in when no personal candidate is resolvable: treat personal
+# as fully exhausted (100%) so any eligible OAuth candidate with real headroom wins.
+_UNKNOWN_PERSONAL_BURN = 100.0
+
+# Neutral elapsed% used in pace-delta computation when the window elapsed is
+# unknown (transient fetch gap, OpenRouter, unknown-window candidate).
+_NEUTRAL_ELAPSED = 50.0
+
+
+def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn,
+                           pace_on=False, oauth_delta=None, personal_delta=None):
+    """Explain why enterprise (oauth) was or was not chosen over personal.
+
+    ``oauth`` is an ``OAuthTokenSnapshot`` (or None when the request carried no
+    tracked enterprise token).  ``oauth_wins`` is the final comparison result.
+    When ``pace_on`` the win/lose messages reference pace deltas
+    (``burn − elapsed``); otherwise they reference raw burn%.
+    """
+    if oauth_credential is None:
+        return 'no enterprise token on request'
+    if oauth is None:
+        return 'enterprise token not tracked'
+    if oauth_wins:
+        if pace_on:
+            return (
+                f'enterprise pace delta {oauth_delta:.1f}pp below '
+                f'personal {personal_delta:.1f}pp'
+            )
+        return (
+            f'enterprise weekly {oauth.burn:.1f}% below '
+            f'personal {personal_burn:.1f}%'
+        )
+    if not oauth.eligible:
+        if oauth.cooldown_remaining_seconds > 0:
+            return (
+                'enterprise in cooldown '
+                f'({oauth.cooldown_remaining_seconds:.0f}s remaining)'
+            )
+        if oauth.monthly_blocked:
+            return 'enterprise spend-cap parked for the month'
+        if oauth.health_ok is not True:
+            return 'enterprise health check not confirmed'
+        if oauth.burn is None:
+            return 'enterprise usage reading unavailable'
+        if oauth.usage_age_seconds is None:
+            return 'enterprise usage not yet probed'
+        if oauth.usage_stale:
+            return (
+                'enterprise usage cache expired '
+                f'({oauth.usage_age_seconds:.0f}s old)'
+            )
+        return 'enterprise usage from a prior month'
+    if oauth.burn is None:
+        return 'enterprise usage reading unavailable'
+    if pace_on:
+        return (
+            f'personal pace delta {personal_delta:.1f}pp at or below '
+            f'enterprise {oauth_delta:.1f}pp (dead-band applied)'
+        )
+    return (
+        f'personal weekly {personal_burn:.1f}% at or below '
+        f'enterprise {oauth.burn:.1f}%'
+    )
+
+
+def _log_oauth_selection(session_key, oauth_credential, oauth,
+                         personal_name, personal_burn, chosen, reason):
+    """Emit one observability line for the enterprise-vs-personal decision.
+
+    DEBUG for the common personal outcome; INFO when the enterprise token is
+    chosen (a divergence from the personal baseline worth surfacing).
+    """
+    level = logging.INFO if chosen == 'oauth' else logging.DEBUG
+    if not logger.isEnabledFor(level):
+        return
+    if oauth is not None and oauth.burn is not None:
+        enterprise_weekly = f'{oauth.burn:.1f}%'
+    elif oauth is not None:
+        enterprise_weekly = 'unknown'
+    else:
+        enterprise_weekly = 'n/a'
+    session_label = f'{session_key[:16]}…' if session_key else '-'
+    logger.log(
+        level,
+        'OAuth backend selection (session=%s): enterprise_token=%s '
+        'enterprise_weekly=%s personal=%s personal_weekly=%.1f%% '
+        'chosen=%s reason=%s',
+        session_label,
+        'yes' if oauth_credential is not None else 'no',
+        enterprise_weekly,
+        personal_name,
+        personal_burn,
+        chosen,
+        reason,
+    )
 
 
 class BackendError(Exception):
@@ -52,6 +157,7 @@ class BackendSnapshot:
     config: Config
     session_pinned: bool = False
     session_subscription: bool = False
+    credentials: 'OAuthRequestCredentials | None' = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,8 +290,9 @@ class BackendRegistry:
 
     _MAX_SESSION_OVERRIDES = 1024  # cap on the session override map size
 
-    def __init__(self, config: Config, initial_backend):
+    def __init__(self, config: Config, initial_backend, oauth_registry=None):
         self._config = config
+        self._oauth_registry = oauth_registry
         self._active = config.backend
         self._instances = {config.backend: initial_backend}
         self._state_lock = threading.Lock()
@@ -217,6 +324,145 @@ class BackendRegistry:
         # Called under _state_lock so it must be a leaf (no network I/O, no
         # registry callbacks).
         self._subscription_resolver = None
+        self._personal_candidates_resolver = None
+
+    def set_personal_candidates_resolver(
+        self, resolver: 'Callable[[], tuple[PersonalCandidate, ...]]',
+    ) -> None:
+        self._personal_candidates_resolver = resolver
+
+    def observe_oauth_credential(
+        self, access_token: str,
+    ) -> 'OAuthRequestCredentials | None':
+        if self._oauth_registry is None:
+            return None
+        return self._oauth_registry.observe(access_token)
+
+    def mark_oauth_cooldown(
+        self, credential: 'OAuthRequestCredentials | None',
+        retry_after: float | None = None,
+    ) -> bool:
+        if self._oauth_registry is None or credential is None:
+            return False
+        ok = self._oauth_registry.mark_cooldown(credential.generation, retry_after)
+        if ok:
+            logger.info(
+                'OAuth enterprise token 429: cooldown %s',
+                f'{retry_after:.0f}s' if retry_after is not None else 'default',
+            )
+        return ok
+
+    def mark_oauth_cap_exhausted(
+        self, credential: 'OAuthRequestCredentials | None',
+    ) -> bool:
+        if self._oauth_registry is None or credential is None:
+            return False
+        ok = self._oauth_registry.mark_cap_exhausted(credential.generation)
+        if ok:
+            logger.info(
+                'OAuth enterprise token 429: spend-cap exhausted, '
+                'parked until next UTC month',
+            )
+        return ok
+
+    def snapshot_for_request(
+        self,
+        session_key: str | None = None,
+        prefer_backend: str | None = None,
+        oauth_credential: 'OAuthRequestCredentials | None' = None,
+    ) -> BackendSnapshot:
+        with self._state_lock:
+            override = self._session_overrides.get(session_key) if session_key is not None else None
+        if override is not None:
+            return self.snapshot(session_key, prefer_backend=prefer_backend)
+
+        if prefer_backend is not None:
+            return self.snapshot(session_key, prefer_backend=prefer_backend)
+
+        candidates = (
+            tuple(self._personal_candidates_resolver())
+            if self._personal_candidates_resolver is not None else ()
+        )
+        # The resolver already returns candidates ordered by the active ranking
+        # (min pace delta with pace on, min raw burn with pace off), so the
+        # representative is the first — a lower-delta candidate is never
+        # eliminated before the OAuth comparison.
+        personal = candidates[0] if candidates else None
+        if personal is None:
+            base = self.snapshot(session_key)
+            personal_name = base.name
+            personal_burn = _UNKNOWN_PERSONAL_BURN
+            personal_elapsed = None
+        else:
+            personal_name = personal.name
+            personal_burn = personal.burn
+            personal_elapsed = personal.weekly_elapsed_pct
+
+        oauth = (
+            self._oauth_registry.snapshot(oauth_credential.generation)
+            if self._oauth_registry is not None and oauth_credential is not None
+            else None
+        )
+        oauth_valid = oauth is not None and oauth.eligible
+        pace_on = _pace_enabled(self._config)
+        oauth_delta = None
+        personal_delta = None
+        if not pace_on:
+            oauth_wins = (
+                oauth_valid
+                and oauth.burn is not None
+                and oauth.burn < personal_burn
+                and not math.isclose(oauth.burn, personal_burn, rel_tol=1e-6)
+            )
+        else:
+            deadband = getattr(
+                self._config, 'auto_backend_oauth_pace_deadband_pp', 3.0,
+            )
+            personal_elapsed_val = (
+                personal_elapsed if personal_elapsed is not None else _NEUTRAL_ELAPSED
+            )
+            personal_delta = personal_burn - personal_elapsed_val
+            if oauth_valid and oauth.burn is not None:
+                oauth_delta = oauth.burn - oauth.month_elapsed_pct
+            # Strict '<' with the dead-band: equality (or within the band) keeps
+            # the incumbent personal backend.
+            oauth_wins = (
+                oauth_delta is not None
+                and oauth_delta < personal_delta - deadband
+            )
+        _log_oauth_selection(
+            session_key, oauth_credential, oauth,
+            personal_name, personal_burn,
+            chosen='oauth' if oauth_wins else personal_name,
+            reason=_oauth_decision_reason(
+                oauth_credential, oauth, oauth_wins, personal_burn,
+                pace_on=pace_on, oauth_delta=oauth_delta,
+                personal_delta=personal_delta,
+            ),
+        )
+        if oauth_wins:
+            with self._state_lock:
+                backend = self._instances.get('oauth')
+            if backend is None:
+                backend = self._get_or_create('oauth')
+            request_config = dataclasses.replace(self._config, backend='oauth')
+            return BackendSnapshot(
+                name='oauth', backend=backend, config=request_config,
+                credentials=oauth_credential,
+            )
+
+        with self._state_lock:
+            backend = self._instances.get(personal_name)
+        if backend is None:
+            return self.snapshot(session_key)
+        request_config = dataclasses.replace(self._config, backend=personal_name)
+        session_routing_override = self.session_model_routing(session_key) \
+            if session_key is not None else None
+        if session_routing_override is not None:
+            request_config = dataclasses.replace(
+                request_config, auto_model_routing=session_routing_override,
+            )
+        return BackendSnapshot(name=personal_name, backend=backend, config=request_config)
 
     def snapshot(self, session_key: str | None = None,
                  prefer_backend: str | None = None) -> BackendSnapshot:
@@ -605,6 +851,44 @@ class BackendRegistry:
                 }
         return result
 
+    def oauth_token_status(self) -> dict | None:
+        """Return the enterprise OAuth token health as a JSON-serialisable dict.
+
+        Reads the latest-generation snapshot from the OAuth token registry — no
+        network I/O.  Returns ``None`` when no OAuth registry is configured.
+        ``present`` is ``False`` until a token has been observed in this process
+        lifetime (generation 0), in which case the remaining fields carry the
+        default snapshot values.
+        """
+        if self._oauth_registry is None:
+            return None
+        snap = self._oauth_registry.snapshot()
+        extra = (snap.usage or {}).get('extra_usage') or {}
+        try:
+            dp = int(extra.get('decimal_places') or 2)
+            scale = 10 ** dp
+        except (TypeError, ValueError):
+            scale = 100
+        try:
+            used_usd = float(extra['used_credits']) / scale
+        except (KeyError, TypeError, ValueError):
+            used_usd = None
+        try:
+            total_usd = float(extra['monthly_limit']) / scale
+        except (KeyError, TypeError, ValueError):
+            total_usd = None
+        return {
+            'present': snap.generation > 0,
+            'eligible': snap.eligible,
+            'burn_pct': snap.burn,
+            'used_usd': used_usd,
+            'total_usd': total_usd,
+            'cooldown_remaining_seconds': snap.cooldown_remaining_seconds,
+            'monthly_blocked': snap.monthly_blocked,
+            'usage_age_seconds': snap.usage_age_seconds,
+            'usage_stale': snap.usage_stale,
+        }
+
     def usage_snapshot(self) -> dict:
         """Return cached subscription usage without making network calls.
 
@@ -741,6 +1025,7 @@ def create_server(config: Config, registry: BackendRegistry,
                   session_db=None) -> ThreadingHTTPServer:
     if selector is not None:
         registry.set_subscription_resolver(selector.current_subscription_backend)
+        registry.set_personal_candidates_resolver(selector.personal_candidates)
     handler_class = make_handler_class(registry, config, selector, stats_collector,
                                        session_db=session_db)
     server = ThreadingHTTPServer((config.host, config.port), handler_class)

@@ -20,10 +20,10 @@ from anthproxy.anthropic.backend import (
     AnthropicBackend,
     _fetch_usage,
     _handle_error_response,
-    _max_weekly_utilization,
+    _max_weekly_window,
 )
 from anthproxy import model_config as _model_config
-from anthproxy.anthropic.mapper import (
+from anthproxy.mapper.anthropic_transform import (
     REQUIRED_BETAS,
     _CC_SYSTEM_PREFIX,
     _build_body,
@@ -1013,6 +1013,47 @@ class TestNeedsAccessRefresh:
 
 
 # ---------------------------------------------------------------------------
+# _classify_refresh_error — invalid_grant recognition
+# ---------------------------------------------------------------------------
+
+class TestClassifyRefreshError:
+    """The Anthropic token endpoint returns ``{"error":"invalid_grant",
+    "error_description":"Refresh token expired"}`` (RFC 6749 §5.2 shape) when
+    the refresh token is dead.  _classify_refresh_error must treat this as
+    terminal so the OAuth flow triggers re-login instead of retrying forever.
+    """
+
+    def test_invalid_grant_with_refresh_token_description_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"invalid_grant","error_description":"Refresh token expired"}'
+        assert _classify_refresh_error(400, body) == 'invalid_grant_refresh_token'
+
+    def test_invalid_grant_with_lowercase_description_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"invalid_grant","error_description":"refresh token revoked"}'
+        assert _classify_refresh_error(400, body) == 'invalid_grant_refresh_token'
+
+    def test_invalid_grant_without_refresh_token_description_is_not_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"invalid_grant","error_description":"authorization code expired"}'
+        assert _classify_refresh_error(400, body) is None
+
+    def test_structured_code_refresh_token_expired_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":{"code":"refresh_token_expired"}}'
+        assert _classify_refresh_error(400, body) == 'refresh_token_expired'
+
+    def test_http_401_is_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        assert _classify_refresh_error(401, b'{}') == 'http_401'
+
+    def test_other_400_is_not_terminal(self):
+        from anthproxy._shared.oauth_base import _classify_refresh_error
+        body = b'{"error":"server_error","error_description":"transient"}'
+        assert _classify_refresh_error(400, body) is None
+
+
+# ---------------------------------------------------------------------------
 # load_credentials / _write_auth
 # ---------------------------------------------------------------------------
 
@@ -1355,7 +1396,7 @@ class TestSendWithRetriesThinkingSignatureRecovery:
 
 
 # ---------------------------------------------------------------------------
-# _max_weekly_utilization helper + five_hour_status weekly plumbing
+# _max_weekly_window helper + five_hour_status weekly plumbing
 # ---------------------------------------------------------------------------
 
 def _weekly_usage(utilization, resets_at='2099-01-01T00:00:00Z'):
@@ -1370,8 +1411,8 @@ def _five_hour_window(utilization=50.0, resets_at='2099-01-01T00:00:00Z'):
     return {'utilization': utilization, 'resets_at': resets_at}
 
 
-class TestMaxWeeklyUtilization:
-    """Unit tests for _max_weekly_utilization (pure function)."""
+class TestMaxWeeklyWindow:
+    """Unit tests for _max_weekly_window (pure function)."""
 
     def test_all_three_windows_returns_max(self):
         usage = {
@@ -1379,18 +1420,18 @@ class TestMaxWeeklyUtilization:
             'seven_day_sonnet': {'utilization': 55.0},
             'seven_day_opus': {'utilization': 90.0},
         }
-        assert _max_weekly_utilization(usage) == 90.0
+        assert _max_weekly_window(usage)[0] == 90.0
 
     def test_single_valid_seven_day_returns_that_value(self):
         usage = {'seven_day': {'utilization': 42.0}}
-        assert _max_weekly_utilization(usage) == 42.0
+        assert _max_weekly_window(usage)[0] == 42.0
 
     def test_opus_is_binding_window(self):
         usage = {
             'seven_day': {'utilization': 20.0},
             'seven_day_opus': {'utilization': 80.0},
         }
-        assert _max_weekly_utilization(usage) == 80.0
+        assert _max_weekly_window(usage)[0] == 80.0
 
     def test_window_with_none_utilization_skipped(self):
         # seven_day_sonnet is present but has no numeric utilization
@@ -1398,47 +1439,47 @@ class TestMaxWeeklyUtilization:
             'seven_day': {'utilization': 60.0},
             'seven_day_sonnet': {},  # utilization key missing
         }
-        assert _max_weekly_utilization(usage) == 60.0
+        assert _max_weekly_window(usage)[0] == 60.0
 
     def test_window_with_explicit_none_utilization_skipped(self):
         usage = {
             'seven_day': {'utilization': 60.0},
             'seven_day_sonnet': {'utilization': None},
         }
-        assert _max_weekly_utilization(usage) == 60.0
+        assert _max_weekly_window(usage)[0] == 60.0
 
     def test_no_weekly_windows_returns_none(self):
-        assert _max_weekly_utilization({}) is None
-        assert _max_weekly_utilization({'five_hour': {'utilization': 50.0}}) is None
+        assert _max_weekly_window({})[0] is None
+        assert _max_weekly_window({'five_hour': {'utilization': 50.0}})[0] is None
 
     def test_lone_seven_day_missing_utilization_returns_none(self):
         # Behavioral delta vs. old code: old yielded 0.0; new yields None.
         # A window with no parseable utilization should not be treated as 0% consumed.
         usage = {'seven_day': {}}  # utilization key absent
-        assert _max_weekly_utilization(usage) is None
+        assert _max_weekly_window(usage)[0] is None
 
     def test_lone_seven_day_explicit_none_utilization_returns_none(self):
         # Same intentional change: old code yielded 0.0; new yields None.
         usage = {'seven_day': {'utilization': None}}
-        assert _max_weekly_utilization(usage) is None
+        assert _max_weekly_window(usage)[0] is None
 
     def test_malformed_value_skipped_no_raise(self):
         usage = {
             'seven_day': {'utilization': 'bad'},
             'seven_day_sonnet': {'utilization': 77.0},
         }
-        assert _max_weekly_utilization(usage) == 77.0
+        assert _max_weekly_window(usage)[0] == 77.0
 
     def test_non_dict_window_ignored(self):
         usage = {
             'seven_day': 'not a dict',
             'seven_day_sonnet': {'utilization': 25.0},
         }
-        assert _max_weekly_utilization(usage) == 25.0
+        assert _max_weekly_window(usage)[0] == 25.0
 
 
 class TestFiveHourStatusWeekly:
-    """five_hour_status correctly populates weekly_utilization via _max_weekly_utilization."""
+    """five_hour_status correctly populates weekly_utilization via _max_weekly_window."""
 
     def _backend_with_usage(self, usage_dict):
         backend = AnthropicBackend()

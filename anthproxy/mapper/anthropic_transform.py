@@ -1,18 +1,32 @@
+"""Shared Anthropic Messages-protocol request transformation.
+
+Model-alias resolution, beta-header merging, and outbound body construction for
+backends speaking the Anthropic subscription protocol.  Both the personal
+``anthropic`` backend and the enterprise ``oauth`` backend depend on this shared
+mapper layer rather than on each other.
+"""
+
 import json
 import logging
 
 from .. import model_config as _model_config
 from .._shared.model_alias import resolve_alias as _resolve_alias
-from ..mapper import strip_codex_thinking_blocks as _strip_codex_thinking_blocks
+from .anthropic_protocol import (  # noqa: F401  (re-exported for backend imports)
+    ANTHROPIC_HOST, ANTHROPIC_VERSION, MESSAGES_PATH, COUNT_TOKENS_PATH,
+    CLAUDE_CLI_VERSION, USER_AGENT,
+)
+from .common import strip_codex_thinking_blocks as _strip_codex_thinking_blocks
 
 logger = logging.getLogger(__name__)
 
 REQUIRED_BETAS = ('claude-code-20250219', 'oauth-2025-04-20')
-_CLAUDE_CLI_VERSION = '2.1.88'
+
 _CC_SYSTEM_PREFIX = 'You are Claude Code, Anthropic\'s official CLI for Claude.'
 MAX_CACHE_CONTROL_BLOCKS = 4
-def _resolve_model(model: str) -> str:
+def resolve_model(model: str) -> str:
     return _resolve_alias(model, _model_config.model_aliases('anthropic'))
+
+_resolve_model = resolve_model
 
 
 def _supports_effort(model_id: str) -> bool:
@@ -105,9 +119,9 @@ def _thinking_active(payload: dict, resolved_model: str) -> bool:
     return False
 
 
-def _merge_betas(payload: dict) -> str:
+def merge_betas(payload: dict) -> str:
     raw_model = payload.get('model') or ''
-    resolved_model = _resolve_model(raw_model) if raw_model else ''
+    resolved_model = resolve_model(raw_model) if raw_model else ''
     active = _thinking_active(payload, resolved_model)
     long_context_ok = _supports_long_context(resolved_model)
     betas: list[str] = []
@@ -409,9 +423,9 @@ def _normalize_cache_ttl_ordering(body: dict) -> dict:
 _INTERNAL_KEYS = frozenset({'_anthropic_beta', '_anthproxy_internal_classifier'})
 
 
-def _build_body(payload: dict) -> bytes:
+def build_body(payload: dict) -> bytes:
     body = {k: v for k, v in payload.items() if k not in _INTERNAL_KEYS}
-    body['model'] = _resolve_model(payload.get('model', ''))
+    body['model'] = resolve_model(payload.get('model', ''))
 
     # Strip output_config.effort for models that reject it (Haiku).  The
     # body dict is a shallow copy, so we must not mutate the nested object
@@ -528,3 +542,7 @@ def _build_body(payload: dict) -> bytes:
     body = _enforce_cache_control_limit(body)
     body = _normalize_cache_ttl_ordering(body)
     return json.dumps(body).encode('utf-8')
+
+
+_merge_betas = merge_betas
+_build_body = build_body

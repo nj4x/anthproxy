@@ -81,10 +81,14 @@ def main():
             anthropic_auth.ensure_credentials(config)
 
     backend = build_backend(config.backend, config)
-    registry = BackendRegistry(config, backend)
+    from ._shared.oauth_usage import fetch_oauth_usage
+    from .oauth_registry import OAuthTokenRegistry
+
+    oauth_registry = OAuthTokenRegistry(usage_probe=fetch_oauth_usage)
+    registry = BackendRegistry(config, backend, oauth_registry=oauth_registry)
 
     from .selector import AutoSelector
-    selector = AutoSelector(registry, config)
+    selector = AutoSelector(registry, config, oauth_registry=oauth_registry)
     if config.auto_backend:
         if config.backend == 'local':
             # The initial --backend local was explicit; pin it so the startup
