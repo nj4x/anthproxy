@@ -168,7 +168,7 @@ describe('StatusPanel enterprise token card', () => {
       },
     }));
 
-    await screen.findByText('Enterprise token');
+    await screen.findByText('Anthropic-OAuth token');
     expect(screen.getByText('Eligible')).toBeInTheDocument();
     expect(screen.getByText('42% used')).toBeInTheDocument();
   });
@@ -186,7 +186,7 @@ describe('StatusPanel enterprise token card', () => {
       },
     }));
 
-    await screen.findByText('Enterprise token');
+    await screen.findByText('Anthropic-OAuth token');
     expect(screen.getByText('Spend cap reached')).toBeInTheDocument();
   });
 
@@ -203,7 +203,7 @@ describe('StatusPanel enterprise token card', () => {
         },
       }));
 
-      await screen.findByText('Enterprise token');
+      await screen.findByText('Anthropic-OAuth token');
       const redHead = Array.from(container.querySelectorAll('.bg-red-500')).find(
         (element) => element.getAttribute('style')?.includes('left: 50%'),
       );
@@ -225,7 +225,7 @@ describe('StatusPanel enterprise token card', () => {
         },
       }));
 
-      await screen.findByText('Enterprise token');
+      await screen.findByText('Anthropic-OAuth token');
       const greenHead = Array.from(container.querySelectorAll('.bg-green-500')).find(
         (element) => element.getAttribute('style')?.includes('left: 20%'),
       );
@@ -247,7 +247,7 @@ describe('StatusPanel enterprise token card', () => {
         },
       }));
 
-      await screen.findByText('Enterprise token');
+      await screen.findByText('Anthropic-OAuth token');
       const redHead = Array.from(container.querySelectorAll('.bg-red-500')).find(
         (element) => element.getAttribute('style')?.includes('left: 50%'),
       );
@@ -279,7 +279,7 @@ describe('StatusPanel enterprise token card', () => {
     }));
 
     await screen.findByText('5-hour window');
-    expect(screen.queryByText('Enterprise token')).not.toBeInTheDocument();
+    expect(screen.queryByText('Anthropic-OAuth token')).not.toBeInTheDocument();
   });
 });
 
@@ -289,7 +289,7 @@ describe('StatusPanel backend labels', () => {
     vi.clearAllMocks();
   });
 
-  it('renders the oauth backend as "Enterprise"', async () => {
+  it('renders the oauth backend as "Anthropic-OAuth"', async () => {
     renderStatus(statusWithUsage({}, {
       active_backend: 'oauth',
       backends: [
@@ -298,7 +298,7 @@ describe('StatusPanel backend labels', () => {
       ],
     }));
 
-    await screen.findByText('Enterprise');
+    await screen.findByText('Anthropic-OAuth');
     expect(screen.queryByText('oauth')).not.toBeInTheDocument();
   });
 });

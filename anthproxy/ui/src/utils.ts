@@ -4,12 +4,12 @@ export interface SessionLabel {
 }
 
 const BACKEND_LABELS: Record<string, string> = {
-  oauth: 'Enterprise',
+  oauth: 'Anthropic-OAuth',
 };
 
 /**
- * Human-facing label for a stored backend name.  The enterprise OAuth token is
- * persisted as the bare backend name "oauth"; operators see it as "Enterprise".
+ * Human-facing label for a stored backend name.  The Anthropic OAuth token is
+ * persisted as the bare backend name "oauth"; operators see it as "Anthropic-OAuth".
  * Unknown names pass through unchanged.
  */
 export function backendLabel(name: string | null | undefined): string {

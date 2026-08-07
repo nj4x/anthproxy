@@ -191,7 +191,7 @@ function EnterpriseTokenCard({ token }: { token: EnterpriseToken }) {
   return (
     <div className="bg-gray-50 rounded-lg p-4 min-w-48 space-y-3">
       <div className="flex items-center gap-2">
-        <span className="text-sm font-medium text-gray-700">Enterprise token</span>
+        <span className="text-sm font-medium text-gray-700">Anthropic-OAuth token</span>
         {ageLabel != null && (
           <span className="text-xs text-gray-400">updated {ageLabel}{token.usage_stale ? ' (stale)' : ''}</span>
         )}
