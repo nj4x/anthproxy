@@ -107,6 +107,17 @@ def _make_selector(backends: dict, initial: str = 'bedrock') -> tuple:
 
 class TestSubscriptionBackend(unittest.TestCase):
 
+    def test_usage_rate_limit_error_describes_retry_guidance(self):
+        self.assertEqual(
+            str(UsageRateLimitError(retry_after=30.0)),
+            'retry after 30.0s',
+        )
+        self.assertEqual(
+            str(UsageRateLimitError(retry_after=0.0)),
+            'retry after 0.0s',
+        )
+        self.assertEqual(str(UsageRateLimitError()), 'no retry guidance')
+
     def test_caches_success_for_ttl_window(self):
         backend = _TestSubscriptionBackend([{'ok': 1}])
         first = backend.get_usage(None)

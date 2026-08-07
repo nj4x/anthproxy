@@ -4,9 +4,11 @@ import threading
 
 import pytest
 
+from anthproxy._shared import UsageRateLimitError
 from anthproxy.oauth_registry import (
+    _DEFAULT_COOLDOWN_SECONDS,
     _MAX_TOKENS,
-    _USAGE_TTL_SECONDS,
+    _MIN_PROBE_COOLDOWN_SECONDS,
     OAuthTokenRegistry,
     _next_month,
 )
@@ -460,6 +462,125 @@ def test_probe_failure_log_shows_fingerprint_not_raw_token(caplog):
     log_text = ' '.join(r.getMessage() for r in caplog.records)
     assert raw_token not in log_text
     assert 'Authentication failed' in log_text
+
+
+# ---------------------------------------------------------------------------
+# Rate-limited usage probe honors retry_after via cooldown backoff
+# ---------------------------------------------------------------------------
+
+def _rate_limited_registry(clock, retry_after, calls):
+    def probe(token):
+        calls.append(token)
+        raise UsageRateLimitError(retry_after=retry_after)
+
+    registry = OAuthTokenRegistry(
+        usage_probe=probe, monotonic=clock.mono, utcnow=clock.now,
+    )
+    registry.observe('secret')
+    return registry
+
+
+def test_rate_limited_probe_backs_off_until_retry_after_elapses():
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    calls = []
+    registry = _rate_limited_registry(clock, 120.0, calls)
+
+    registry.tick()
+    assert calls == ['secret']
+    assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(120.0)
+
+    clock.monotonic += 119
+    registry.tick()  # still within retry window: no re-probe despite usage_at==0
+    assert calls == ['secret']
+
+    clock.monotonic += 2  # past the 120s retry window
+    registry.tick()
+    assert calls == ['secret', 'secret']
+
+
+def test_rate_limited_probe_zero_retry_after_is_floored_to_min_cooldown():
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    calls = []
+    registry = _rate_limited_registry(clock, 0.0, calls)
+
+    registry.tick()
+    assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(
+        _MIN_PROBE_COOLDOWN_SECONDS
+    )
+
+    clock.monotonic += _MIN_PROBE_COOLDOWN_SECONDS - 1
+    registry.tick()  # floored window not yet elapsed
+    assert calls == ['secret']
+
+    clock.monotonic += 2
+    registry.tick()
+    assert calls == ['secret', 'secret']
+
+
+def test_rate_limited_probe_missing_retry_after_falls_back_to_default_cooldown():
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    calls = []
+    registry = _rate_limited_registry(clock, None, calls)
+
+    registry.tick()
+    assert registry.snapshot().cooldown_remaining_seconds == pytest.approx(
+        _DEFAULT_COOLDOWN_SECONDS
+    )
+
+    clock.monotonic += _DEFAULT_COOLDOWN_SECONDS - 1
+    registry.tick()
+    assert calls == ['secret']
+
+
+def test_force_tick_respects_rate_limit_cooldown():
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    calls = []
+    registry = _rate_limited_registry(clock, 120.0, calls)
+
+    registry.tick()
+    assert calls == ['secret']
+
+    # force bypasses TTL staleness but must NOT bypass rate-limit cooldown.
+    registry.tick(force=True)
+    assert calls == ['secret']
+
+
+def test_rate_limited_probe_logs_at_info_not_warning(caplog):
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+    calls = []
+    registry = _rate_limited_registry(clock, 120.0, calls)
+
+    with caplog.at_level(logging.INFO, logger='anthproxy.oauth_registry'):
+        registry.tick()
+
+    levels = {r.levelno for r in caplog.records}
+    assert logging.INFO in levels
+    assert logging.WARNING not in levels
+    text = ' '.join(r.getMessage() for r in caplog.records)
+    assert 'throttled' in text
+    assert 'retry after 120' in text  # ticket 01 __str__ surfaces the window
+
+
+def test_non_rate_limit_probe_failure_stays_at_warning_without_cooldown(caplog):
+    clock = _Clock(dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc))
+
+    def probe(token):
+        raise RuntimeError('Authentication failed for usage endpoint')
+
+    registry = OAuthTokenRegistry(
+        usage_probe=probe, monotonic=clock.mono, utcnow=clock.now,
+    )
+    credential = registry.observe('secret')
+
+    with caplog.at_level(logging.INFO, logger='anthproxy.oauth_registry'):
+        registry.tick()
+
+    # Generic failures keep the WARNING level and set no rate-limit cooldown.
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    snapshot = registry.snapshot(credential.generation)
+    assert snapshot.cooldown_remaining_seconds == pytest.approx(0.0)
+    assert snapshot.health_ok is False
+    assert snapshot.usage is None
 
 
 def test_probe_success_log_shows_fingerprint_not_raw_token(caplog):
