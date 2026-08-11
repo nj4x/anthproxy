@@ -216,6 +216,7 @@ export interface EnterpriseToken {
   monthly_blocked: boolean;
   usage_age_seconds: number | null;
   usage_stale: boolean;
+  month_elapsed_pct: number;
 }
 
 export interface StatusResponse {

@@ -905,6 +905,7 @@ class BackendRegistry:
             'monthly_blocked': snap.monthly_blocked,
             'usage_age_seconds': snap.usage_age_seconds,
             'usage_stale': snap.usage_stale,
+            'month_elapsed_pct': snap.month_elapsed_pct,
         }
 
     def usage_snapshot(self) -> dict:

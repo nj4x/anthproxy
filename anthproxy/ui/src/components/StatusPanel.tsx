@@ -214,12 +214,10 @@ function EnterpriseTokenCard({ token }: { token: EnterpriseToken }) {
         {burn != null && (() => {
           const pct = Math.min(burn, 100);
           const barColor = burn >= 100 ? 'bg-red-500' : burn >= 80 ? 'bg-amber-500' : 'bg-blue-500';
-          // Pace reference for the calendar-month quota: fraction of the month
-          // already elapsed. No backend reset timestamp exists, so derive it
-          // client-side. Red head = burning ahead of pace; green = below.
-          const now = new Date();
-          const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-          const monthElapsedPct = ((now.getDate() - 1) / daysInMonth) * 100;
+          // Pace reference for the calendar-month quota: fraction of the UTC
+          // month already elapsed, computed server-side (matches the self-pace
+          // gate the server actually acts on, ADR-0016).
+          const monthElapsedPct = token.month_elapsed_pct;
           const hasRedHead = pct > monthElapsedPct;
           const hasGreenHead = monthElapsedPct - pct > 0.5;
           return (
