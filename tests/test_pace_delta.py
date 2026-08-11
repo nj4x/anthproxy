@@ -50,6 +50,24 @@ class TestMonthElapsedPct:
         assert got == (30 / 31) * 100.0
         assert got < 100.0
 
+    def test_intra_day_drifts_within_calendar_day(self):
+        # Same calendar day, later second-of-day yields a strictly higher pct.
+        midnight = _month_elapsed_pct(dt.datetime(2026, 8, 5, 0, 0, 0, tzinfo=dt.timezone.utc))
+        got = _month_elapsed_pct(dt.datetime(2026, 8, 5, 13, 7, 29, tzinfo=dt.timezone.utc))
+        assert got > midnight
+        seconds_into_day = 13 * 3600 + 7 * 60 + 29
+        expected = (4 + seconds_into_day / 86400.0) / 31 * 100.0
+        assert got == expected
+
+    def test_intra_day_just_before_midnight_stays_below_next_day(self):
+        got = _month_elapsed_pct(dt.datetime(2026, 8, 5, 23, 59, 59, tzinfo=dt.timezone.utc))
+        next_day_midnight = _month_elapsed_pct(dt.datetime(2026, 8, 6, 0, 0, 0, tzinfo=dt.timezone.utc))
+        assert got < next_day_midnight
+
+    def test_last_day_intra_day_stays_below_100(self):
+        got = _month_elapsed_pct(dt.datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt.timezone.utc))
+        assert got < 100.0
+
     def test_snapshot_populates_month_elapsed(self):
         walls = [dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc)]
         registry = OAuthTokenRegistry(utcnow=lambda: walls[0])
