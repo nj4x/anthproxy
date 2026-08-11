@@ -284,6 +284,20 @@ def test_reason_oauth_wins():
     assert 'enterprise weekly 10.0% below personal 40.0%' == reason
 
 
+def test_reason_self_pace_gate_differs_from_relative_win():
+    snap = OAuthTokenSnapshot(eligible=True, burn=5.0)
+    cred = object()
+    relative = _oauth_decision_reason(
+        cred, snap, True, 40.0, pace_on=True, oauth_delta=-7.9, personal_delta=-2.0,
+    )
+    gated = _oauth_decision_reason(
+        cred, snap, True, 40.0, pace_on=True, oauth_delta=-7.9, personal_delta=-2.0,
+        self_pace=True,
+    )
+    assert gated == 'enterprise behind its own monthly pace by 7.9pp (self-pace gate)'
+    assert gated != relative
+
+
 def test_reason_cooldown():
     snap = _ineligible(cooldown_remaining_seconds=90.0)
     assert 'enterprise in cooldown (90s remaining)' == _oauth_decision_reason(
