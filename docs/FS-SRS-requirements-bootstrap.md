@@ -59,4 +59,26 @@ This document bootstraps the requirements corpus for anthproxy's backend-selecti
 
 ---
 
-These SRS items anchor ADR-0015 (pace-delta backend selection) and can be extended with additional routing contracts as the system evolves.
+## FS-Routing-003: Expiring enterprise capacity should be consumed rather than forfeited at monthly reset
+
+**Product outcome**: Enterprise OAuth monthly capacity is a prepaid allotment that resets at UTC month boundary. Unspent capacity is forfeited and represents a sunk cost; routing should actively consume the monthly allowance rather than protect an underutilized subscription backend at the expense of enterprise quota expiration.
+
+**Constraint**: When an enterprise token is eligible and behind its own monthly pace, it should receive traffic priority over a flat-fee subscription backend that is also behind its own pace but whose underutilization has no cost consequence.
+
+---
+
+## SRS-Routing-003: Expiring-quota precedence gate for enterprise backends
+
+**Source FS**: FS-Routing-003
+
+**System contract**: When the auto-backend selector evaluates an enterprise OAuth token backend that carries a time-bounded expiring quota (monthly reset), it shall apply a precedence gate: if the token's quota utilization is behind its linear monthly pace, the token shall take priority over other backends for dispatch, subject to hard eligibility gates (cooldown, spend-cap, health, staleness).
+
+- The gate threshold is operator-tunable via `auto_backend_oauth_pace_deadband_pp` (the same stability margin used in pace-delta ranking).
+- The gate is exempt from the stability-margin hysteresis invariant of SRS-Routing-001:30-41, because the gate operates on a single-backend absolute test rather than a multi-backend comparison. Flapping near the gate threshold is mitigated by the usage-probe cadence (typically 300s between utilization updates); real-world crossing frequency is bounded by probe refresh, not per-request.
+- The gate never resurrects a backend that fails hard eligibility gates.
+
+**Applicability**: Applies only when the inbound request carries an `Authorization: Bearer <token>` header, which signals explicit delegation to the enterprise token. Requests without a bearer token do not engage this gate.
+
+---
+
+These SRS items anchor ADR-0015 (pace-delta backend selection) and ADR-0016 (OAuth self-pace gate) and can be extended with additional routing contracts as the system evolves.

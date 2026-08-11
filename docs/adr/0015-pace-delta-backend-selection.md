@@ -9,9 +9,11 @@ source-srs: docs/FS-SRS-requirements-bootstrap.md (SRS-Routing-001, SRS-Routing-
 
 **Date**: 2026-08-05
 
-**Status**: Decided (under grilling)
+**Status**: Accepted
 
 **Source SRS**: SRS-Routing-001, SRS-Routing-002
+
+**Amended by**: [ADR-0016](0016-oauth-self-pace-gate.md) — adds an absolute self-pace precedence gate ahead of the OAuth-vs-personal comparison (lines 56-59 below), and refines the `month_elapsed_pct` formula to include an intra-day term for continuous progression (lines 39-40 below).
 
 ## Context
 
@@ -34,11 +36,17 @@ Replace raw-% comparison with **pace delta**: `burn% − elapsed%`, where:
 
 ### Elapsed formulas (realization)
 
-**Month elapsed** (enterprise OAuth, UTC):
+**Month elapsed** (enterprise OAuth, UTC) — **superseded by [ADR-0016](0016-oauth-self-pace-gate.md); see note below**:
 ```
 month_elapsed_pct = (now_utc.day − 1) / days_in_month(now_utc.year, now_utc.month) × 100
 ```
 Computed in UTC (matches the real spend-cap reset boundary). `days_in_month` derived via `calendar.monthrange`. Range is `[0, ~96.8]` by construction; no clamping needed because `now_utc.day ∈ [1, days_in_month]`.
+
+> **Superseded (ADR-0016, per SRS-Routing-003)**: the formula above steps once per UTC day, which freezes `elapsed` for 24h and makes the self-pace precedence gate un-rearmable mid-day. ADR-0016 adds an intra-day term:
+> ```
+> month_elapsed_pct = (now_utc.day − 1 + seconds_into_utc_day / 86400) / days_in_month(...) × 100
+> ```
+> Range widens to `[0, 100)`. The UTC basis (SRS-Routing-002) is unchanged.
 
 **Weekly elapsed** (personal, from API reset timestamp):
 ```
@@ -56,6 +64,7 @@ else:
 **OAuth vs personal** (`server.py:snapshot_for_request`):
 - `oauth_delta = oauth.burn − month_elapsed_pct`.
 - `personal_delta = personal.burn − (personal.weekly_elapsed_pct if not None else 50.0)`.
+- **Absolute self-pace gate** (added in [ADR-0016](0016-oauth-self-pace-gate.md), per SRS-Routing-003): if `oauth_delta < -deadband_pp`, OAuth wins outright and the comparison below is skipped. Otherwise:
 - `oauth_wins` iff `oauth_delta < personal_delta − deadband_pp` where `deadband_pp = auto_backend_oauth_pace_deadband_pp` (default `3.0`, percentage points). Strict `<`: equality means personal wins (incumbent-friendly).
 - The **personal representative** is chosen by minimum pace delta across the personal candidate pool (not by raw burn). A lower-delta personal candidate must not be eliminated before the OAuth comparison runs.
 
@@ -116,6 +125,8 @@ else:
 **SRS-Routing-001** (pace-delta normalization across windows) and **SRS-Routing-002** (UTC month-elapsed derivation).
 
 Both requirements are defined in `docs/FS-SRS-requirements-bootstrap.md` alongside their product outcomes (FS-Routing-001, FS-Routing-002).
+
+The two amended passages in this document — the intra-day `month_elapsed_pct` formula and the absolute self-pace gate in the OAuth-vs-personal comparison — are governed by **SRS-Routing-003** (expiring-quota precedence gate) and decided in [ADR-0016](0016-oauth-self-pace-gate.md). They are annotated inline at their point of use.
 
 ---
 

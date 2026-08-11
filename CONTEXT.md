@@ -43,3 +43,13 @@ _Avoid_: classifier input, classification payload
 **Context Key**:
 The composite routing cache key `session_id + "\x00" + first_user_message_hash`. Used for the tier cache and the session-context size floor to isolate sub-agents from their parent sessions.
 _Avoid_: session key, routing key
+
+## Backend Selection
+
+**Pace Delta**:
+A backend's quota consumption relative to the linear passage of its own quota window: `burn% − elapsed%`. Negative means behind schedule (headroom to spare); positive means ahead of schedule. Comparable across windows of differing length.
+_Avoid_: burn rate, utilization delta
+
+**Self-Pace Gate**:
+The absolute test `oauth_delta < 0` — is this backend behind its *own* schedule — evaluated before any cross-backend comparison. Distinct from the pace-delta *comparison*, which asks only which backend is further behind.
+_Avoid_: pace check, budget gate
