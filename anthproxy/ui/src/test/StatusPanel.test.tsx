@@ -165,6 +165,7 @@ describe('StatusPanel enterprise token card', () => {
         monthly_blocked: false,
         usage_age_seconds: 10,
         usage_stale: false,
+        month_elapsed_pct: 50,
       },
     }));
 
@@ -183,6 +184,7 @@ describe('StatusPanel enterprise token card', () => {
         monthly_blocked: true,
         usage_age_seconds: 5,
         usage_stale: false,
+        month_elapsed_pct: 50,
       },
     }));
 
@@ -190,75 +192,59 @@ describe('StatusPanel enterprise token card', () => {
     expect(screen.getByText('Spend cap reached')).toBeInTheDocument();
   });
 
-  it('renders a red head when burn is ahead of the month-elapsed pace', async () => {
-    // 2026-09-16: September has 30 days → monthElapsedPct = (16-1)/30 = 50%.
-    // burn=95 > 50 → red head [50%, 95%], width=45%.
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.setSystemTime(new Date(2026, 8, 16));
-    try {
-      const { container } = renderStatus(statusWithUsage({}, {
-        enterprise_token: {
-          present: true, eligible: true, burn_pct: 95, cooldown_remaining_seconds: 0,
-          monthly_blocked: false, usage_age_seconds: 10, usage_stale: false,
-        },
-      }));
+  it('renders a red head when burn is ahead of the server-supplied month-elapsed pace', async () => {
+    // month_elapsed_pct=50 (server-computed). burn=95 > 50 → red head [50%, 95%], width=45%.
+    const { container } = renderStatus(statusWithUsage({}, {
+      enterprise_token: {
+        present: true, eligible: true, burn_pct: 95, cooldown_remaining_seconds: 0,
+        monthly_blocked: false, usage_age_seconds: 10, usage_stale: false,
+        month_elapsed_pct: 50,
+      },
+    }));
 
-      await screen.findByText('Anthropic-OAuth token');
-      const redHead = Array.from(container.querySelectorAll('.bg-red-500')).find(
-        (element) => element.getAttribute('style')?.includes('left: 50%'),
-      );
-      expect(redHead).toHaveStyle({ left: '50%', width: '45%' });
-    } finally {
-      vi.useRealTimers();
-    }
+    await screen.findByText('Anthropic-OAuth token');
+    const redHead = Array.from(container.querySelectorAll('.bg-red-500')).find(
+      (element) => element.getAttribute('style')?.includes('left: 50%'),
+    );
+    expect(redHead).toHaveStyle({ left: '50%', width: '45%' });
   });
 
-  it('renders a green head when burn is below the month-elapsed pace', async () => {
-    // 2026-09-16 → monthElapsedPct = 50%. burn=20 < 50 → green head [20%, 50%], width=30%.
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.setSystemTime(new Date(2026, 8, 16));
-    try {
-      const { container } = renderStatus(statusWithUsage({}, {
-        enterprise_token: {
-          present: true, eligible: true, burn_pct: 20, cooldown_remaining_seconds: 0,
-          monthly_blocked: false, usage_age_seconds: 10, usage_stale: false,
-        },
-      }));
+  it('renders a green head when burn is below the server-supplied month-elapsed pace', async () => {
+    // month_elapsed_pct=50. burn=20 < 50 → green head [20%, 50%], width=30%.
+    const { container } = renderStatus(statusWithUsage({}, {
+      enterprise_token: {
+        present: true, eligible: true, burn_pct: 20, cooldown_remaining_seconds: 0,
+        monthly_blocked: false, usage_age_seconds: 10, usage_stale: false,
+        month_elapsed_pct: 50,
+      },
+    }));
 
-      await screen.findByText('Anthropic-OAuth token');
-      const greenHead = Array.from(container.querySelectorAll('.bg-green-500')).find(
-        (element) => element.getAttribute('style')?.includes('left: 20%'),
-      );
-      expect(greenHead).toHaveStyle({ left: '20%', width: '30%' });
-    } finally {
-      vi.useRealTimers();
-    }
+    await screen.findByText('Anthropic-OAuth token');
+    const greenHead = Array.from(container.querySelectorAll('.bg-green-500')).find(
+      (element) => element.getAttribute('style')?.includes('left: 20%'),
+    );
+    expect(greenHead).toHaveStyle({ left: '20%', width: '30%' });
   });
 
   it('renders neither head at the exact month-elapsed pace boundary', async () => {
-    // 2026-09-16 → monthElapsedPct = 50%. burn=50 → neither head (0.5% floor).
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.setSystemTime(new Date(2026, 8, 16));
-    try {
-      const { container } = renderStatus(statusWithUsage({}, {
-        enterprise_token: {
-          present: true, eligible: true, burn_pct: 50, cooldown_remaining_seconds: 0,
-          monthly_blocked: false, usage_age_seconds: 10, usage_stale: false,
-        },
-      }));
+    // month_elapsed_pct=50. burn=50 → neither head (0.5% floor).
+    const { container } = renderStatus(statusWithUsage({}, {
+      enterprise_token: {
+        present: true, eligible: true, burn_pct: 50, cooldown_remaining_seconds: 0,
+        monthly_blocked: false, usage_age_seconds: 10, usage_stale: false,
+        month_elapsed_pct: 50,
+      },
+    }));
 
-      await screen.findByText('Anthropic-OAuth token');
-      const redHead = Array.from(container.querySelectorAll('.bg-red-500')).find(
-        (element) => element.getAttribute('style')?.includes('left: 50%'),
-      );
-      const greenHead = Array.from(container.querySelectorAll('.bg-green-500')).find(
-        (element) => element.getAttribute('style')?.includes('left:'),
-      );
-      expect(redHead).toBeUndefined();
-      expect(greenHead).toBeUndefined();
-    } finally {
-      vi.useRealTimers();
-    }
+    await screen.findByText('Anthropic-OAuth token');
+    const redHead = Array.from(container.querySelectorAll('.bg-red-500')).find(
+      (element) => element.getAttribute('style')?.includes('left: 50%'),
+    );
+    const greenHead = Array.from(container.querySelectorAll('.bg-green-500')).find(
+      (element) => element.getAttribute('style')?.includes('left:'),
+    );
+    expect(redHead).toBeUndefined();
+    expect(greenHead).toBeUndefined();
   });
 
   it('omits the card when no token has been observed', async () => {
@@ -275,6 +261,7 @@ describe('StatusPanel enterprise token card', () => {
         monthly_blocked: false,
         usage_age_seconds: null,
         usage_stale: false,
+        month_elapsed_pct: 0,
       },
     }));
 

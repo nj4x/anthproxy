@@ -224,10 +224,14 @@ def parse_args(argv=None) -> Config:
                    dest='auto_backend_oauth_pace_deadband_pp', type=float,
                    default=float(os.environ.get(
                        'ANTHPROXY_AUTO_BACKEND_OAUTH_PACE_DEADBAND_PP', '3')),
-                   help='Dead-band in percentage points for the enterprise-vs-personal'
-                        ' pace-delta gate: enterprise wins only when its pace delta is more'
-                        ' than this far below the personal representative, preventing flapping'
-                        ' when deltas cross (default: 3, env:'
+                   help='Stability margin in percentage points, shared by two enterprise'
+                        ' pace gates. Self-pace: enterprise wins outright when its own pace'
+                        ' delta is more than this far below zero, since the monthly cap is'
+                        ' use-it-or-lose-it. Otherwise enterprise-vs-personal: enterprise'
+                        ' wins only when its pace delta is more than this far below the'
+                        ' personal representative, preventing flapping when deltas cross.'
+                        ' Raising it damps switching but also delays the self-pace gate.'
+                        ' Negative values are clamped to 0 (default: 3, env:'
                         ' ANTHPROXY_AUTO_BACKEND_OAUTH_PACE_DEADBAND_PP)')
     p.add_argument('--auto-model-routing', dest='auto_model_routing',
                    action=argparse.BooleanOptionalAction,

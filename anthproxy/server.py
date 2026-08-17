@@ -38,19 +38,26 @@ _NEUTRAL_ELAPSED = 50.0
 
 
 def _oauth_decision_reason(oauth_credential, oauth, oauth_wins, personal_burn,
-                           pace_on=False, oauth_delta=None, personal_delta=None):
+                           pace_on=False, oauth_delta=None, personal_delta=None,
+                           *, self_pace=False):
     """Explain why enterprise (oauth) was or was not chosen over personal.
 
     ``oauth`` is an ``OAuthTokenSnapshot`` (or None when the request carried no
     tracked enterprise token).  ``oauth_wins`` is the final comparison result.
     When ``pace_on`` the win/lose messages reference pace deltas
-    (``burn − elapsed``); otherwise they reference raw burn%.
+    (``burn − elapsed``); otherwise they reference raw burn%.  ``self_pace``
+    marks a win from the ADR-0016 gate, where personal was never consulted.
     """
     if oauth_credential is None:
         return 'no enterprise token on request'
     if oauth is None:
         return 'enterprise token not tracked'
     if oauth_wins:
+        if self_pace:
+            return (
+                f'enterprise behind its own monthly pace by '
+                f'{abs(oauth_delta):.1f}pp (self-pace gate)'
+            )
         if pace_on:
             return (
                 f'enterprise pace delta {oauth_delta:.1f}pp below '
@@ -407,6 +414,7 @@ class BackendRegistry:
         pace_on = _pace_enabled(self._config)
         oauth_delta = None
         personal_delta = None
+        self_pace_gate = False
         if not pace_on:
             oauth_wins = (
                 oauth_valid
@@ -415,21 +423,31 @@ class BackendRegistry:
                 and not math.isclose(oauth.burn, personal_burn, rel_tol=1e-6)
             )
         else:
-            deadband = getattr(
+            # A negative margin would let an ahead-of-pace token win the
+            # self-pace gate; clamp at the read site rather than trust the operator knob.
+            deadband = max(0.0, getattr(
                 self._config, 'auto_backend_oauth_pace_deadband_pp', 3.0,
-            )
+            ))
             personal_elapsed_val = (
                 personal_elapsed if personal_elapsed is not None else _NEUTRAL_ELAPSED
             )
             personal_delta = personal_burn - personal_elapsed_val
             if oauth_valid and oauth.burn is not None:
                 oauth_delta = oauth.burn - oauth.month_elapsed_pct
-            # Strict '<' with the dead-band: equality (or within the band) keeps
-            # the incumbent personal backend.
-            oauth_wins = (
-                oauth_delta is not None
-                and oauth_delta < personal_delta - deadband
-            )
+            # Self-pace gate (ADR-0016): the enterprise monthly cap is
+            # use-it-or-lose-it, so a token behind its own pace wins outright and
+            # the personal comparison is never consulted.  Strict '<' mirrors the
+            # relative tie rule: exactly at the margin the gate stays shut.
+            self_pace_gate = oauth_delta is not None and oauth_delta < -deadband
+            if self_pace_gate:
+                oauth_wins = True
+            else:
+                # Strict '<' with the dead-band: equality (or within the band)
+                # keeps the incumbent personal backend.
+                oauth_wins = (
+                    oauth_delta is not None
+                    and oauth_delta < personal_delta - deadband
+                )
         _log_oauth_selection(
             session_key, oauth_credential, oauth,
             personal_name, personal_burn,
@@ -437,7 +455,7 @@ class BackendRegistry:
             reason=_oauth_decision_reason(
                 oauth_credential, oauth, oauth_wins, personal_burn,
                 pace_on=pace_on, oauth_delta=oauth_delta,
-                personal_delta=personal_delta,
+                personal_delta=personal_delta, self_pace=self_pace_gate,
             ),
         )
         if oauth_wins:
@@ -887,6 +905,7 @@ class BackendRegistry:
             'monthly_blocked': snap.monthly_blocked,
             'usage_age_seconds': snap.usage_age_seconds,
             'usage_stale': snap.usage_stale,
+            'month_elapsed_pct': snap.month_elapsed_pct,
         }
 
     def usage_snapshot(self) -> dict:

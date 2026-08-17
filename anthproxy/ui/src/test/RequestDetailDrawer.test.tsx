@@ -90,9 +90,10 @@ describe('RequestDetailDrawer', () => {
   });
 
   it('does not show content when requestId is null', () => {
-    const { container } = renderDrawer(null);
-    // The panel should be translated off-screen
-    const panel = container.querySelector('.translate-x-full');
+    renderDrawer(null);
+    // The drawer is rendered via createPortal(..., document.body), so it lives
+    // outside the render container; the panel should be translated off-screen.
+    const panel = document.body.querySelector('.translate-x-full');
     expect(panel).toBeTruthy();
   });
 

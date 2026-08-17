@@ -253,6 +253,25 @@ def test_oauth_token_status_reports_eligible_fields():
     assert status['cooldown_remaining_seconds'] == 0.0
 
 
+def test_oauth_token_status_reports_month_elapsed_pct():
+    oauth_registry, _ = _eligible_oauth(12.5)
+    registry = _registry(oauth_registry)
+
+    status = registry.oauth_token_status()
+
+    month_elapsed = status['month_elapsed_pct']
+    assert isinstance(month_elapsed, float)
+    assert 0.0 <= month_elapsed < 100.0
+
+
+def test_oauth_token_status_month_elapsed_pct_defaults_to_zero_before_observation():
+    registry = _registry(OAuthTokenRegistry())
+
+    status = registry.oauth_token_status()
+
+    assert status['month_elapsed_pct'] == 0.0
+
+
 def _ineligible(**overrides):
     """Return an OAuthTokenSnapshot with eligible=False and specified fields."""
     defaults = dict(
@@ -282,6 +301,20 @@ def test_reason_oauth_wins():
     cred = object()
     reason = _oauth_decision_reason(cred, snap, True, 40.0)
     assert 'enterprise weekly 10.0% below personal 40.0%' == reason
+
+
+def test_reason_self_pace_gate_differs_from_relative_win():
+    snap = OAuthTokenSnapshot(eligible=True, burn=5.0)
+    cred = object()
+    relative = _oauth_decision_reason(
+        cred, snap, True, 40.0, pace_on=True, oauth_delta=-7.9, personal_delta=-2.0,
+    )
+    gated = _oauth_decision_reason(
+        cred, snap, True, 40.0, pace_on=True, oauth_delta=-7.9, personal_delta=-2.0,
+        self_pace=True,
+    )
+    assert gated == 'enterprise behind its own monthly pace by 7.9pp (self-pace gate)'
+    assert gated != relative
 
 
 def test_reason_cooldown():

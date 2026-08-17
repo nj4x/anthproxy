@@ -303,14 +303,16 @@ class OAuthTokenRegistry:
 
 
 def _month_elapsed_pct(now: dt.datetime) -> float:
-    """Fraction of the current UTC month already elapsed by calendar day, 0–100.
+    """Fraction of the current UTC month already elapsed, continuous by second, 0–100.
 
     Matches the real spend-cap reset boundary (UTC month rollover).  ``day`` is
-    1-based, so day 1 yields 0.0 and the last day yields ``(n-1)/n × 100``; the
-    result is in ``[0, ~96.8]`` by construction, needing no clamp.
+    1-based and drifts continuously across the day via second-of-day, so day 1
+    at midnight yields 0.0 and the result is in ``[0, 100)`` by construction,
+    needing no clamp.
     """
     days_in_month = calendar.monthrange(now.year, now.month)[1]
-    return (now.day - 1) / days_in_month * 100.0
+    seconds_into_utc_day = now.hour * 3600 + now.minute * 60 + now.second
+    return (now.day - 1 + seconds_into_utc_day / 86400.0) / days_in_month * 100.0
 
 
 def _next_month(now: dt.datetime) -> dt.datetime:
