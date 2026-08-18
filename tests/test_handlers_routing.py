@@ -761,10 +761,57 @@ class TestSessionKey:
     def test_non_dict_metadata_returns_none(self):
         assert _session_key({'metadata': 'oops'}) is None
 
-    def test_user_id_truncated_to_128(self):
+    def _collision_test_ids(self):
+        """Build two session IDs that share a 128-char prefix but differ afterward.
+        Returns (id_a, id_b) where both would have collided under the old truncation."""
+        shared = '{"device_id":"' + ('a' * 64) + '","session_id":"'
+        shared = shared.ljust(128, 'x')
+        id_a = shared + 'aaaaaaaa-1111-1111-1111-111111111111","account_uuid":"acct-a"}'
+        id_b = shared + 'bbbbbbbb-2222-2222-2222-222222222222","account_uuid":"acct-b"}'
+        assert id_a[:128] == id_b[:128]
+        return id_a, id_b
+
+    def test_full_user_id_preserved(self):
         long_id = 'x' * 200
         result = _session_key({'metadata': {'user_id': long_id}})
-        assert result == 'x' * 128
+        assert result == long_id
+        assert len(result) == 200
+
+    def test_distinct_metadata_produces_distinct_keys(self):
+        id_a, id_b = self._collision_test_ids()
+        key_a = _session_key({'metadata': {'user_id': id_a}})
+        key_b = _session_key({'metadata': {'user_id': id_b}})
+        assert key_a != key_b
+
+    def test_session_override_isolation(self, monkeypatch):
+        """Two sessions whose metadata shares a 128-char prefix must not share
+        backend overrides once the full blob is used as the session key."""
+        from anthproxy.config import Config
+        from anthproxy.server import BackendRegistry
+
+        class _FakeBackend:
+            def __init__(self, name):
+                self.name = name
+
+        created = {}
+
+        def fake_build(name, config):
+            created.setdefault(name, _FakeBackend(name))
+            return created[name]
+
+        monkeypatch.setattr('anthproxy.server.build_backend', fake_build)
+
+        config = Config(backend='bedrock')
+        registry = BackendRegistry(config, _FakeBackend('bedrock'))
+
+        id_a, id_b = self._collision_test_ids()
+        key_a = _session_key({'metadata': {'user_id': id_a}})
+        key_b = _session_key({'metadata': {'user_id': id_b}})
+
+        registry.set_session_backend(key_a, 'local')
+
+        assert registry.session_backend(key_a) == 'local'
+        assert registry.session_backend(key_b) is None
 
 
 # ---------------------------------------------------------------------------
