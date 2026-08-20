@@ -46,6 +46,7 @@ curl -X POST http://localhost:8082/v1/messages \
 | **Codex** | OAuth (ChatGPT account) | ChatGPT Codex via OpenAI Codex endpoint |
 | **OpenRouter** | API key in config | OpenRouter's Anthropic-compatible gateway |
 | **Local** | None | LM Studio or local Anthropic-compatible server |
+| **Peer** | `X-Anthproxy-Peer-Key` from `--peer-api-key` (optional) | Another anthproxy instance via its `/v1/messages` |
 
 ## Configuration
 

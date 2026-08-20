@@ -46,7 +46,7 @@ RESERVED_NAMES: frozenset[str] = frozenset(VALID_BACKEND_MODES) | {SESSION_SUBSC
 
 # Canonical order for user-facing lists (CLI choices, help text, etc.).
 _DECLARED_ORDER: tuple[str, ...] = (
-    'bedrock', 'codex', 'anthropic', 'local', 'openrouter',
+    'bedrock', 'codex', 'anthropic', 'local', 'openrouter', 'peer',
 )
 _INTERNAL_BACKENDS: frozenset[str] = frozenset({'oauth'})
 

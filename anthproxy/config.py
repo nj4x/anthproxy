@@ -136,6 +136,8 @@ class Config:
     anthropic_home: str = ''
     openrouter_api_key: str = ''
     local_base_url: str = 'http://127.0.0.1:1235'
+    peer_base_url: str = ''
+    peer_api_key: str = ''
     auto_backend: bool = True
     auto_backend_mode: str = 'subscription'
     auto_backend_interval: float = 60.0
@@ -225,6 +227,16 @@ def parse_args(argv=None) -> Config:
                    help='Base URL for the local (LM Studio) backend'
                         ' (default: http://127.0.0.1:1235,'
                         ' env: ANTHPROXY_LOCAL_BASE_URL)')
+    p.add_argument('--peer-base-url', dest='peer_base_url',
+                   default=os.environ.get('ANTHPROXY_PEER_BASE_URL', ''),
+                   help='Base URL of another anthproxy instance to dispatch to'
+                        ' via the peer backend (default: unset,'
+                        ' env: ANTHPROXY_PEER_BASE_URL)')
+    p.add_argument('--peer-api-key', dest='peer_api_key',
+                   default=os.environ.get('ANTHPROXY_PEER_API_KEY', ''),
+                   help='Credential sent to the peer as X-Anthproxy-Peer-Key for a'
+                        ' fronting access-control layer to consume; anthproxy itself'
+                        ' never checks it (default: unset, env: ANTHPROXY_PEER_API_KEY)')
     p.add_argument('--log-level',
                    default=os.environ.get('ANTHPROXY_LOG_LEVEL', 'INFO'),
                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],

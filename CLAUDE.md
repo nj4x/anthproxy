@@ -42,7 +42,7 @@ Local-command matching order and non-interactive backend switching:
 Lock-scope discipline and selector behavior invariants:
 @docs/agents/concurrency.md
 
-Per-provider transport and mapping quirks (Codex, Anthropic, Local):
+Per-provider transport and mapping quirks (Codex, Anthropic, Local, Peer):
 @docs/agents/backend-providers.md
 
 Credential isolation/atomicity and client-facing failure shaping:
