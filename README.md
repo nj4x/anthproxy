@@ -70,7 +70,9 @@ See `python -m anthproxy --help` for the full option list.
 `--backends` (env: `ANTHPROXY_BACKENDS`) takes a comma-separated allowlist restricting
 which backends are discoverable/selectable at all — via `--backend`, `/backend` local
 commands, the admin UI, and auto-backend rotation. Omit it to leave every installed
-backend available (the default). An unknown name or an empty list is a startup error.
+backend available (the default) — except `peer`, which is enabled by `--peer-base-url`
+rather than by installation, and must still be listed explicitly when `--backends` is
+passed. An unknown name or an empty list is a startup error.
 `--backend`'s own default is silently repaired to the first enabled backend when the
 allowlist excludes it; an *explicit* `--backend` outside the allowlist is a startup
 error naming both flags.
