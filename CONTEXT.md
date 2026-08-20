@@ -57,3 +57,29 @@ _Avoid_: allowed backends, active backends, backend allowlist
 **Self-Pace Gate**:
 The absolute test `oauth_delta < 0` — is this backend behind its *own* schedule — evaluated before any cross-backend comparison. Distinct from the pace-delta *comparison*, which asks only which backend is further behind.
 _Avoid_: pace check, budget gate
+
+## Chaining
+
+**Peer**:
+Another anthproxy instance reached over its public Messages interface and treated as a backend. A peer is defined by what it exposes, not by where it runs — an instance on the same host is still a peer.
+_Avoid_: remote, upstream proxy, parent proxy
+
+**Peer Backend**:
+The named backend that dispatches to a Peer. Ordinary in every respect that selection, pinning, enablement, and override care about; distinguished from a provider backend only in that its capacity belongs to another instance.
+_Avoid_: proxy backend, relay backend
+
+**Chain**:
+Two or more instances linked by peer dispatch. Describes the topology, never a single instance's configuration.
+_Avoid_: pipeline, cascade
+
+**Hop**:
+One instance's handling of a request within a chain, from inbound receipt to outbound dispatch. The unit of accounting, control, and configuration — each hop routes, records, and is configured on its own terms.
+_Avoid_: leg, stage, link
+
+**Classification Authority**:
+The property of being the hop that performs model-tier classification for a request. Held by exactly one hop per request: the innermost one, i.e. the hop that dispatches to a provider rather than to a peer.
+_Avoid_: routing owner, primary router
+
+**Neutral Status**:
+The capacity report a Peer Backend gives the selector — available, with utilization unknown. Distinct from *unavailable* (a veto) and from *known-idle* (an invitation); it makes the peer eligible but ranks it behind every backend whose real utilization is known.
+_Avoid_: unknown status, default status
