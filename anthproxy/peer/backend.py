@@ -17,6 +17,7 @@ Key properties
 """
 
 import http.client
+import ipaddress
 import json
 import logging
 import socket
@@ -106,6 +107,75 @@ def _target(config: Config) -> tuple[str, str, int, str]:
             status_code=502,
         ) from exc
     return scheme, parsed.hostname, port, parsed.path.rstrip('/')
+
+
+class PeerSelfReferenceError(Exception):
+    """The peer target resolves to the address this instance is about to bind."""
+
+
+def _resolve(host: str, port: int) -> set[str]:
+    """Return every address *host* resolves to, across address families."""
+    return {info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}
+
+
+def _is_local(addr: str, own_addrs: set[str]) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_unspecified or addr in own_addrs
+
+
+def check_self_reference(config: Config) -> None:
+    """Raise ``PeerSelfReferenceError`` when the peer target is this instance.
+
+    A peer pointing at our own listening address makes every request recurse
+    without bound (ADR-0026). Only a *positive* match is fatal: a resolution
+    failure is an absence of evidence, and refusing to boot on it would turn a
+    peer that is merely not up yet into an outage of the instance depending on
+    it, breaking the outer-before-inner bring-up order operators rely on.
+
+    Both sides are resolved and compared as full address sets, so a match is
+    found across address families — ``localhost`` resolves to both ``::1`` and
+    ``127.0.0.1``, and which one the resolver returns first must not decide
+    whether the instance boots into a self-loop. A wildcard bind accepts every
+    local address, so any peer target that resolves to one is a match.
+    """
+    try:
+        _, peer_host, peer_port, _ = _target(config)
+    except AnthropicRequestError:
+        # A malformed target already fails loudly at dispatch; it cannot loop.
+        return
+    if peer_port != config.port:
+        return
+
+    bind_host = (config.host or '').strip()
+    try:
+        peer_addrs = _resolve(peer_host, peer_port)
+        bind_addrs = _resolve(bind_host, config.port) if bind_host else {'0.0.0.0'}
+    except (OSError, UnicodeError) as exc:
+        logger.warning(
+            'Could not resolve --peer-base-url %r or bind host %r to check for a '
+            'self-referential peer target: %s — continuing',
+            _redact(config.peer_base_url), bind_host, exc,
+        )
+        return
+
+    if bind_addrs & {'0.0.0.0', '::'}:
+        try:
+            own_addrs = _resolve(socket.gethostname(), config.port)
+        except OSError:
+            own_addrs = set()
+        matched = {a for a in peer_addrs if _is_local(a, own_addrs)}
+    else:
+        matched = peer_addrs & bind_addrs
+    if matched:
+        raise PeerSelfReferenceError(
+            f'--peer-base-url {_redact(config.peer_base_url)!r} resolves to this '
+            f'instance\'s own listening address ({config.host}:{config.port} via '
+            f'{sorted(matched)}); every request would recurse without bound. '
+            'Point --peer-base-url at a different anthproxy instance.'
+        )
 
 
 def _make_connection(config: Config):

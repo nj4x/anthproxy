@@ -621,3 +621,144 @@ class TestPeerEndToEnd:
         }) as response:
             body = json.loads(response.read())
         assert body['input_tokens'] == 1234
+
+
+# ---------------------------------------------------------------------------
+# Startup self-reference check (ADR-0026)
+# ---------------------------------------------------------------------------
+
+class TestPeerSelfReferenceCheck:
+    def _check(self, **kwargs):
+        from anthproxy.peer.backend import check_self_reference
+        check_self_reference(_make_config(**kwargs))
+
+    def _assert_refuses(self, **kwargs):
+        from anthproxy.peer.backend import PeerSelfReferenceError
+        with pytest.raises(PeerSelfReferenceError) as excinfo:
+            self._check(**kwargs)
+        assert '--peer-base-url' in str(excinfo.value)
+
+    def test_same_loopback_literal_and_port_refuses(self):
+        self._assert_refuses(host='127.0.0.1', port=8082,
+                             peer_base_url='http://127.0.0.1:8082')
+
+    def test_localhost_target_against_loopback_bind_refuses(self):
+        self._assert_refuses(host='127.0.0.1', port=8082,
+                             peer_base_url='http://localhost:8082')
+
+    def test_wildcard_bind_matches_local_target(self):
+        self._assert_refuses(host='0.0.0.0', port=8082,
+                             peer_base_url='http://127.0.0.1:8082')
+
+    def test_ipv4_wildcard_bind_matches_ipv6_target(self):
+        self._assert_refuses(host='0.0.0.0', port=8082,
+                             peer_base_url='http://[::1]:8082')
+
+    def test_ipv6_wildcard_bind_matches_ipv4_target(self):
+        self._assert_refuses(host='::', port=8082,
+                             peer_base_url='http://127.0.0.1:8082')
+
+    def test_both_sides_resolved_across_families(self):
+        """Every resolved peer address is compared against every resolved bind
+        address, so the family the resolver happens to return first cannot
+        decide whether the instance boots into a self-loop."""
+        real = socket.getaddrinfo
+
+        def ipv6_first(host, port, *args, **kwargs):
+            if host in ('localhost', 'peerbox'):
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', port, 0, 0)),
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+            return real(host, port, *args, **kwargs)
+
+        with patch('socket.getaddrinfo', side_effect=ipv6_first):
+            self._assert_refuses(host='127.0.0.1', port=8082,
+                                 peer_base_url='http://peerbox:8082')
+
+    def test_same_host_different_port_starts(self):
+        self._check(host='127.0.0.1', port=8082,
+                    peer_base_url='http://127.0.0.1:9099')
+
+    def test_distinct_host_starts(self):
+        real = socket.getaddrinfo
+
+        def resolver(host, port, *args, **kwargs):
+            if host == 'peerbox':
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.9.9.9', port))]
+            return real(host, port, *args, **kwargs)
+
+        with patch('socket.getaddrinfo', side_effect=resolver):
+            self._check(host='127.0.0.1', port=8082,
+                        peer_base_url='http://peerbox:8082')
+
+    def test_wildcard_bind_with_remote_target_starts(self):
+        """Two boxes each bound to 0.0.0.0:8082 is an ordinary deployment: a
+        shared port number is not a self-reference."""
+        real = socket.getaddrinfo
+
+        def resolver(host, port, *args, **kwargs):
+            if host == 'peerbox':
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.9.9.9', port))]
+            return real(host, port, *args, **kwargs)
+
+        with patch('socket.getaddrinfo', side_effect=resolver):
+            self._check(host='0.0.0.0', port=8082,
+                        peer_base_url='http://peerbox:8082')
+
+    def test_unresolvable_target_warns_and_proceeds(self, caplog):
+        real = socket.getaddrinfo
+
+        def resolver(host, port, *args, **kwargs):
+            if host == 'nx.invalid':
+                raise socket.gaierror('Name or service not known')
+            return real(host, port, *args, **kwargs)
+
+        with patch('socket.getaddrinfo', side_effect=resolver):
+            with caplog.at_level('WARNING', logger='anthproxy.peer.backend'):
+                self._check(host='127.0.0.1', port=8082,
+                            peer_base_url='http://nx.invalid:8082')
+        assert '--peer-base-url' in caplog.text
+
+    def test_idna_failure_warns_and_proceeds(self, caplog):
+        """``getaddrinfo`` raises ``UnicodeError`` — not ``OSError`` — on an IDNA
+        encoding failure, which must take the warn-and-proceed path rather than
+        crashing startup with a traceback carrying the unredacted URL."""
+        long_label = 'x' * 64
+        with caplog.at_level('WARNING', logger='anthproxy.peer.backend'):
+            self._check(host='127.0.0.1', port=8082,
+                        peer_base_url=f'http://{long_label}.example:8082')
+        assert '--peer-base-url' in caplog.text
+
+    def test_malformed_target_is_not_a_boot_failure(self):
+        self._check(host='127.0.0.1', port=8082,
+                    peer_base_url='ftp://127.0.0.1:8082')
+
+
+class TestPeerSelfReferenceGuard:
+    """The ``__main__`` gate: enabled-ness, fatality, and resolution avoidance."""
+
+    def _guard(self, **kwargs):
+        from anthproxy.__main__ import _guard_peer_self_reference
+        _guard_peer_self_reference(_make_config(**kwargs))
+
+    def test_positive_match_refuses_to_start(self, caplog):
+        with caplog.at_level('ERROR', logger='anthproxy'):
+            with pytest.raises(SystemExit) as excinfo:
+                self._guard(host='127.0.0.1', port=8082,
+                            peer_base_url='http://127.0.0.1:8082')
+        assert excinfo.value.code != 0
+        assert '--peer-base-url' in caplog.text
+
+    def test_unset_target_resolves_nothing(self):
+        with patch('socket.getaddrinfo') as resolve:
+            self._guard(host='127.0.0.1', port=8082, peer_base_url='')
+        resolve.assert_not_called()
+
+    def test_peer_excluded_from_allowlist_starts_cleanly(self, caplog):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        with caplog.at_level('WARNING', logger='anthproxy'):
+            with patch('socket.getaddrinfo') as resolve:
+                self._guard(host='127.0.0.1', port=8082,
+                            peer_base_url='http://127.0.0.1:8082')
+        resolve.assert_not_called()
+        assert caplog.text == ''

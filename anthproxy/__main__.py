@@ -31,6 +31,25 @@ class _ShortNameFormatter(logging.Formatter):
 logger = logging.getLogger('anthproxy')
 
 
+def _guard_peer_self_reference(config):
+    """Refuse to start when an *enabled* peer target points back at us (ADR-0026).
+
+    Gated on ``peer`` being enabled, not merely configured: ticket 03 case 3
+    makes "base URL set, ``peer`` excluded from --backends" a legal
+    configuration in which nothing is ever dispatched to the peer, so there is
+    no loop to prevent and refusing to boot would turn a leftover environment
+    variable into an outage.
+    """
+    if not config.peer_base_url or 'peer' not in backend_names():
+        return
+    from .peer.backend import PeerSelfReferenceError, check_self_reference
+    try:
+        check_self_reference(config)
+    except PeerSelfReferenceError as exc:
+        logger.error('%s', exc)
+        sys.exit(2)
+
+
 def main():
     # Check for migrate subcommand before parsing server config
     if len(sys.argv) > 1 and sys.argv[1] == 'migrate':
@@ -56,6 +75,8 @@ def main():
         fh.setLevel(getattr(logging, config.log_level))
         fh.setFormatter(_ShortNameFormatter(_fmt))
         root.addHandler(fh)
+
+    _guard_peer_self_reference(config)
 
     # Write default ~/.anthproxy/config.json on first run so users have an
     # editable template for model aliases, pricing, etc.
