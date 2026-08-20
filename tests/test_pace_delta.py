@@ -20,8 +20,11 @@ import pytest
 from anthproxy.config import Config
 from anthproxy.oauth_registry import OAuthTokenRegistry, _month_elapsed_pct
 from anthproxy.selector import (
+    _PERSONAL_CACHE_TTL,
+    _UNKNOWN_WEEKLY,
     AutoSelector,
     PersonalCandidate,
+    _pace_rank_key,
     _sort_personal_candidates,
     _weekly_elapsed_pct,
 )
@@ -145,6 +148,52 @@ class TestSortPersonalCandidates:
         ]
         ordered = _sort_personal_candidates(cands, pace_on=False)
         assert [c.name for c in ordered] == ['codex', 'anthropic']
+
+
+# ---------------------------------------------------------------------------
+# Window-less candidates rank last in both pace modes (SRS-Chaining-001)
+# ---------------------------------------------------------------------------
+
+class TestPaceRankKeyBlockIsModeIndependent:
+    def test_pace_off_elapsed_less_ranks_behind_elapsed_bearing(self):
+        # Raw burn would put the elapsed-less candidate first; the block does not.
+        cands = [
+            PersonalCandidate('windowless', 10.0, None),
+            PersonalCandidate('paced', 90.0, 20.0),
+        ]
+        ordered = _sort_personal_candidates(cands, pace_on=False)
+        assert [c.name for c in ordered] == ['paced', 'windowless']
+
+    def test_pace_off_elapsed_less_candidates_compare_by_raw_burn(self):
+        cands = [
+            PersonalCandidate('high', 60.0, None),
+            PersonalCandidate('low', 20.0, None),
+        ]
+        ordered = _sort_personal_candidates(cands, pace_on=False)
+        assert [c.name for c in ordered] == ['low', 'high']
+
+    def test_pace_off_value_within_block_zero_is_raw_burn(self):
+        # Block 0 with pace off must not subtract elapsed.
+        assert _pace_rank_key(90.0, 20.0, pace_on=False) == (0, 90.0)
+        assert _pace_rank_key(90.0, 20.0, pace_on=True) == (0, 70.0)
+
+    def test_pace_on_block_ordering_unchanged(self):
+        # Regression: the pace-on split-branch ordering is untouched.
+        cands = [
+            PersonalCandidate('codex', 40.0, 30.0),
+            PersonalCandidate('openrouter', 5.0, None),
+            PersonalCandidate('anthropic', 86.0, 95.0),
+        ]
+        ordered = _sort_personal_candidates(cands, pace_on=True)
+        assert [c.name for c in ordered] == ['anthropic', 'codex', 'openrouter']
+
+    @pytest.mark.parametrize('pace_on', [True, False])
+    def test_burn_known_but_reset_absent_is_block_one(self, pace_on):
+        # elapsed is None whenever *either* field is missing — a real weekly
+        # window with an unparseable resets_at still lands in block 1.
+        elapsed = _weekly_elapsed_pct(None, 168.0, now=1_000_000.0)
+        assert elapsed is None
+        assert _pace_rank_key(12.0, elapsed, pace_on)[0] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -513,13 +562,44 @@ class TestPersonalCandidatesElapsed:
         assert candidate.weekly_elapsed_pct is None
         assert candidate.burn == 50.0  # _UNKNOWN_WEEKLY neutral
 
+    def test_stale_candidate_sorts_behind_fresh_with_pace_off(self):
+        selector = self._selector(pace='off')
+        now = time.time()
+        with selector._lock:
+            # anthropic's reading is older than the cache TTL, so despite the
+            # far lower burn it loses both its elapsed and its real burn.
+            selector._last_weekly.update({'anthropic': 1.0, 'codex': 90.0})
+            selector._last_weekly_resets_at.update({
+                'anthropic': now + 84 * 3600, 'codex': now + 84 * 3600,
+            })
+            selector._last_weekly_window_hours.update({
+                'anthropic': 168.0, 'codex': 168.0,
+            })
+            selector._last_status_at.update({
+                'anthropic': now - _PERSONAL_CACHE_TTL - 1.0, 'codex': now,
+            })
+            selector._last_available.update({'anthropic': True, 'codex': True})
+
+        candidates = selector.personal_candidates()
+
+        assert [c.name for c in candidates if c.name in ('anthropic', 'codex')] == [
+            'codex', 'anthropic',
+        ]
+        stale = next(c for c in candidates if c.name == 'anthropic')
+        assert stale.burn == _UNKNOWN_WEEKLY
+        assert stale.weekly_elapsed_pct is None
+
     def test_pace_off_disables_elapsed_ranking(self):
         selector = self._selector(pace='off')
         now = time.time()
         with selector._lock:
             selector._last_weekly.update({'anthropic': 86.0, 'codex': 30.0})
+            # Both carry a usable elapsed, so both sit in the leading block and
+            # the comparison is purely about the *value* the mode selects.
+            # Pace on would rank anthropic first (delta -9 vs codex's +20).
             selector._last_weekly_resets_at.update({
-                'anthropic': now + 84 * 3600, 'codex': None,
+                'anthropic': now + int(0.05 * 168 * 3600),
+                'codex': now + int(0.90 * 168 * 3600),
             })
             selector._last_weekly_window_hours.update({
                 'anthropic': 168.0, 'codex': 168.0,
@@ -667,4 +747,45 @@ class TestComputeBestUnlockedPaceOrdering:
 
         # Raw burn: codex 30 < anthropic 86 → codex wins.
         assert best == 'codex'
+
+    def test_openrouter_shape_ranks_last_with_pace_off(self):
+        # openrouter's real status shape: weekly_utilization set (credit burn),
+        # weekly_resets_at / weekly_window_hours never set → elapsed always None.
+        # With pace off it used to share one raw-burn block and win on burn 5;
+        # now it sorts behind both elapsed-bearing backends.
+        now = time.time()
+        instances = {
+            'anthropic': _FakeBackend(self._status(
+                True, 86.0, now + int(0.05 * 168 * 3600), 168.0,
+            )),
+            'codex': _FakeBackend(self._status(
+                True, 30.0, now + int(0.90 * 168 * 3600), 168.0,
+            )),
+            'openrouter': _FakeBackend(self._status(True, 5.0, None, None)),
+        }
+        selector = self._selector('bedrock', instances, pace='off')
+
+        best, _, _, _ = selector._compute_best_unlocked({}, {}, False)
+
+        assert best == 'codex'
+
+    @pytest.mark.parametrize('pace', ['on', 'off'])
+    def test_missing_weekly_reset_demotes_to_raw_block(self, pace):
+        # anthropic reports a weekly burn but its resets_at is momentarily
+        # unparseable → no usable elapsed signal → block 1 in both pace modes,
+        # behind codex despite anthropic's far lower burn.
+        now = time.time()
+        instances = {
+            'anthropic': _FakeBackend(self._status(True, 5.0, None, 168.0)),
+            'codex': _FakeBackend(self._status(
+                True, 30.0, now + int(0.90 * 168 * 3600), 168.0,
+            )),
+        }
+        selector = self._selector('bedrock', instances, pace=pace)
+
+        best, _, _, _ = selector._compute_best_unlocked({}, {}, False)
+
+        assert best == 'codex'
+
+
 

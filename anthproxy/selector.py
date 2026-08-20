@@ -66,7 +66,7 @@ def _weekly_elapsed_pct(
     """Fraction of the weekly window elapsed by time, 0–100, or None.
 
     Returns None when the window size or reset timestamp is unknown (→ ranked on
-    raw burn alongside other raw-only candidates). A stale reset
+    raw burn behind every candidate that has an elapsed figure). A stale reset
     (``weekly_resets_at <= now``) yields ``0.0``: the window is about to roll, so
     under ascending pace-delta ranking (``burn - elapsed``) the backend gets the
     highest delta and is deprioritized while its burn reading is going stale.
@@ -84,16 +84,26 @@ def _weekly_elapsed_pct(
 def _pace_rank_key(burn: float, elapsed: float | None, pace_on: bool):
     """Sort key implementing the ADR-0015 split-branch ranking.
 
-    Returns a ``(block, value)`` tuple so candidates with a known elapsed (the
-    pace-delta block, ``block=0``) rank ahead of raw-only candidates
-    (``block=1``) as a group, each block preserving its own ascending order.
-    With pace off everything is one raw-burn block. Callers that need a single
-    scalar key (e.g. for ``sorted``) can use ``key=lambda c: _pace_rank_key(...)``
-    and Python's tuple comparison does the block-then-value ordering.
+    Returns a ``(block, value)`` tuple so candidates with a known elapsed
+    (``block=0``) rank ahead of the rest (``block=1``) as a group, each block
+    preserving its own ascending order. The block depends only on ``elapsed``,
+    never on ``pace_on``; only the *value* varies with the mode (``burn -
+    elapsed`` with pace on, raw ``burn`` with pace off).
+
+    ``block=1`` means "no usable elapsed signal right now", not "no weekly
+    window exists": ``elapsed`` is None whenever *either* the reset timestamp or
+    the window size is missing, including for a backend that does have a weekly
+    window whose ``resets_at`` is momentarily unparseable. Without an elapsed
+    figure there is no pace delta to compute and the candidate cannot be
+    compared on the same axis as one that has it.
+
+    Callers that need a single scalar key (e.g. for ``sorted``) can use
+    ``key=lambda c: _pace_rank_key(...)`` and Python's tuple comparison does the
+    block-then-value ordering.
     """
-    if not pace_on or elapsed is None:
+    if elapsed is None:
         return (1, burn)
-    return (0, burn - elapsed)
+    return (0, burn - elapsed if pace_on else burn)
 
 
 def _sort_personal_candidates(
@@ -101,10 +111,11 @@ def _sort_personal_candidates(
 ) -> tuple[PersonalCandidate, ...]:
     """Order personal candidates: pace-delta block then raw-only block.
 
-    With pace on, candidates that carry a known ``weekly_elapsed_pct`` sort
-    ascending by ``burn - weekly_elapsed_pct`` and rank ahead, as a group, of
-    candidates with no elapsed (OpenRouter, unknown windows) which sort ascending
-    by raw ``burn``. With pace off, all sort by raw ``burn``.
+    Candidates that carry a known ``weekly_elapsed_pct`` rank ahead, as a group,
+    of candidates with no elapsed (OpenRouter, unknown windows, stale cache
+    readings) in both pace modes. Within the leading block they sort ascending by
+    ``burn - weekly_elapsed_pct`` with pace on and by raw ``burn`` with pace off;
+    the trailing block always sorts ascending by raw ``burn``.
     """
     return tuple(
         sorted(
