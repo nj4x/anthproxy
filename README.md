@@ -184,6 +184,109 @@ Override globally with `proxy-set-model-routing:on` / `proxy-set-model-routing:o
 
 Use `X-Anthproxy-Override: no-classifier` to bypass routing for a single request.
 
+## Chaining anthproxy instances
+
+The `peer` backend dispatches to another anthproxy over its public `/v1/messages`, so one instance
+can forward to another that holds the credentials.
+
+### Setup
+
+| Flag | Environment | Effect |
+|------|-------------|--------|
+| `--peer-base-url` | `ANTHPROXY_PEER_BASE_URL` | Target anthproxy instance. Setting it is what enables the `peer` backend. |
+| `--peer-api-key` | `ANTHPROXY_PEER_API_KEY` | Credential sent to the peer as `X-Anthproxy-Peer-Key`. Optional; unset means no header. |
+
+Enablement rules:
+
+- `peer` is not enabled by installation. `--peer-base-url` enables it.
+- With `--backends` passed, `peer` must also be listed there — the base URL alone is not enough.
+- Naming `peer` in `--backends` without a base URL is a startup error.
+
+Worked two-instance loopback example. The inner instance holds the subscription credentials; the
+outer forwards to it:
+
+```bash
+# Inner instance — authenticates upstream as usual
+python -m anthproxy --port 8083 --backend anthropic
+
+# Outer instance — forwards to the inner one
+python -m anthproxy --port 8082 \
+  --peer-base-url http://127.0.0.1:8083 \
+  --backends peer \
+  --backend peer
+
+# Clients talk to the outer instance
+curl -X POST http://localhost:8082/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sonnet","max_tokens":100,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+A peer mounted behind a reverse proxy at a subpath works: any path component of the base URL
+prefixes the outbound paths.
+
+### Security posture
+
+**anthproxy has no inbound authentication.** No client credential is checked for access, on any
+endpoint, chained or not. A chain is only as private as the network between its
+hops — the supported deployments are loopback, an SSH tunnel, or a private network you already
+control.
+
+**`--peer-api-key` sends, it never checks.** It exists so a peer can sit behind an existing
+access-control layer — a reverse proxy, an identity-aware proxy, a mesh with its own authentication
+— and that layer is what consumes the `X-Anthproxy-Peer-Key` header.
+
+**The header is inert at the receiving instance, and must stay inert.** No anthproxy reads it; that
+is the property that makes it safe to send. Making a receiving instance *check* it would be adding
+inbound authentication — a separate decision to be taken as such, revisiting SRS-Chaining-006's
+second invariant. It is not a hardening tweak to be slipped in alongside something else.
+
+The key is never sent as `Authorization: Bearer`. A gateway that requires `Authorization`
+specifically is a deployment concern its own configuration can bridge; anthproxy will not use that
+header, because the receiving instance's OAuth credential path would absorb the peer key into its
+own credential state.
+
+### Operational surprises
+
+Four behaviours that read as bugs if you have not seen them before:
+
+- **An enabled peer displaces the bedrock fallback.** A peer always reports itself available, so it
+  occupies the available pool that `bedrock` is only reached *after*. Run both and metered bedrock
+  fallover stops firing. This is intended — a peer forwards to a subscription, bedrock bills per
+  token — but it is invisible until the day it matters.
+- **Routing config on the outer instance is inert for peer-bound traffic.** Chained requests are
+  classified by the peer, against the peer's own configuration. Tuning model-tier routing on the
+  outer instance has no effect on what leaves for the peer.
+- **Cost totals are per-instance and must not be summed.** A chained request is recorded by both
+  hops, so adding the two instances' totals double-counts every one. Session keys are identical
+  across hops, which makes the records line up request-for-request — useful for diagnosis,
+  dangerous for arithmetic.
+- **The inner instance is not addressable through the outer.** No `X-Anthproxy-Override` header and
+  no `proxy-*` command crosses the hop; both are consumed where they arrive. Configure or query the
+  inner instance by talking to it directly. `prefer:peer` is the intended escape hatch — it is
+  meaningful at the outer hop and honoured there.
+
+### Loop guard and its known gaps
+
+At startup, an instance with `peer` enabled resolves the peer target and refuses to boot if it
+resolves to its own bind address, naming `--peer-base-url`. A target that does not resolve yet logs
+a warning and proceeds, so an outer instance can start before the inner one exists.
+
+Three gaps remain, knowingly:
+
+- A multi-instance cycle (A→B→A) is **not** detected, and will amplify until something else fails.
+- A self-reference formed after startup is not detected.
+- A self-loop behind a name that does not resolve at boot slips through.
+
+These are carried as SRS-Chaining-007 in `docs/FS-SRS-requirements-bootstrap.md`, recorded as
+deferred and unsatisfied rather than scoped away. If chains of three or more hops become normal,
+the follow-up is a per-request instance-ID marker.
+
+### Reasoning
+
+ADR-0021 (peer backend package), ADR-0022 (peer selection and neutral status), ADR-0023 (innermost
+hop classification authority), ADR-0024 (the peer hop as a control boundary), ADR-0025 (per-hop
+independent accounting), ADR-0026 (startup self-reference check) — all under `docs/adr/`.
+
 ## Admin UI
 
 Enable the optional web UI with `--enable-ui`. It exposes:
