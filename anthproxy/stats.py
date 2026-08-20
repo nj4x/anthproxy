@@ -49,9 +49,17 @@ from .constants import SESSION_SUBSCRIPTION_SENTINEL, SUBSCRIPTION_BACKENDS
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STATS_DIR = Path.home() / '.anthproxy' / 'stats'
-_LEGACY_STATS_FILE = Path.home() / '.anthproxy' / 'stats.jsonl'
 _MAX_PARTITION_DAYS = 92
+
+
+def _default_stats_dir() -> Path:
+    """Default stats directory under ANTHPROXY_HOME/stats."""
+    return Path.home() / '.anthproxy' / 'stats'
+
+
+def _legacy_stats_file() -> Path:
+    """Legacy stats file location for back-compat reads."""
+    return Path.home() / '.anthproxy' / 'stats.jsonl'
 _HISTORICAL_PERIOD_RE = re.compile(r'^-([1-9]\d{0,5})([dmwq])$')
 
 PeriodBucket = Literal['hour', 'day', 'week', 'month']
@@ -321,7 +329,7 @@ class StatsCollector:
     """Thread-safe JSONL stats writer/reader backed by per-day files."""
 
     def __init__(self, stats_dir: str | Path | None = None):
-        self._dir = Path(stats_dir) if stats_dir else DEFAULT_STATS_DIR
+        self._dir = Path(stats_dir) if stats_dir else _default_stats_dir()
         self._lock = threading.Lock()
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
@@ -420,10 +428,11 @@ class StatsCollector:
                     logger.debug('Stats: read failed %s: %s', path, exc)
                 cur += datetime.timedelta(days=1)
 
-            if _LEGACY_STATS_FILE.exists():
+            legacy_file = _legacy_stats_file()
+            if legacy_file.exists():
                 try:
-                    with open(_LEGACY_STATS_FILE, 'r', encoding='utf-8') as fh:
-                        lines_per_file.append((_LEGACY_STATS_FILE, fh.readlines()))
+                    with open(legacy_file, 'r', encoding='utf-8') as fh:
+                        lines_per_file.append((legacy_file, fh.readlines()))
                 except OSError as exc:
                     logger.debug('Stats: legacy read failed: %s', exc)
 

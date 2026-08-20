@@ -176,6 +176,13 @@ def _config_path() -> Path:
     override = os.environ.get("ANTHPROXY_CONFIG")
     if override:
         return Path(override)
+    # Try $ANTHPROXY_HOME/config.json if env var is set
+    home_env = os.environ.get("ANTHPROXY_HOME", "").strip()
+    if home_env:
+        home_path = Path(home_env) / "config.json"
+        if home_path.exists():
+            return home_path
+    # Legacy fallback to ~/.anthproxy/config.json
     return Path.home() / ".anthproxy" / "config.json"
 
 

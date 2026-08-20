@@ -27,12 +27,22 @@ logger = logging.getLogger(__name__)
 
 
 def _bedrock_home(config=None) -> pathlib.Path:
-    """Priority: config.bedrock_home -> $BEDROCK_HOME -> ~/.bedrock."""
+    """Priority: config.bedrock_home -> $BEDROCK_HOME -> $ANTHPROXY_HOME/bedrock -> ~/.bedrock."""
     if config is not None and getattr(config, 'bedrock_home', ''):
         return pathlib.Path(config.bedrock_home)
     env = os.environ.get('BEDROCK_HOME', '').strip()
     if env:
         p = pathlib.Path(env)
+        if p.is_dir():
+            return p
+    # Try new ANTHPROXY_HOME/bedrock location if available
+    if config is not None:
+        anthproxy_home = getattr(config, 'anthproxy_home', '')
+        if not anthproxy_home or not anthproxy_home.strip():
+            # Not set in config, try env var or default
+            from ..config import _resolve_home
+            anthproxy_home = _resolve_home('')
+        p = pathlib.Path(anthproxy_home) / 'bedrock'
         if p.is_dir():
             return p
     return pathlib.Path.home() / '.bedrock'

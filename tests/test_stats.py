@@ -285,7 +285,7 @@ def _record_for(ts: float, backend: str, model: str, **kw) -> dict:
 class TestStatsCollectorStorage:
     def _no_legacy(self, monkeypatch, tmp_path):
         import anthproxy.stats as stats_mod
-        monkeypatch.setattr(stats_mod, '_LEGACY_STATS_FILE', tmp_path / 'no_legacy.jsonl')
+        monkeypatch.setattr(stats_mod, '_legacy_stats_file', lambda: tmp_path / 'no_legacy.jsonl')
 
     def test_record_writes_day_file(self, tmp_path, monkeypatch):
         self._no_legacy(monkeypatch, tmp_path)
@@ -374,7 +374,7 @@ class TestStatsCollectorStorage:
             json.dumps(_record_for(ts_old, 'bedrock', 'opus', input_tokens=999)) + '\n'
             + json.dumps(_record_for(ts_new, 'bedrock', 'sonnet', input_tokens=1)) + '\n'
         )
-        monkeypatch.setattr(stats_mod, '_LEGACY_STATS_FILE', legacy)
+        monkeypatch.setattr(stats_mod, '_legacy_stats_file', lambda: legacy)
 
         sc = StatsCollector(stats_dir=stats_dir)
         records = sc.read_records(datetime.datetime(2026, 6, 7, 0, 0, 0).timestamp(), datetime.datetime(2026, 6, 8, 0, 0, 0).timestamp())
@@ -616,7 +616,7 @@ class TestRecordEnrichedFields:
 
     def _no_legacy(self, monkeypatch, tmp_path):
         import anthproxy.stats as stats_mod
-        monkeypatch.setattr(stats_mod, '_LEGACY_STATS_FILE', tmp_path / 'no_legacy.jsonl')
+        monkeypatch.setattr(stats_mod, '_legacy_stats_file', lambda: tmp_path / 'no_legacy.jsonl')
 
     def _read_row(self, sc, tmp_path) -> dict:
         """Read the single JSONL row written into stats_dir today."""

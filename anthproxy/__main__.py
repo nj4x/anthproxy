@@ -31,6 +31,11 @@ logger = logging.getLogger('anthproxy')
 
 
 def main():
+    # Check for migrate subcommand before parsing server config
+    if len(sys.argv) > 1 and sys.argv[1] == 'migrate':
+        from . import migrate
+        return migrate.main(sys.argv[2:])
+
     discover_backends()
 
     config = parse_args()
@@ -100,18 +105,16 @@ def main():
             selector.evaluate()
 
     from .stats import StatsCollector
-    stats_collector = StatsCollector()
+    stats_collector = StatsCollector(stats_dir=config.stats_dir)
     logger.info('Stats collection enabled: %s', stats_collector._dir)
 
     session_db = None
     summary_daemon = None
     if config.enable_ui or config.db_path:
-        from pathlib import Path as _Path
         from .db import SessionDB
-        _db_path = config.db_path or str(_Path.home() / '.anthproxy' / 'anthproxy.db')
-        session_db = SessionDB(_db_path)
+        session_db = SessionDB(config.db_path)
         session_db.start_retention_daemon()
-        logger.info('Session DB enabled: %s', _db_path)
+        logger.info('Session DB enabled: %s', config.db_path)
 
         if config.enable_ui:
             from .summary import SummaryDaemon
