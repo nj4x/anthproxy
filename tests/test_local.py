@@ -21,7 +21,8 @@ def _make_config(**kwargs) -> Config:
         use_inference_profile=True, use_global_inference_profile=False,
         backend='local', log_level='INFO',
         no_prompt_translate=False, request_history_size=5, log_file='',
-        codex_home='', bedrock_home='', anthropic_home='',
+        anthproxy_home='', codex_home='', bedrock_home='', anthropic_home='',
+        stats_dir='',
         local_base_url='http://127.0.0.1:1235',
         auto_backend=False, auto_backend_interval=60.0,
     )

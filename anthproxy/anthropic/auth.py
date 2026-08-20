@@ -48,6 +48,17 @@ def _anthropic_home(config=None) -> pathlib.Path:
         p = pathlib.Path(env)
         if p.is_dir():
             return p
+    # Try new ANTHPROXY_HOME/anthropic location if available
+    if config is not None:
+        anthproxy_home = getattr(config, 'anthproxy_home', '')
+        if not anthproxy_home or not anthproxy_home.strip():
+            # Not set in config, try env var or default
+            from ..config import _resolve_home
+            anthproxy_home = _resolve_home('')
+        p = pathlib.Path(anthproxy_home) / 'anthropic'
+        if p.is_dir():
+            return p
+    # Legacy fallback to ~/.anthropic
     return pathlib.Path.home() / '.anthropic'
 
 

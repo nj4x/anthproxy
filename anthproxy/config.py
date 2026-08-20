@@ -37,6 +37,13 @@ _DEFAULT_CLASSIFICATION: dict[str, str] = {
 _VALID_CLASSIFICATION_LABELS: frozenset[str] = frozenset(_DEFAULT_CLASSIFICATION)
 
 
+def _resolve_home(home_override: str) -> str:
+    """Resolve a home directory: explicit override > environment > default ~/.anthproxy."""
+    if home_override and home_override.strip():
+        return home_override.strip()
+    return str(Path.home() / '.anthproxy')
+
+
 def _parse_classification_str(
     raw: str | None, p: argparse.ArgumentParser
 ) -> dict[str, str]:
@@ -85,6 +92,7 @@ class Config:
     no_prompt_translate: bool = False
     request_history_size: int = 5
     log_file: str = '/tmp/anthproxy.log'
+    anthproxy_home: str = ''
     codex_home: str = ''
     codex_unsupported_model_fallback: str = ''
     bedrock_home: str = ''
@@ -119,6 +127,7 @@ class Config:
     lock_requested_model: str = 'claude-sonnet-4-6'      # Model baseline lock for routing; 'off' disables
     sse_keepalive_interval: float = 10.0
     db_path: str | None = None   # Path to SQLite DB file; None disables DB recording
+    stats_dir: str = ''           # Path to stats directory; empty uses default under anthproxy_home
     enable_ui: bool = False       # Whether /admin/* and /ui/* endpoints are active
     codex_context_limit: int = 100_000
 
@@ -188,6 +197,14 @@ def parse_args(argv=None) -> Config:
     p.add_argument('--log-file',
                    default=os.environ.get('ANTHPROXY_LOG_FILE', '/tmp/anthproxy.log'),
                    help='Write log to this file at --log-level verbosity (default: /tmp/anthproxy.log, env: ANTHPROXY_LOG_FILE)')
+    p.add_argument('--anthproxy-home', dest='anthproxy_home',
+                   default=os.environ.get('ANTHPROXY_HOME', ''),
+                   help='Root directory for anthproxy config, state, and credentials'
+                        ' (default: ~/.anthproxy, env: ANTHPROXY_HOME)')
+    p.add_argument('--stats-dir', dest='stats_dir',
+                   default=os.environ.get('ANTHPROXY_STATS_DIR', ''),
+                   help='Directory for stats JSONL files (default: $ANTHPROXY_HOME/stats,'
+                        ' env: ANTHPROXY_STATS_DIR)')
     p.add_argument('--auto-backend', dest='auto_backend',
                    action=argparse.BooleanOptionalAction,
                    default=_env_bool('ANTHPROXY_AUTO_BACKEND', True),
@@ -511,7 +528,15 @@ def parse_args(argv=None) -> Config:
             f'auto_model_routing_system_prompt_preview_limit must be >= 1, '
             f'got {cfg.auto_model_routing_system_prompt_preview_limit}'
         )
+    # Resolve anthproxy_home and derive paths from it
+    cfg.anthproxy_home = _resolve_home(cfg.anthproxy_home)
+
+    # Default stats_dir to $ANTHPROXY_HOME/stats if not explicitly set
+    if not cfg.stats_dir or not cfg.stats_dir.strip():
+        cfg.stats_dir = str(Path(cfg.anthproxy_home) / 'stats')
+
     # Default db_path when enable_ui is set and no explicit path was given
     if cfg.enable_ui and cfg.db_path is None:
-        cfg.db_path = str(Path.home() / '.anthproxy' / 'anthproxy.db')
+        cfg.db_path = str(Path(cfg.anthproxy_home) / 'anthproxy.db')
+
     return cfg
