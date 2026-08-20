@@ -80,6 +80,9 @@ class _FakeRegistry:
     def active_name(self) -> str:
         return self._active
 
+    def list_backends(self):
+        return ('anthropic', 'bedrock', 'codex', 'local', 'openrouter')
+
     def instance(self, name: str):
         return self._instances[name]
 
@@ -1076,6 +1079,78 @@ class TestWeeklyNoneCachePreservation(unittest.TestCase):
             )
         # Sanity: selector still chose the only available backend.
         self.assertEqual(reg.active_name(), 'anthropic')
+
+
+class _RestrictedRegistry(_FakeRegistry):
+    """_FakeRegistry variant reporting a caller-supplied enabled backend set."""
+
+    def __init__(self, enabled: tuple, initial='bedrock'):
+        super().__init__(initial)
+        self._enabled = enabled
+
+    def list_backends(self):
+        return self._enabled
+
+
+class TestAllowlistIntersection(unittest.TestCase):
+    """ADR-0020 §8: _PRIORITY/_FALLBACK intersected with the enabled set."""
+
+    def test_priority_intersected_at_construction(self):
+        reg = _RestrictedRegistry(('anthropic', 'codex'))
+        sel = AutoSelector(reg, _FakeConfig())
+        self.assertEqual(sel._priority, ('anthropic', 'codex'))
+
+    def test_fallback_none_when_bedrock_excluded(self):
+        reg = _RestrictedRegistry(('anthropic', 'codex'))
+        sel = AutoSelector(reg, _FakeConfig())
+        self.assertIsNone(sel._fallback)
+
+    def test_fallback_present_when_bedrock_enabled(self):
+        reg = _RestrictedRegistry(('anthropic', 'bedrock'))
+        sel = AutoSelector(reg, _FakeConfig())
+        self.assertEqual(sel._fallback, 'bedrock')
+
+    def test_evaluate_does_not_crash_with_no_enabled_subscription_backends(self):
+        """Bedrock-only allowlist: no subscription candidates, no bedrock instance
+        registered either — evaluate() must not raise and must hold active."""
+        reg = _RestrictedRegistry(('bedrock', 'local'), initial='bedrock')
+        sel = AutoSelector(reg, _FakeConfig())
+        result = sel.evaluate()
+        self.assertEqual(result, 'bedrock')
+        self.assertEqual(reg._switches, [])
+
+    def test_restrict_subscription_does_not_crash_with_empty_priority(self):
+        reg = _RestrictedRegistry(('bedrock', 'local'), initial='bedrock')
+        sel = AutoSelector(reg, _FakeConfig())
+        result = sel.restrict_subscription()
+        self.assertEqual(result, 'bedrock')
+        self.assertEqual(sel._mode, 'subscription')
+
+    def test_refresh_tokens_skips_excluded_backend(self):
+        calls = []
+        reg = _RestrictedRegistry(('anthropic', 'bedrock'))
+        sel = AutoSelector(reg, _FakeConfig())
+
+        import anthproxy.codex.auth as codex_auth
+        import anthproxy.anthropic.auth as anthropic_auth
+
+        def fake_anthropic(config):
+            calls.append('anthropic')
+
+        def fake_codex(config):
+            calls.append('codex')
+
+        orig_anthropic = anthropic_auth.ensure_credentials_noninteractive
+        orig_codex = codex_auth.ensure_credentials_noninteractive
+        anthropic_auth.ensure_credentials_noninteractive = fake_anthropic
+        codex_auth.ensure_credentials_noninteractive = fake_codex
+        try:
+            sel._refresh_tokens()
+        finally:
+            anthropic_auth.ensure_credentials_noninteractive = orig_anthropic
+            codex_auth.ensure_credentials_noninteractive = orig_codex
+
+        self.assertEqual(calls, ['anthropic'])  # codex excluded, never called
 
 
 if __name__ == '__main__':

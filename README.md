@@ -56,6 +56,7 @@ anthproxy \
   --host 127.0.0.1 \                           # Bind address (default)
   --port 8082 \                                 # Bind port (default)
   --backend bedrock \                           # Default backend (default)
+  --backends anthropic,codex \                  # Restrict discoverable backends (default: all)
   --region us-east-1 \                          # AWS region for Bedrock
   --auto-backend \                              # Enable automatic selection (default)
   --auto-backend-mode subscription \            # Start mode: subscription | auto
@@ -64,6 +65,14 @@ anthproxy \
 ```
 
 See `python -m anthproxy --help` for the full option list.
+
+`--backends` (env: `ANTHPROXY_BACKENDS`) takes a comma-separated allowlist restricting
+which backends are discoverable/selectable at all — via `--backend`, `/backend` local
+commands, the admin UI, and auto-backend rotation. Omit it to leave every installed
+backend available (the default). An unknown name or an empty list is a startup error.
+`--backend`'s own default is silently repaired to the first enabled backend when the
+allowlist excludes it; an *explicit* `--backend` outside the allowlist is a startup
+error naming both flags.
 
 ### Authentication
 

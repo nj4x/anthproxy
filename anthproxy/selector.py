@@ -166,6 +166,12 @@ class AutoSelector:
         self._mode: str = config.auto_backend_mode
         # The pinned backend name; meaningful only when _mode == 'pinned'.
         self._pinned: str | None = None
+        # ADR-0020 §8: intersect the module-level candidate pools with the
+        # enabled backend set, once, at construction. Never rebind _PRIORITY/
+        # _FALLBACK themselves — those stay shared, unfiltered module state.
+        enabled = frozenset(registry.list_backends())
+        self._priority: tuple[str, ...] = tuple(n for n in _PRIORITY if n in enabled)
+        self._fallback: str | None = _FALLBACK if _FALLBACK in enabled else None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -238,7 +244,12 @@ class AutoSelector:
                     self._last_weekly_window_hours[name] = status.weekly_window_hours
 
         active = self._registry.active_name()
-        if best != active:
+        if best is None:
+            logger.debug(
+                "Auto-selector: no enabled backend available to switch to; staying on %s",
+                active,
+            )
+        elif best != active:
             reason = _format_switch_reason(
                 "periodic evaluation", active, best, statuses
             )
@@ -322,7 +333,12 @@ class AutoSelector:
         if source_status is not None:
             statuses.setdefault(name, source_status)
         active = self._registry.active_name()
-        if best != active:
+        if best is None:
+            logger.debug(
+                "Auto-selector: 429 on %s, no enabled backend available to switch to",
+                name,
+            )
+        elif best != active:
             reason = _format_switch_reason(f"429 on {name}", name, best, statuses)
             result = self._registry.switch(best, reason=reason)
             if result.kind == "failed":
@@ -395,7 +411,7 @@ class AutoSelector:
             window_hours = dict(self._last_weekly_window_hours)
         pace_on = _pace_enabled(self._config)
         candidates = []
-        for name in _PRIORITY:
+        for name in self._priority:
             if now < exhausted.get(name, 0) or available.get(name) is False:
                 continue
             fresh = now - status_at.get(name, 0.0) <= _PERSONAL_CACHE_TTL
@@ -420,15 +436,16 @@ class AutoSelector:
 
         Prefers a not-currently-exhausted sub with lowest known weekly
         utilization; falls back to the lowest-weekly subscription backend
-        overall.  Can only return a member of ``_PRIORITY`` or ``None`` —
-        never bedrock or any other non-subscription backend.
+        overall.  Can only return a member of the enabled subset of
+        ``_PRIORITY`` or ``None`` — never bedrock or any other non-subscription
+        or disabled backend.
         """
         now = time.time()
         with self._lock:
             exhausted = dict(self._exhausted_until)
             weekly = dict(self._last_weekly)
-        available = [n for n in _PRIORITY if now >= exhausted.get(n, 0)]
-        pool = available if available else list(_PRIORITY)
+        available = [n for n in self._priority if now >= exhausted.get(n, 0)]
+        pool = available if available else list(self._priority)
         pool.sort(key=lambda n: weekly.get(n, _UNKNOWN_WEEKLY))
         return pool[0] if pool else None
 
@@ -469,9 +486,14 @@ class AutoSelector:
         """Proactively refresh OAuth tokens for OAuth-backed subscription backends.
 
         OpenRouter is intentionally excluded: it authenticates with a static
-        API key, not OAuth, so there is nothing to refresh.
+        API key, not OAuth, so there is nothing to refresh. The OAuth-backed
+        pair is filtered against the enabled backend set (ADR-0020 §7) —
+        `self._priority` is the OAuth pool's superset (includes openrouter),
+        so membership is checked directly rather than reused wholesale.
         """
         for name in ("anthropic", "codex"):
+            if name not in self._priority:
+                continue
             try:
                 if name == "anthropic":
                     from .anthropic import auth as anthropic_auth
@@ -540,7 +562,7 @@ class AutoSelector:
         # best_exhausted: (name, weekly_utilization) — exhausted, with known weekly
         best_exhausted: tuple | None = None
 
-        for name in _PRIORITY:
+        for name in self._priority:
             in_cooldown = now < exhausted_snapshot.get(name, 0)
 
             if in_cooldown:
@@ -608,8 +630,19 @@ class AutoSelector:
                 # path keeps cycling until one opens.
                 if best_exhausted is not None:
                     return best_exhausted[0], statuses, new_exhausted, new_weekly
-                return _PRIORITY[0], statuses, new_exhausted, new_weekly
-            return _FALLBACK, statuses, new_exhausted, new_weekly
+                if self._priority:
+                    return self._priority[0], statuses, new_exhausted, new_weekly
+                # No subscription backend is enabled at all (ADR-0020 Known
+                # Limitations). Nothing to route to; caller no-ops on active.
+                return None, statuses, new_exhausted, new_weekly
+            if self._fallback is not None:
+                return self._fallback, statuses, new_exhausted, new_weekly
+            # bedrock is excluded and no subscription backend is available.
+            # Prefer a known-exhausted subscription backend over returning
+            # nothing, since it will at least surface a 429 to retry against.
+            if best_exhausted is not None:
+                return best_exhausted[0], statuses, new_exhausted, new_weekly
+            return None, statuses, new_exhausted, new_weekly
 
         # Order available backends for the ranking sort key only.  The same
         # _pace_rank_key used by _sort_personal_candidates drives the split-branch
@@ -678,6 +711,7 @@ class AutoSelector:
         # Skip in subscription-only mode — bedrock is never used there.
         if (
             not subscription_only
+            and self._fallback is not None
             and best_exhausted is not None
             and best_avail_val - best_exhausted[1] >= margin
         ):
@@ -691,7 +725,7 @@ class AutoSelector:
                 best_avail_val - best_exhausted[1],
                 margin,
             )
-            return _FALLBACK, statuses, new_exhausted, new_weekly
+            return self._fallback, statuses, new_exhausted, new_weekly
 
         return best_avail_name, statuses, new_exhausted, new_weekly
 

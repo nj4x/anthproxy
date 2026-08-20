@@ -22,6 +22,20 @@ discover_backends()
 
 
 @pytest.fixture(autouse=True)
+def _isolate_enabled_backends():
+    """Reset the backend allowlist filter after each test.
+
+    Prevents a test that installs ``--backends`` / calls
+    ``set_enabled_backends()`` directly from leaking a restricted registry
+    view into unrelated tests.
+    """
+    from anthproxy import backends_registry
+
+    yield
+    backends_registry.set_enabled_backends(None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_model_config(tmp_path):
     """Point ANTHPROXY_CONFIG at a non-existent path so defaults are used,
     and clear the module-level cache before and after each test."""

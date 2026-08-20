@@ -15,7 +15,16 @@ Public API
     backend_names() -> tuple[str, ...]   (declared order + discovered extras)
     discover_backends() -> None
     class_hook(backend_class, name) -> callable | None
+    set_enabled_backends(allowed) -> None   (allowlist filter; see ADR-0020)
     temporary_registry(mapping)          (context manager, test-only)
+
+Allowlist filtering (ADR-0020)
+-------------------------------
+``_BACKENDS`` always holds every discovered backend; ``set_enabled_backends()``
+installs an optional filter consulted by ``get_backend()``, ``list_backends()``,
+and ``backend_names()``. Internal backends (``_INTERNAL_BACKENDS``) are exempt
+from the filter and remain resolvable regardless of the allowlist. Call once,
+from ``config.parse_args()``, before any server thread starts.
 """
 
 import importlib
@@ -42,6 +51,11 @@ _DECLARED_ORDER: tuple[str, ...] = (
 _INTERNAL_BACKENDS: frozenset[str] = frozenset({'oauth'})
 
 _BACKENDS: dict[str, type] = {}
+
+# None means "no filter installed" (all discovered backends are enabled).
+# Once installed by set_enabled_backends(), this holds the allowed name set;
+# _INTERNAL_BACKENDS are always exempt from it (see module docstring).
+_enabled_backends: frozenset[str] | None = None
 
 _NAME_RE = re.compile(r'^[a-z][a-z0-9_-]*$')
 
@@ -71,18 +85,48 @@ def register_backend(name: str, backend_class: type) -> None:
     _BACKENDS[name] = backend_class
 
 
+def _is_enabled(name: str) -> bool:
+    """True if *name* is usable under the current allowlist filter.
+
+    Internal backends are always exempt from the filter. When no filter is
+    installed (``_enabled_backends is None``), every registered name is enabled.
+    """
+    if name in _INTERNAL_BACKENDS:
+        return True
+    return _enabled_backends is None or name in _enabled_backends
+
+
+def set_enabled_backends(allowed: 'frozenset[str] | None') -> None:
+    """Install (or clear, with ``None``) the allowlist filter.
+
+    Called exactly once, from ``config.parse_args()``, before any server
+    thread starts — never from live server code. *allowed* must already be
+    validated against the unfiltered ``backend_names()`` by the caller; this
+    function does not re-validate. Internal backends are implicitly always
+    enabled and need not be included in *allowed*.
+    """
+    global _enabled_backends
+    _enabled_backends = allowed
+
+
 def get_backend(name: str) -> type | None:
-    """Return the registered backend class for *name*, or ``None``."""
+    """Return the registered backend class for *name*, or ``None``.
+
+    Returns ``None`` for a name excluded by the allowlist filter, exactly as
+    for an unregistered name — callers cannot distinguish the two cases.
+    """
+    if not _is_enabled(name):
+        return None
     return _BACKENDS.get(name)
 
 
 def list_backends() -> tuple[str, ...]:
-    """Return all registered backend names, sorted."""
-    return tuple(sorted(_BACKENDS.keys()))
+    """Return all registered, allowlist-enabled backend names, sorted."""
+    return tuple(sorted(n for n in _BACKENDS if _is_enabled(n)))
 
 
 def backend_names() -> tuple[str, ...]:
-    """Return backend names in declared order, with discovered extras appended sorted.
+    """Return enabled backend names in declared order, with discovered extras appended sorted.
 
     Raises ``BackendDiscoveryError`` when the registry is empty — a signal that
     ``discover_backends()`` has not been called.
@@ -91,10 +135,10 @@ def backend_names() -> tuple[str, ...]:
         raise BackendDiscoveryError(
             'backend registry is empty — did you forget to call discover_backends()?'
         )
-    declared = [n for n in _DECLARED_ORDER if n in _BACKENDS]
+    declared = [n for n in _DECLARED_ORDER if n in _BACKENDS and _is_enabled(n)]
     extras = sorted(
         n for n in _BACKENDS
-        if n not in _DECLARED_ORDER and n not in _INTERNAL_BACKENDS
+        if n not in _DECLARED_ORDER and n not in _INTERNAL_BACKENDS and _is_enabled(n)
     )
     return tuple(declared + extras)
 

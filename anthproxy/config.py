@@ -8,6 +8,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from .backends_registry import backend_names as _backend_names
+from .backends_registry import set_enabled_backends as _set_enabled_backends
 from .constants import VALID_BACKEND_MODES
 
 
@@ -35,6 +36,41 @@ _DEFAULT_CLASSIFICATION: dict[str, str] = {
 }
 
 _VALID_CLASSIFICATION_LABELS: frozenset[str] = frozenset(_DEFAULT_CLASSIFICATION)
+
+
+def _parse_backends_str(
+    raw: str | None, p: argparse.ArgumentParser, full_names: frozenset[str]
+) -> frozenset[str] | None:
+    """Parse the ``--backends`` allowlist. ``None`` input means no filter.
+
+    Splits on commas, strips whitespace, drops empty tokens, de-duplicates
+    (preserving first occurrence). Validates every token against *full_names*
+    (the unfiltered discovered set). Calls ``p.error()`` on an unknown token
+    or a resulting empty set — an allowlist with zero usable backends is
+    always a configuration mistake, never a valid intent.
+    """
+    if raw is None:
+        return None
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for tok in raw.split(','):
+        tok = tok.strip()
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        tokens.append(tok)
+    if not tokens:
+        p.error(
+            '--backends: must name at least one backend, comma-separated '
+            '(e.g. --backends anthropic,codex)'
+        )
+    unknown = [t for t in tokens if t not in full_names]
+    if unknown:
+        p.error(
+            f'--backends: unknown backend(s) {unknown!r}; '
+            f'valid backends: {sorted(full_names)}'
+        )
+    return frozenset(tokens)
 
 
 def _resolve_home(home_override: str) -> str:
@@ -88,6 +124,7 @@ class Config:
     use_inference_profile: bool = True
     use_global_inference_profile: bool = False
     backend: str = 'bedrock'
+    backends: tuple[str, ...] = ()   # Allowlist filter applied at startup; empty means unrestricted
     log_level: str = 'INFO'
     no_prompt_translate: bool = False
     request_history_size: int = 5
@@ -152,9 +189,16 @@ def parse_args(argv=None) -> Config:
     p.add_argument('--global-inference-profile', dest='use_global_inference_profile',
                    action='store_true', default=False,
                    help='Use global. prefix instead of region-based prefix')
-    p.add_argument('--backend', default=os.environ.get('ANTHPROXY_BACKEND', 'bedrock'),
-                   choices=list(_backend_names()),
-                   help='LLM backend (default: bedrock)')
+    p.add_argument('--backend', default=None,
+                   help='LLM backend (default: bedrock, env: ANTHPROXY_BACKEND). '
+                        'Must be a member of the --backends allowlist if one is set; '
+                        'an unchosen default is repaired to the first enabled backend.')
+    p.add_argument('--backends', dest='backends',
+                   default=os.environ.get('ANTHPROXY_BACKENDS'),
+                   help='Comma-separated allowlist restricting which backends are '
+                        'discoverable/selectable (e.g. --backends anthropic,codex). '
+                        'Absent: all discovered backends are enabled (default,'
+                        ' env: ANTHPROXY_BACKENDS)')
     p.add_argument('--codex-home',
                    default=os.environ.get('CODEX_HOME', ''),
                    help='Path to Codex home directory (default: ~/.codex,'
@@ -439,6 +483,35 @@ def parse_args(argv=None) -> Config:
                         ' (default: 100000, env: ANTHPROXY_CODEX_CONTEXT_LIMIT)')
 
     args = p.parse_args(argv)
+
+    # --backends: validate against the full discovered set, then install the
+    # filter before any subsequent backend_names() call. This is a required
+    # ordering — see ADR-0020 §4.
+    full_backend_names = frozenset(_backend_names())
+    enabled = _parse_backends_str(args.backends, p, full_backend_names)
+    _set_enabled_backends(enabled)
+    args.backends = tuple(sorted(enabled)) if enabled is not None else ()
+
+    # --backend: distinguish an explicit choice (CLI flag or env var) from the
+    # unset packaged default. An explicit value outside the enabled set is a
+    # hard error; an unchosen default is silently repaired (ADR-0020 §5, §6).
+    backend_env = os.environ.get('ANTHPROXY_BACKEND')
+    backend_explicit = args.backend is not None or bool(backend_env)
+    if args.backend is None:
+        args.backend = backend_env or 'bedrock'
+    filtered_backend_names = _backend_names()
+    if args.backend not in filtered_backend_names:
+        if backend_explicit:
+            p.error(
+                f'--backend {args.backend!r} is not in the enabled backend set '
+                f'{list(filtered_backend_names)}; pass --backends to include it '
+                f'or choose a different --backend'
+            )
+        if not filtered_backend_names:
+            p.error('--backends: resulting enabled backend set is empty')
+        repaired = filtered_backend_names[0]
+        logger.warning('Backend default repaired: %s -> %s', args.backend, repaired)
+        args.backend = repaired
 
     args.codex_unsupported_model_fallback = (
         args.codex_unsupported_model_fallback or ''

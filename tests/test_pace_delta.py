@@ -451,6 +451,9 @@ class _Registry:
     def active_name(self):
         raise AssertionError('personal_candidates must not call registry')
 
+    def list_backends(self):
+        return ('anthropic', 'bedrock', 'codex', 'local', 'openrouter')
+
 
 class TestPersonalCandidatesElapsed:
     """Verify personal_candidates() derives weekly_elapsed_pct from the cached
@@ -555,6 +558,9 @@ class _ActiveRegistry:
 
     def active_name(self):
         return self._active
+
+    def list_backends(self):
+        return ('anthropic', 'bedrock', 'codex', 'local', 'openrouter')
 
     def instance(self, name):
         return self._instances[name]

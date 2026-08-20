@@ -50,6 +50,10 @@ _Avoid_: session key, routing key
 A backend's quota consumption relative to the linear passage of its own quota window: `burn% − elapsed%`. Negative means behind schedule (headroom to spare); positive means ahead of schedule. Comparable across windows of differing length.
 _Avoid_: burn rate, utilization delta
 
+**Enabled Backend Set**:
+The backends an operator has made available for this deployment. Defaults to every backend the installation provides; an operator may narrow it. A backend outside the set does not exist as far as selection, switching, and credential preparation are concerned — it is not merely hidden from view.
+_Avoid_: allowed backends, active backends, backend allowlist
+
 **Self-Pace Gate**:
 The absolute test `oauth_delta < 0` — is this backend behind its *own* schedule — evaluated before any cross-backend comparison. Distinct from the pace-delta *comparison*, which asks only which backend is further behind.
 _Avoid_: pace check, budget gate

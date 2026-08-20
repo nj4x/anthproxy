@@ -464,11 +464,27 @@ class BackendRegistry:
                     name = None
                     if self._subscription_resolver is not None:
                         resolved = self._subscription_resolver()
-                        if resolved in SUBSCRIPTION_BACKENDS:
+                        if resolved in SUBSCRIPTION_BACKENDS and resolved in backend_names():
                             name = resolved
                     if name is None:
-                        name = self._active if self._active in SUBSCRIPTION_BACKENDS else 'anthropic'
-                    backend = self._instances.get(name) or self._instances[self._active]
+                        # ADR-0020 (a): prefer an enabled subscription backend
+                        # over the hardcoded 'anthropic' fallback, so an
+                        # excluded name is never recorded as the snapshot name.
+                        enabled_subs = [
+                            b for b in SUBSCRIPTION_BACKENDS if b in backend_names()
+                        ]
+                        if self._active in enabled_subs:
+                            name = self._active
+                        elif enabled_subs:
+                            name = enabled_subs[0]
+                        else:
+                            name = self._active
+                    backend = self._instances.get(name)
+                    if backend is None:
+                        # Keep name/backend consistent — never report a name
+                        # whose instance we didn't actually use.
+                        name = self._active
+                        backend = self._instances[self._active]
                     session_subscription = True
                 else:
                     name = override
@@ -962,10 +978,14 @@ class BackendRegistry:
                 return SwitchResult(kind='unchanged', previous=previous,
                                     current=SESSION_SUBSCRIPTION_SENTINEL)
 
+        # ADR-0020 (a): iterate only enabled subscription backends. An excluded
+        # backend already fails inside _prepare_candidate via build_backend(),
+        # so this is a clarity/perf narrowing, not new error handling.
+        enabled_subs = [b for b in SUBSCRIPTION_BACKENDS if b in backend_names()]
         prepared_any = False
         last_error: str | None = None
         with self._prepare_lock:
-            for sub in SUBSCRIPTION_BACKENDS:
+            for sub in enabled_subs:
                 try:
                     self._prepare_candidate(sub)
                     prepared_any = True
@@ -974,6 +994,8 @@ class BackendRegistry:
                     last_error = str(exc)
 
         if not prepared_any:
+            if last_error is None:
+                last_error = 'no subscription backends are enabled'
             return SwitchResult(kind='failed', previous=previous,
                                 current=previous, error=last_error)
 

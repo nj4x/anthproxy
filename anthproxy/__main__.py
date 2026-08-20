@@ -3,7 +3,8 @@ import sys
 
 from . import model_config
 from .config import parse_args
-from .server import BackendRegistry, build_backend, create_server, discover_backends
+from .constants import SUBSCRIPTION_BACKENDS
+from .server import BackendRegistry, backend_names, build_backend, create_server, discover_backends
 
 
 class _ShortNameFormatter(logging.Formatter):
@@ -60,22 +61,34 @@ def main():
     # editable template for model aliases, pricing, etc.
     model_config.ensure_file()
 
+    # ADR-0020 §8: when the enabled set contains no subscription backend, auto
+    # mode has nothing to rotate among — disable it rather than fail to boot.
+    enabled_names = frozenset(backend_names())
+    if config.auto_backend and not (enabled_names & set(SUBSCRIPTION_BACKENDS)):
+        logger.info(
+            'Auto-backend disabled: no subscription backends in enabled set (%s)',
+            sorted(enabled_names),
+        )
+        config.auto_backend = False
+
     if config.auto_backend:
-        # Auto mode: ensure credentials for both subscription backends regardless
-        # of --backend.  Interactive login may run for each.  Priority order:
-        # anthropic first so its login prompt appears before codex's.
-        from .anthropic import auth as anthropic_auth
-        from .codex import auth as codex_auth
-        try:
-            anthropic_auth.ensure_credentials(config)
-        except Exception as exc:
-            logger.warning(
-                'Anthropic credential setup failed; anthropic backend will be unavailable: %s', exc)
-        try:
-            codex_auth.ensure_credentials(config)
-        except Exception as exc:
-            logger.warning(
-                'Codex credential setup failed; codex backend will be unavailable: %s', exc)
+        # Auto mode: ensure credentials only for subscription backends in the
+        # enabled set (ADR-0020 §7). Priority order: anthropic first so its
+        # login prompt appears before codex's.
+        if 'anthropic' in enabled_names:
+            from .anthropic import auth as anthropic_auth
+            try:
+                anthropic_auth.ensure_credentials(config)
+            except Exception as exc:
+                logger.warning(
+                    'Anthropic credential setup failed; anthropic backend will be unavailable: %s', exc)
+        if 'codex' in enabled_names:
+            from .codex import auth as codex_auth
+            try:
+                codex_auth.ensure_credentials(config)
+            except Exception as exc:
+                logger.warning(
+                    'Codex credential setup failed; codex backend will be unavailable: %s', exc)
     else:
         # Static mode: only prepare the single configured backend.
         if config.backend == 'codex':

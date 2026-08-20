@@ -993,3 +993,105 @@ class TestSummaryCredentialsRegression:
         from anthproxy.config import Config
         assert not hasattr(Config(), 'gauss_ums_token')
         assert not hasattr(Config(), 'plugin_ums_token')
+
+
+class TestEnabledBackendsFilter:
+    """ADR-0020: --backends allowlist filtering at the accessor level."""
+
+    def test_no_filter_means_all_enabled(self):
+        assert backends_registry._enabled_backends is None
+        names = backend_names()
+        assert 'bedrock' in names and 'anthropic' in names
+
+    def test_filter_restricts_backend_names(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic', 'codex'}))
+        names = backend_names()
+        assert set(names) == {'anthropic', 'codex'}
+
+    def test_filter_restricts_list_backends(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        # oauth is internal and always exempt, so it survives the filter.
+        assert set(backends_registry.list_backends()) == {'anthropic', 'oauth'}
+
+    def test_filter_restricts_get_backend(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        assert get_backend('anthropic') is not None
+        assert get_backend('bedrock') is None
+
+    def test_internal_backend_exempt_from_filter(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        assert get_backend('oauth') is not None
+        assert 'oauth' not in backend_names()  # never listed, filter or not
+
+    def test_reset_to_none_restores_full_set(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        assert set(backend_names()) == {'anthropic'}
+        backends_registry.set_enabled_backends(None)
+        assert set(backend_names()) == set(
+            n for n in backends_registry._BACKENDS
+            if n not in backends_registry._INTERNAL_BACKENDS
+        )
+
+    def test_rediscovery_is_idempotent_under_filter(self):
+        """A second discover_backends() call must not choke on a filtered view."""
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        backends_registry.discover_backends()  # must not raise
+        assert get_backend('bedrock') is None  # filter still installed
+        assert 'bedrock' in backends_registry._BACKENDS  # but never removed internally
+
+
+class TestBackendsCliFlag:
+    """ADR-0020: --backends / ANTHPROXY_BACKENDS CLI and env parsing."""
+
+    def test_absent_flag_means_unrestricted(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args([])
+        assert cfg.backends == ()
+        assert backends_registry._enabled_backends is None
+
+    def test_valid_allowlist_installs_filter(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex'])
+        assert cfg.backends == ('anthropic', 'codex')
+        assert set(backend_names()) == {'anthropic', 'codex'}
+
+    def test_whitespace_and_dedup(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', ' anthropic , codex ,anthropic'])
+        assert cfg.backends == ('anthropic', 'codex')
+
+    def test_unknown_token_errors(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,not_a_backend'])
+
+    def test_empty_value_errors(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', ''])
+
+    def test_oauth_token_rejected_as_unknown(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'oauth'])
+
+    def test_explicit_backend_outside_allowlist_errors(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,codex', '--backend', 'bedrock'])
+
+    def test_explicit_backend_inside_allowlist_succeeds(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex', '--backend', 'codex'])
+        assert cfg.backend == 'codex'
+
+    def test_unset_backend_default_is_repaired(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex'])
+        assert cfg.backend in ('anthropic', 'codex')
+
+    def test_env_backend_is_treated_as_explicit(self, monkeypatch):
+        from anthproxy.config import parse_args
+        monkeypatch.setenv('ANTHPROXY_BACKEND', 'bedrock')
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,codex'])

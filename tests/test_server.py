@@ -442,6 +442,45 @@ class TestSessionSubscription:
         assert registry.session_backend('sess-a') is None
 
 
+class TestSubscriptionAllowlistDegradation:
+    """ADR-0020 (a): subscription paths must not name/route to an excluded backend."""
+
+    def test_set_session_subscription_fails_with_typed_error_when_none_enabled(
+        self, monkeypatch,
+    ):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'bedrock', 'local'}))
+        config, registry = _registry('bedrock')
+        _patch_build_with_auth(monkeypatch)
+        result = registry.set_session_subscription('sess-a')
+        assert result.kind == 'failed'
+        assert 'no subscription backends are enabled' in result.error
+
+    def test_snapshot_fallback_never_names_excluded_backend(self, monkeypatch):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'codex', 'bedrock'}))
+        config, registry = _registry('bedrock')
+        _patch_build_with_auth(monkeypatch)
+        registry.set_session_subscription('sess-a')
+        # anthropic is excluded; the hardcoded 'anthropic' fallback must not
+        # be used. codex is the only enabled subscription backend.
+        snap = registry.snapshot('sess-a')
+        assert snap.name == 'codex'
+
+    def test_snapshot_fallback_uses_active_when_no_subscription_enabled(
+        self, monkeypatch,
+    ):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'bedrock', 'local'}))
+        config, registry = _registry('bedrock')
+        _patch_build_with_auth(monkeypatch)
+        registry._session_overrides['sess-a'] = SESSION_SUBSCRIPTION_SENTINEL
+        snap = registry.snapshot('sess-a')
+        # No subscription backend enabled at all: name/backend stay consistent
+        # with whatever is actually active, never a fabricated/excluded name.
+        assert snap.name == registry.active_name()
+
+
 class TestCreateServerWiresResolver:
 
     def test_create_server_wires_subscription_resolver(self, monkeypatch):
