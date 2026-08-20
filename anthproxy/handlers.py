@@ -654,7 +654,6 @@ class PreparedRequest:
     credentials: dict
     routing: _ModelRoutingDecision
     ctx_key: str | None
-    route_est: int
     prompt_capture: dict
 
 
@@ -666,19 +665,52 @@ def _oauth_credential(handler) -> 'OAuthRequestCredentials | None':
     return None
 
 
-def prepare_routing(handler, payload, sess_key):
-    """Prepare a request for dispatch: routing, tier cache, DB pin, tool stripping, etc."""
-    oauth_credential = _oauth_credential(handler)
-    snapshot = handler.registry.snapshot_for_request(
-        sess_key,
-        prefer_backend=getattr(handler, '_prefer_backend', None),
-        oauth_credential=oauth_credential,
-    )
+def _snapshot_credentials(handler, snapshot) -> dict:
+    """Credentials for a dispatch attempt against ``snapshot``.
+
+    The oauth backend carries its credential on the snapshot itself; every
+    other backend parses it from the request headers.
+    """
     if snapshot.name == 'oauth':
-        credentials = {'oauth': snapshot.credentials}
-    else:
-        credentials = snapshot.backend.parse_credentials(handler.headers.get('x-api-key', ''))
+        return {'oauth': snapshot.credentials}
+    return snapshot.backend.parse_credentials(handler.headers.get('x-api-key', ''))
+
+
+def _derive_and_record_routing(handler, payload, snapshot) -> None:
+    """Derive the routing decision and record it on the handler.
+
+    Used by both initial dispatch and retry to avoid duplication. Sets
+    ``self._routing``, ``self._ctx_key``, and ``self._prompt_capture``.
+    """
+    credentials = _snapshot_credentials(handler, snapshot)
+    sess_key = _session_key(payload) if isinstance(payload, dict) else None
+    routing, ctx_key = derive_routing(
+        handler, payload, sess_key, snapshot, credentials,
+    )
+    handler._routing = routing
+    handler._ctx_key = ctx_key
+    handler._prompt_capture = handler._extract_prompt_capture(payload, routing=routing)
+
+
+def derive_routing(handler, payload, sess_key, snapshot, credentials):
+    """Derive the model-routing decision for one dispatch attempt.
+
+    Called once per attempt against the snapshot that will actually serve the
+    request, so a retry crossing the provider/peer boundary re-derives rather
+    than inheriting the previous attempt's decision.  Returns
+    ``(routing, ctx_key)``; ``ctx_key`` is the key the post-response
+    session-context recording writes under, or ``None`` when it must not fire.
+    """
     _blks, _chars, _sys_hash, _head = _system_fingerprint(payload)
+
+    # ADR-0023: model-tier routing authority rests with the innermost hop.
+    # When this attempt resolves to the peer backend the peer classifies the
+    # same text against its own configuration, so classifying here would bill
+    # a second classifier call, risk a conflicting decision, and hand the peer
+    # a model no client requested.  Suppression is total — no classifier and
+    # no long-context floor, because a floor is a judgement about what the
+    # serving backend can hold and this hop is not serving the request.
+    peer_bound = snapshot.name == 'peer'
 
     # Per-conversation routing key: (session_id, first-user-message hash).
     # NOT the bare session — Claude Code shares metadata.user_id between a
@@ -700,21 +732,49 @@ def prepare_routing(handler, payload, sess_key):
     # Pass cached session tier so walk-back-only continuations can reuse
     # the tier established by a turn with real intent — keyed per
     # conversation so a sub-agent never reuses the parent's tier.
+    # The peer path reads no routing state either: the short-affirmation
+    # lookup and the floor read both live inside route_model, which is not
+    # called below, but skipping them here explicitly keeps a later hoist out
+    # of route_model from quietly reintroducing them on the peer path.
     cached_tier = (
-        handler.registry.session_routed_tier(ctx_key) if ctx_key else None
+        handler.registry.session_routed_tier(ctx_key)
+        if ctx_key and not peer_bound else None
     )
     # Session-context floor: track measured tokens only when routing is on
     # AND a floor threshold is set. _ctx_key gates the post-response
     # recording below; (floor, ratio) feed the floor decision now.
     floor_active = (
         routing_on
+        and not peer_bound
         and snapshot.config.auto_model_routing_long_context_threshold > 0
     )
     ctx_key_result = ctx_key if floor_active else None
     session_floor, session_ratio = (
         handler.registry.session_context(ctx_key) if floor_active else (0, 1.0)
     )
-    if getattr(handler, '_no_classifier', False):
+    if peer_bound:
+        # A pass-through decision, not None: _routing_fields() and the
+        # response emitter consume it unconditionally.  The reason code is
+        # distinct from 'disabled' (routing was off) and from a classifier
+        # run that happened to choose the same model, so an operator
+        # debugging a chain can tell the three apart.
+        ctx_key_result = None
+        requested = str(payload.get('model', ''))
+        routing = _ModelRoutingDecision(
+            requested_model=requested,
+            routed_model=requested,
+            classification=None,
+            applied=False,
+            reason_code='peer_hop_suppressed',
+            estimated_input_tokens=0,
+        )
+        logger.info(
+            '%s Model routing suppressed: dispatch target is the peer backend, '
+            'which classifies for itself; transmitting requested=%s verbatim '
+            '(no classifier, no context floor, no session state written)',
+            handler._log_tag(), requested,
+        )
+    elif getattr(handler, '_no_classifier', False):
         # Bypass ALL routing: classifier call, size floor, session tier
         # cache, affirmation branch.  The client gets exactly the model
         # it asked for.  _ctx_key must be cleared so the post-response
@@ -749,7 +809,6 @@ def prepare_routing(handler, payload, sess_key):
                                task_tag=getattr(handler, '_task_tag', None),
                                ctx_key=ctx_key,
                                baseline_model=baseline_model)
-    route_est = routing.estimated_input_tokens
 
     # Session tier cache (last-resort fallback): persist each fresh
     # classification, and reuse the last tier only when this turn yields
@@ -758,7 +817,7 @@ def prepare_routing(handler, payload, sess_key):
     # only continuations are freshly classified (taking the write
     # branch); the stale-tier read fires only when neither the final
     # message nor any prior user turn yields text.
-    if ctx_key is not None:
+    if ctx_key is not None and not peer_bound:
         if routing.classification is not None:
             # A valid classification was produced; persist the tier.
             # For affirmation_classified, write the uncapped cache_tier so
@@ -846,6 +905,23 @@ def prepare_routing(handler, payload, sess_key):
             routing.classifier_mode,
         )
 
+
+    return routing, ctx_key_result
+
+
+def prepare_routing(handler, payload, sess_key):
+    """Prepare a request for dispatch: routing, tier cache, DB pin, tool stripping, etc."""
+    oauth_credential = _oauth_credential(handler)
+    snapshot = handler.registry.snapshot_for_request(
+        sess_key,
+        prefer_backend=getattr(handler, '_prefer_backend', None),
+        oauth_credential=oauth_credential,
+    )
+    credentials = _snapshot_credentials(handler, snapshot)
+    routing, ctx_key_result = derive_routing(
+        handler, payload, sess_key, snapshot, credentials,
+    )
+
     # Strip deny-listed tools before the request reaches any backend.
     if TOOLS_TO_REMOVE and payload.get('tools'):
         payload['tools'] = [
@@ -872,7 +948,6 @@ def prepare_routing(handler, payload, sess_key):
         credentials=credentials,
         routing=routing,
         ctx_key=ctx_key_result,
-        route_est=route_est,
         prompt_capture=prompt_capture,
     )
 
@@ -885,6 +960,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     stats_collector = None  # StatsCollector instance, or None if stats are disabled
     session_db = None       # SessionDB instance, or None if DB recording disabled
     enable_ui = False       # Whether /admin/* and /ui/* endpoints are active
+    _original_requested_model = None  # Set per-request in do_POST/_handle_messages
+    _original_anthropic_beta = None   # Set per-request in do_POST/_handle_messages
 
     def do_POST(self):
         self._req_start = time.monotonic()
@@ -904,6 +981,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self._task_tag = None
         self._db_request_id = None
         self._prompt_capture: dict = {}
+        # The single source of truth for "what the client asked for": captured
+        # before any route_model call and never overwritten, so every dispatch
+        # attempt derives its own decision from it rather than inheriting the
+        # previous attempt's routed output as its input.  The beta list is
+        # captured with it because the long-context floor appends to it, and a
+        # retry that lands on a different backend must not inherit that either.
+        self._original_requested_model = None
+        self._original_anthropic_beta = None
 
         overrides = _parse_override_header(self.headers.get('X-Anthproxy-Override'))
         self._no_classifier = overrides.get('no_classifier', False)
@@ -1005,6 +1090,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             # Snapshot the active backend once; the whole request lifetime uses
             # this captured backend/config even if another thread switches.
             sess_key = _session_key(payload)
+            self._original_requested_model = str(payload.get('model', ''))
+            _client_beta = payload.get('_anthropic_beta')
+            self._original_anthropic_beta = (
+                list(_client_beta) if isinstance(_client_beta, list) else None
+            )
             self._session_prefix = _session_short_id(sess_key) if sess_key else None
             _blks, _chars, sys_hash, _head = _system_fingerprint(payload)
             self._session_hash = sys_hash
@@ -1013,7 +1103,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             snapshot = prepared.snapshot
             self._routing = prepared.routing
             self._ctx_key = prepared.ctx_key
-            self._route_est = prepared.route_est
+            self._route_est = prepared.routing.estimated_input_tokens
             self._prompt_capture = prepared.prompt_capture
             self._dispatch(payload, snapshot, 1, credentials=prepared.credentials)
 
@@ -1124,7 +1214,30 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         """
         snapshot = None
         try:
+            # The retry must land on the auto-selector's new choice, not the
+            # session backend pin. That pin is consulted only in the initial
+            # prepare_routing; here we use the fresh selector state to honour
+            # the 429.  We do NOT pass sess_key because that would read
+            # _session_overrides (the backend pin) and bypass the retry.
             snapshot = self.registry.snapshot()
+            # The routing decision belongs to the snapshot that will actually
+            # serve the request, so a retry re-derives it from the client's
+            # original model.  Inheriting the first attempt's output would
+            # either leave routing disabled for a request this instance now
+            # serves itself (peer → provider), or send the peer a routed model
+            # the client never asked for (provider → peer).
+            credentials = None
+            if self._original_requested_model:  # non-empty string
+                payload['model'] = self._original_requested_model
+                # Undo the long-context floor's beta injection too: the peer
+                # re-emits _anthropic_beta as an outbound header, so a carried
+                # context-1m token would hand it a floor decision this hop was
+                # not entitled to make.
+                if self._original_anthropic_beta is None:
+                    payload.pop('_anthropic_beta', None)
+                else:
+                    payload['_anthropic_beta'] = list(self._original_anthropic_beta)
+                _derive_and_record_routing(self, payload, snapshot)
             self._dispatch(payload, snapshot, 2)
         except AnthropicRequestError as exc:
             if snapshot is not None and self.stats_collector is not None:

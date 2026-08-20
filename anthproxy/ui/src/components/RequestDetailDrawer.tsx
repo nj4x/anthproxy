@@ -52,6 +52,8 @@ function reasonDescription(reasonCode: string | null): string {
       return 'No classifier call: no user text in final message';
     case 'override_no_classifier':
       return 'No classifier call: X-Anthproxy-Override: no-classifier';
+    case 'peer_hop_suppressed':
+      return 'No classifier call: peer-bound request — the peer routes for itself';
     default:
       return 'No classifier call';
   }

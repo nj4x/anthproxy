@@ -3120,3 +3120,299 @@ class TestLogRoutingEconomicsReturn:
             routed_model='haiku', input_tokens=1_000, output_tokens=0,
             cache_creation_tokens=0, cache_read_tokens=0,
         ) is None
+
+
+class TestPeerHopRoutingSuppression:
+    """ADR-0023: an instance that resolves its dispatch target to the peer
+    backend performs no model-tier routing for that request — no classifier,
+    no long-context floor, no session state read or written — and transmits
+    the client's model verbatim."""
+
+    def _make(self, name, *, model_response=None):
+        backend = MagicMock()
+        backend.parse_credentials.return_value = {'token': 'ok'}
+        backend.send_message.return_value = model_response or {
+            'type': 'message', 'content': [], 'usage': {'input_tokens': 10, 'output_tokens': 5},
+        }
+        backend.send_classifier_message = MagicMock(
+            return_value={'content': [{'type': 'text', 'text': '0'}]}  # 0 = trivial
+        )
+        snapshot = _fake_snapshot(name, backend)
+        snapshot.config.auto_model_routing = True
+        snapshot.config.auto_model_routing_affirmation_inherit = True
+        return backend, snapshot
+
+    def _handler(self, registry):
+        handler = _handler_with_registry(registry)
+        handler.headers = {'x-api-key': 'key'}
+        handler._validate_content_type = MagicMock()
+        handler._read_body = MagicMock(return_value=b'{}')
+        return handler
+
+    def _registry(self, *snapshots):
+        registry = MagicMock()
+        if len(snapshots) == 1:
+            registry.snapshot.return_value = snapshots[0]
+        else:
+            registry.snapshot.side_effect = list(snapshots)
+        registry.session_context.return_value = (0, 1.0)
+        registry.session_routed_tier.return_value = None
+        registry.set_session_routed_tier = MagicMock()
+        registry.record_session_context = MagicMock()
+        return registry
+
+    def _payload(self, model='sonnet', content='plan a refactor', sess='peer-sess'):
+        return {
+            'model': model,
+            'messages': [{'role': 'user', 'content': content}],
+            'metadata': {'user_id': sess},
+        }
+
+    def test_peer_bound_request_runs_no_classifier(self):
+        backend, snapshot = self._make('peer')
+        handler = self._handler(self._registry(snapshot))
+        handler._parse_json = MagicMock(return_value=self._payload())
+
+        handler._handle_messages()
+
+        backend.send_classifier_message.assert_not_called()
+        assert handler._routing.reason_code == 'peer_hop_suppressed'
+        assert handler._routing.applied is False
+        assert handler._routing.classification is None
+
+    def test_peer_bound_request_applies_no_long_context_floor(self):
+        backend, snapshot = self._make('peer')
+        snapshot.config.auto_model_routing_long_context_threshold = 1
+        handler = self._handler(self._registry(snapshot))
+        payload = self._payload(content='x' * 100_000)
+        handler._parse_json = MagicMock(return_value=payload)
+
+        handler._handle_messages()
+
+        assert backend.send_message.call_args.args[0]['model'] == 'sonnet'
+        assert '_anthropic_beta' not in backend.send_message.call_args.args[0]
+
+    def test_peer_bound_request_writes_no_session_state(self):
+        _backend, snapshot = self._make('peer')
+        registry = self._registry(snapshot)
+        handler = self._handler(registry)
+        handler._parse_json = MagicMock(return_value=self._payload())
+
+        handler._handle_messages()
+
+        registry.set_session_routed_tier.assert_not_called()
+        registry.record_session_context.assert_not_called()
+        assert handler._ctx_key is None
+
+    def test_peer_bound_request_reads_no_session_state(self):
+        """Reads are moot (route_model is not called) but must be explicitly
+        skipped so a later hoist out of route_model cannot reintroduce them."""
+        _backend, snapshot = self._make('peer')
+        registry = self._registry(snapshot)
+        handler = self._handler(registry)
+        handler._parse_json = MagicMock(return_value=self._payload())
+
+        handler._handle_messages()
+
+        registry.session_routed_tier.assert_not_called()
+        registry.session_context.assert_not_called()
+
+    def test_peer_turn_leaves_tier_cache_untouched_for_next_provider_turn(self):
+        _pb, peer_snapshot = self._make('peer')
+        provider_backend, provider_snapshot = self._make('anthropic')
+        registry = self._registry(peer_snapshot, provider_snapshot)
+        registry.session_routed_tier.return_value = 'opus'
+
+        handler = self._handler(registry)
+        handler._parse_json = MagicMock(return_value=self._payload(sess='alt-sess'))
+        handler._handle_messages()
+
+        handler2 = self._handler(registry)
+        handler2._parse_json = MagicMock(return_value=self._payload(sess='alt-sess'))
+        handler2._handle_messages()
+
+        # The peer turn wrote nothing, so the provider turn's classifier ran
+        # and wrote its own tier — the only write in the sequence.
+        provider_backend.send_classifier_message.assert_called_once()
+        assert registry.set_session_routed_tier.call_count == 1
+
+    def test_suppression_reason_distinct_from_off_and_from_classifier_no_change(self):
+        _pb, peer_snapshot = self._make('peer')
+        handler = self._handler(self._registry(peer_snapshot))
+        handler._parse_json = MagicMock(return_value=self._payload())
+        handler._handle_messages()
+        suppressed = handler._routing_fields()
+
+        _ob, off_snapshot = self._make('anthropic')
+        off_snapshot.config.auto_model_routing = False
+        handler_off = self._handler(self._registry(off_snapshot))
+        handler_off._parse_json = MagicMock(return_value=self._payload())
+        handler_off._handle_messages()
+        routing_off = handler_off._routing_fields()
+
+        # Classifier runs and picks the tier already requested → no rewrite.
+        _cb, ran_snapshot = self._make('anthropic')
+        handler_ran = self._handler(self._registry(ran_snapshot))
+        handler_ran._parse_json = MagicMock(return_value=self._payload(model='haiku'))
+        handler_ran._handle_messages()
+        classifier_ran = handler_ran._routing_fields()
+
+        assert suppressed['reason_code'] == 'peer_hop_suppressed'
+        assert routing_off['reason_code'] == 'disabled'
+        assert classifier_ran['reason_code'] == 'classifier_trivial'
+        assert handler_ran._routing.applied is False
+
+    @pytest.mark.parametrize('model', ['sonnet', 'claude-sonnet-4-5-20250929'])
+    def test_peer_bound_transmits_client_model_verbatim(self, model):
+        backend, snapshot = self._make('peer')
+        handler = self._handler(self._registry(snapshot))
+        handler._parse_json = MagicMock(return_value=self._payload(model=model))
+
+        handler._handle_messages()
+
+        assert backend.send_message.call_args.args[0]['model'] == model
+        assert handler._routing.requested_model == model
+        assert handler._routing.routed_model == model
+
+    def test_next_request_to_provider_routes_normally(self):
+        _pb, peer_snapshot = self._make('peer')
+        provider_backend, provider_snapshot = self._make('anthropic')
+        registry = self._registry(peer_snapshot, provider_snapshot)
+
+        handler = self._handler(registry)
+        handler._parse_json = MagicMock(return_value=self._payload(sess='seq-sess'))
+        handler._handle_messages()
+        assert handler._routing.reason_code == 'peer_hop_suppressed'
+
+        handler2 = self._handler(registry)
+        handler2._parse_json = MagicMock(return_value=self._payload(sess='seq-sess'))
+        handler2._handle_messages()
+
+        provider_backend.send_classifier_message.assert_called_once()
+        assert handler2._routing.reason_code == 'classifier_trivial'
+        assert provider_backend.send_message.call_args.args[0]['model'] == 'haiku'
+
+    def test_suppression_is_logged(self, caplog):
+        _pb, snapshot = self._make('peer')
+        handler = self._handler(self._registry(snapshot))
+        handler._parse_json = MagicMock(return_value=self._payload())
+
+        with caplog.at_level(logging.INFO, logger='anthproxy.handlers'):
+            handler._handle_messages()
+
+        assert 'Model routing suppressed' in caplog.text
+        assert 'peer backend' in caplog.text
+
+    def test_retry_peer_to_provider_routes_against_original_model(self):
+        peer_backend, peer_snapshot = self._make('peer')
+        peer_backend.send_message.side_effect = AnthropicRequestError(
+            'rate limited', status_code=429)
+        provider_backend, provider_snapshot = self._make('anthropic')
+        registry = self._registry(peer_snapshot, provider_snapshot)
+        selector = MagicMock()
+        selector.is_paused.return_value = False
+        selector.on_rate_limited.return_value = 'anthropic'
+
+        handler = self._handler(registry)
+        handler.selector = selector
+        handler._parse_json = MagicMock(return_value=self._payload(sess='retry-a'))
+
+        handler._handle_messages()
+
+        # The retry is served by this instance, so it classifies the client's
+        # original model rather than inheriting the peer non-decision.
+        provider_backend.send_classifier_message.assert_called_once()
+        assert handler._routing.reason_code == 'classifier_trivial'
+        assert provider_backend.send_message.call_args.args[0]['model'] == 'haiku'
+
+    def test_retry_provider_to_peer_sends_client_original_model(self):
+        provider_backend, provider_snapshot = self._make('anthropic')
+        # The payload dict is mutated in place across attempts, so record the
+        # model at call time rather than reading it back off call_args.
+        seen = []
+
+        def _first_attempt(payload, *_args, **_kwargs):
+            seen.append(payload['model'])
+            raise AnthropicRequestError('rate limited', status_code=429)
+
+        provider_backend.send_message.side_effect = _first_attempt
+        peer_backend, peer_snapshot = self._make('peer')
+        registry = self._registry(provider_snapshot, peer_snapshot)
+        selector = MagicMock()
+        selector.is_paused.return_value = False
+        selector.on_rate_limited.return_value = 'peer'
+
+        handler = self._handler(registry)
+        handler.selector = selector
+        handler._parse_json = MagicMock(return_value=self._payload(sess='retry-b'))
+
+        handler._handle_messages()
+
+        # First attempt routed sonnet → haiku; the peer must still receive the
+        # client's original model, with no trace of that routing.
+        assert seen == ['haiku']
+        assert peer_backend.send_message.call_args.args[0]['model'] == 'sonnet'
+        assert handler._routing.reason_code == 'peer_hop_suppressed'
+        assert handler._routing.requested_model == 'sonnet'
+        peer_backend.send_classifier_message.assert_not_called()
+
+    def test_original_model_captured_before_any_routing(self):
+        provider_backend, provider_snapshot = self._make('anthropic')
+        registry = self._registry(provider_snapshot)
+        handler = self._handler(registry)
+        handler._parse_json = MagicMock(return_value=self._payload(sess='capture'))
+
+        handler._handle_messages()
+
+        # route_model rewrote payload['model'] to haiku; the captured value is
+        # still what the client asked for.
+        assert provider_backend.send_message.call_args.args[0]['model'] == 'haiku'
+        assert handler._original_requested_model == 'sonnet'
+
+    def test_retry_to_peer_drops_long_context_beta_injected_by_first_attempt(self):
+        """The floor's context-1m injection must not ride along to the peer,
+        which re-emits _anthropic_beta as an outbound anthropic-beta header."""
+        provider_backend, provider_snapshot = self._make('anthropic')
+        provider_snapshot.config.auto_model_routing_long_context_threshold = 1
+        provider_backend.send_message.side_effect = AnthropicRequestError(
+            'rate limited', status_code=429)
+        peer_backend, peer_snapshot = self._make('peer')
+        registry = self._registry(provider_snapshot, peer_snapshot)
+        selector = MagicMock()
+        selector.is_paused.return_value = False
+        selector.on_rate_limited.return_value = 'peer'
+
+        handler = self._handler(registry)
+        handler.selector = selector
+        handler.headers = {'x-api-key': 'key', 'anthropic-beta': 'oauth-2025-04-20'}
+        handler._parse_json = MagicMock(
+            return_value=self._payload(content='x' * 100_000, sess='retry-beta'))
+
+        handler._handle_messages()
+
+        outbound = peer_backend.send_message.call_args.args[0]
+        assert outbound['model'] == 'sonnet'
+        assert outbound['_anthropic_beta'] == ['oauth-2025-04-20']
+
+    def test_retry_bypasses_session_backend_pin_to_honour_429_switch(self):
+        """The retry takes a fresh selector snapshot *without* the session
+        key, so a pinned session backend does not bypass the auto-switch."""
+        first_backend, first_snapshot = self._make('anthropic')
+        first_backend.send_message.side_effect = AnthropicRequestError(
+            'rate limited', status_code=429)
+        second_backend, second_snapshot = self._make('bedrock')
+        registry = self._registry(first_snapshot, second_snapshot)
+        selector = MagicMock()
+        selector.is_paused.return_value = False
+        selector.on_rate_limited.return_value = 'bedrock'
+
+        handler = self._handler(registry)
+        handler.selector = selector
+        payload = self._payload(sess='pin-sess')
+        handler._parse_json = MagicMock(return_value=payload)
+
+        handler._handle_messages()
+
+        # The retry snapshot is called without a session key, so the session
+        # backend pin is not consulted and the retry lands on bedrock.
+        assert registry.snapshot.call_args_list[-1].args == ()

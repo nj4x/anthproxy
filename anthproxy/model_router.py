@@ -344,6 +344,7 @@ ReasonCode = Literal[
     'malformed_payload',
     'missing_final_user_text',
     'override_no_classifier',
+    'peer_hop_suppressed',  # constructed by handlers.py, never by route_model
     'size_forced_long_context',
     'session_cached_tier',
     'session_cached_tier_capped',
