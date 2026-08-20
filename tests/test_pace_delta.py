@@ -222,21 +222,14 @@ class TestOAuthPaceGate:
 
         assert snap.name == 'oauth'
 
-    def test_deadband_holds_personal_at_boundary(self):
-        # Construct personal so oauth_delta == personal_delta - deadband exactly;
-        # strict '<' means personal (incumbent) wins.  oauth delta is -1.0, inside
-        # the self-pace margin, so the gate stays out of this comparison.
+    def test_personal_pace_delta_does_not_override_oauth_allowance(self):
         oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED - 1.0, _WALL)
-        oauth_delta = -1.0
-        # personal_delta = burn - elapsed; want personal_delta - 3 == oauth_delta
-        # → personal_delta = oauth_delta + 3.  elapsed 0 → burn = personal_delta.
-        personal_burn = oauth_delta + 3.0
-        candidates = (PersonalCandidate('anthropic', personal_burn, 0.0),)
+        candidates = (PersonalCandidate('anthropic', 2.0, 0.0),)
         registry = _registry(oauth_registry, candidates, deadband=3.0)
 
         snap = registry.snapshot_for_request(oauth_credential=credential)
 
-        assert snap.name == 'anthropic'
+        assert snap.name == 'oauth'
 
     def test_representative_is_min_pace_delta_not_min_burn(self):
         # codex has the lowest raw burn but the worst pace delta; anthropic is
@@ -253,12 +246,9 @@ class TestOAuthPaceGate:
 
         assert snap.name == 'anthropic'
 
-    # -- Self-pace precedence gate (SRS-Routing-003, ADR-0016) --------------
+    # -- Paced OAuth precedence (SRS-Routing-003, ADR-0017) -----------------
 
-    def test_gate_fires_when_oauth_behind_own_pace(self):
-        # ADR-0016 pathology: oauth delta -7.9 (behind its own monthly pace by
-        # more than the margin) while personal is even further behind at -27.
-        # The relative comparison alone would hold personal indefinitely.
+    def test_oauth_wins_within_paced_allowance(self):
         oauth_registry, credential = _eligible_oauth(5.0, _WALL)
         candidates = (PersonalCandidate('anthropic', 23.0, 50.0),)
         registry = _registry(oauth_registry, candidates)
@@ -268,10 +258,8 @@ class TestOAuthPaceGate:
         assert snap.name == 'oauth'
         assert snap.credentials == credential
 
-    def test_gate_does_not_fire_at_exact_margin_tie(self):
-        # oauth_delta == -deadband exactly; strict '<' keeps the gate shut and
-        # control falls through to the relative comparison, which personal wins.
-        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED - 3.0, _WALL)
+    def test_exact_allowance_boundary_favors_personal(self):
+        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 3.0, _WALL)
         candidates = (PersonalCandidate('anthropic', 23.0, 50.0),)
         registry = _registry(oauth_registry, candidates, deadband=3.0)
 
@@ -279,8 +267,8 @@ class TestOAuthPaceGate:
 
         assert snap.name == 'anthropic'
 
-    def test_gate_fires_just_past_margin(self):
-        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED - 3.1, _WALL)
+    def test_just_below_allowance_boundary_favors_oauth(self):
+        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 2.9, _WALL)
         candidates = (PersonalCandidate('anthropic', 23.0, 50.0),)
         registry = _registry(oauth_registry, candidates, deadband=3.0)
 
@@ -288,11 +276,8 @@ class TestOAuthPaceGate:
 
         assert snap.name == 'oauth'
 
-    def test_negative_deadband_is_clamped_to_zero(self):
-        # oauth is 4pp *ahead* of pace.  An unclamped -5 deadband would make the
-        # gate read `delta < 5.0` and fire; clamping to 0 keeps it shut, and the
-        # relative comparison (4 < 0) also fails.
-        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 4.0, _WALL)
+    def test_negative_margin_is_clamped_to_zero(self):
+        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 0.1, _WALL)
         candidates = (PersonalCandidate('anthropic', 0.0, 0.0),)
         registry = _registry(oauth_registry, candidates, deadband=-5.0)
 
@@ -352,10 +337,7 @@ class TestOAuthPaceGate:
 
         assert snap.name == 'anthropic'
 
-    def test_post_rollover_dead_window_does_not_fire_gate(self):
-        # 30s into a fresh UTC month: elapsed ≈ 0.0011, so oauth_delta cannot
-        # reach -deadband regardless of burn.  The gate is unreachable for the
-        # first ~0.93 days and control falls through to the relative comparison.
+    def test_oauth_wins_at_zero_early_in_month(self):
         wall = dt.datetime(2026, 9, 1, 0, 0, 30, tzinfo=dt.timezone.utc)
         oauth_registry, credential = _eligible_oauth(0.0, wall)
         candidates = (PersonalCandidate('anthropic', 50.0, 80.0),)
@@ -363,9 +345,9 @@ class TestOAuthPaceGate:
 
         snap = registry.snapshot_for_request(oauth_credential=credential)
 
-        assert snap.name == 'anthropic'
+        assert snap.name == 'oauth'
 
-    def test_gate_win_is_logged_with_self_pace_reason(self, caplog):
+    def test_paced_win_reason_is_logged(self, caplog):
         oauth_registry, credential = _eligible_oauth(5.0, _WALL)
         candidates = (PersonalCandidate('anthropic', 23.0, 50.0),)
         registry = _registry(oauth_registry, candidates)
@@ -377,22 +359,33 @@ class TestOAuthPaceGate:
             r for r in caplog.records if 'OAuth backend selection' in r.message
         )
         assert 'chosen=oauth' in record.getMessage()
-        assert 'self-pace gate' in record.getMessage()
+        assert 'within paced allowance' in record.getMessage()
 
-    def test_relative_win_reason_does_not_claim_self_pace(self, caplog):
-        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED - 1.0, _WALL)
-        candidates = (PersonalCandidate('anthropic', 40.0, 30.0),)
+    def test_personal_wins_once_oauth_allowance_reached(self):
+        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 4.0, _WALL)
+        candidates = (PersonalCandidate('anthropic', 90.0, 95.0),)
         registry = _registry(oauth_registry, candidates)
 
-        with caplog.at_level(logging.DEBUG, logger='anthproxy.server'):
-            registry.snapshot_for_request(oauth_credential=credential)
+        snap = registry.snapshot_for_request(oauth_credential=credential)
 
-        record = next(
-            r for r in caplog.records if 'OAuth backend selection' in r.message
-        )
-        assert 'chosen=oauth' in record.getMessage()
-        assert 'self-pace gate' not in record.getMessage()
-        assert 'below personal' in record.getMessage()
+        assert snap.name == 'anthropic'
+
+    def test_confirmed_personal_unavailability_favors_oauth(self):
+        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 20.0, _WALL)
+        registry = _registry(oauth_registry, ())
+
+        snap = registry.snapshot_for_request(oauth_credential=credential)
+
+        assert snap.name == 'oauth'
+
+    def test_unknown_personal_status_does_not_imply_unavailable(self):
+        oauth_registry, credential = _eligible_oauth(_MONTH_ELAPSED + 20.0, _WALL)
+        candidates = (PersonalCandidate('anthropic', 50.0, None),)
+        registry = _registry(oauth_registry, candidates)
+
+        snap = registry.snapshot_for_request(oauth_credential=credential)
+
+        assert snap.name == 'anthropic'
 
 
 # ---------------------------------------------------------------------------

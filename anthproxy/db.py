@@ -1,11 +1,12 @@
 """SQLite persistence layer for the anthproxy web UI.
 
-Schema version: 10
+Schema version: 11
 Thread safety: threading.Lock() for all writes; WAL mode for concurrent reads.
 Migrations: PRAGMA user_version tracks applied schema version (no Alembic).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -18,7 +19,7 @@ from .stats import MODEL_PRICING, _classify_model
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +334,74 @@ def _apply_migration_9(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE requests ADD COLUMN classifier_overhead_usd REAL")
 
 
+# A truncated key is a 128-char prefix of a JSON blob cut mid-field, so it never
+# closes its brace. The guard keeps a legitimately 128-char-long key intact.
+_TRUNCATED_SESSION_KEY_PREDICATE = (
+    "length(session_id) = 128 AND session_id NOT LIKE '%}'"
+)
+
+
+def _apply_migration_10(conn: sqlite3.Connection) -> None:
+    """Split sessions collapsed by the removed 128-char key truncation (v10 → v11).
+
+    See docs/adr/0018. Each conversation anchor under a truncated key was a
+    distinct session, so it is reassigned a synthetic key derived from the anchor.
+    """
+    groups = conn.execute(
+        'SELECT DISTINCT session_id, conversation_anchor FROM requests '
+        f'WHERE {_TRUNCATED_SESSION_KEY_PREDICATE} AND conversation_anchor IS NOT NULL'
+    ).fetchall()
+    if not groups:
+        return
+
+    for old_key, anchor in groups:
+        digest = hashlib.sha256(anchor.encode('utf-8')).hexdigest()[:16]
+        new_key = f'{old_key}_{digest}'
+        conn.execute(
+            'UPDATE requests SET session_id = ? '
+            'WHERE session_id = ? AND conversation_anchor = ?',
+            (new_key, old_key, anchor),
+        )
+        conn.execute(
+            'UPDATE OR REPLACE conversation_summaries SET session_id = ? '
+            'WHERE session_id = ? AND conversation_anchor = ?',
+            (new_key, old_key, anchor),
+        )
+        conn.execute(
+            """
+            INSERT INTO sessions (session_id, created_at, last_seen_at)
+            SELECT ?, MIN(request_ts), MAX(request_ts) FROM requests WHERE session_id = ?
+            ON CONFLICT(session_id) DO NOTHING
+            """,
+            (new_key, new_key),
+        )
+        # Note: old session metadata (display_name, pinned_backend, pinned_tier) is
+        # discarded when the collapsed key is split. This is intentional — metadata
+        # on a corrupted collapsed session is itself meaningless and not worth migrating.
+
+    # Cleanup orphaned conversation_summaries that have no backing requests
+    conn.execute(
+        """
+        DELETE FROM conversation_summaries
+        WHERE NOT EXISTS (SELECT 1 FROM requests r WHERE r.session_id = conversation_summaries.session_id)
+        """
+    )
+
+    # A collapsed key survives only if anchorless requests still reference it.
+    # Otherwise its row and its (now meaningless) whole-blob summary are dropped.
+    stale = (
+        f'{_TRUNCATED_SESSION_KEY_PREDICATE} '
+        'AND session_id NOT IN (SELECT session_id FROM requests)'
+    )
+    conn.execute(f'DELETE FROM session_summaries WHERE {stale}')
+    cur = conn.execute(f'DELETE FROM sessions WHERE {stale}')
+    logger.info(
+        'Migration 10: regrouped %d conversations, removed %d collapsed sessions',
+        len(groups),
+        cur.rowcount,
+    )
+
+
 _MIGRATIONS: dict[int, object] = {
     0: _apply_migration_0,
     1: _apply_migration_1,
@@ -344,6 +413,7 @@ _MIGRATIONS: dict[int, object] = {
     7: _apply_migration_7,
     8: _apply_migration_8,
     9: _apply_migration_9,
+    10: _apply_migration_10,
 }
 
 
