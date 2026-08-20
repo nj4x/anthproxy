@@ -197,6 +197,14 @@ def _path(config: Config, path: str) -> str:
 
 
 def _request_headers(config: Config, betas: str, stream: bool) -> dict:
+    """Build outbound headers from scratch — inbound headers are never relayed.
+
+    The peer hop is a control boundary (ADR-0024): ``X-Anthproxy-Override`` is
+    consumed whole by the hop that receives it, because ``prefer:<backend>`` and
+    friends name things in *this* instance's configuration. ``anthropic-beta`` is
+    the one thing re-emitted, and it is content: the client's own opt-in, which
+    the peer speaks natively.
+    """
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream' if stream else 'application/json',
