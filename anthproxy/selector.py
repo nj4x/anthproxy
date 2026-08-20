@@ -15,6 +15,13 @@ subscription backend has an open 5-hour window.  In subscription mode the
 fallback is the lowest-weekly subscription backend instead — bedrock is never
 used.
 
+The candidate pool is ``ROTATABLE_BACKENDS`` — the subscription backends plus
+``peer``.  An enabled peer reports a constant neutral status (always available,
+weekly unknown), so it ranks behind every candidate with an elapsed signal and
+is chosen only once local capacity is spent.  Because it is always available it
+also occupies the available pool, which makes the bedrock fallback unreachable
+for an instance running both: peer wins over bedrock by design.
+
 Selector modes
 --------------
 ``'auto'``         Normal auto-selection; bedrock is the unconditional fallback.
@@ -28,7 +35,7 @@ import logging
 import threading
 import time
 
-from .constants import SUBSCRIPTION_BACKENDS
+from .constants import ROTATABLE_BACKENDS, SUBSCRIPTION_BACKENDS
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +43,10 @@ logger = logging.getLogger(__name__)
 # when we have no resets_at from the usage endpoint.
 _DEFAULT_RECHECK_SECS = 300.0
 
-# Ordered list of subscription backends for initial iteration.
+# Ordered list of rotation candidates for initial iteration — the subscription
+# backends plus the peer, which is rotatable without being a subscription.
 # bedrock is the unconditional fallback (no 5-hour window, always available).
-_PRIORITY = SUBSCRIPTION_BACKENDS
+_PRIORITY = ROTATABLE_BACKENDS
 _FALLBACK = "bedrock"
 
 # When weekly utilization is unknown, use this neutral value for comparisons.
@@ -448,15 +456,16 @@ class AutoSelector:
         Prefers a not-currently-exhausted sub with lowest known weekly
         utilization; falls back to the lowest-weekly subscription backend
         overall.  Can only return a member of the enabled subset of
-        ``_PRIORITY`` or ``None`` — never bedrock or any other non-subscription
-        or disabled backend.
+        ``SUBSCRIPTION_BACKENDS`` or ``None`` — never bedrock, never the peer,
+        never any other non-subscription or disabled backend.
         """
         now = time.time()
         with self._lock:
             exhausted = dict(self._exhausted_until)
             weekly = dict(self._last_weekly)
-        available = [n for n in self._priority if now >= exhausted.get(n, 0)]
-        pool = available if available else list(self._priority)
+        subs = [n for n in self._priority if n in SUBSCRIPTION_BACKENDS]
+        available = [n for n in subs if now >= exhausted.get(n, 0)]
+        pool = available if available else list(subs)
         pool.sort(key=lambda n: weekly.get(n, _UNKNOWN_WEEKLY))
         return pool[0] if pool else None
 
@@ -499,8 +508,10 @@ class AutoSelector:
         OpenRouter is intentionally excluded: it authenticates with a static
         API key, not OAuth, so there is nothing to refresh. The OAuth-backed
         pair is filtered against the enabled backend set (ADR-0020 §7) —
-        `self._priority` is the OAuth pool's superset (includes openrouter),
-        so membership is checked directly rather than reused wholesale.
+        `self._priority` is the OAuth pool's superset (it also carries
+        openrouter and peer, neither of which holds an OAuth token), so
+        membership is checked directly rather than reused wholesale.  Do not
+        rewrite this loop to walk `self._priority`.
         """
         for name in ("anthropic", "codex"):
             if name not in self._priority:
@@ -691,6 +702,28 @@ class AutoSelector:
                     active_val,
                 )
                 return active, statuses, new_exhausted, new_weekly
+            # A peer incumbent reports the constant neutral status and so has
+            # nothing for the margin to compare: its active_val is the
+            # fabricated _UNKNOWN_WEEKLY midpoint, not a real reading. Hand
+            # back to a challenger with an elapsed signal (block 0) as soon as
+            # one exists, so local capacity reclaims the request immediately
+            # rather than waiting out the margin. Scoped to `active == 'peer'`
+            # specifically (not "any signal-less incumbent"): openrouter is
+            # also permanently elapsed-less, but its weekly *is* a real
+            # reading — sometimes momentarily missing on a fetch gap, in which
+            # case it must keep the existing neutral-hold behavior below,
+            # unlike the peer whose absence of a weekly is permanent by
+            # construction.
+            if (
+                active == 'peer'
+                and available_backends[0][2] is not None
+            ):
+                logger.debug(
+                    "Auto-selector: incumbent peer carries no capacity signal; "
+                    "yielding to %s",
+                    best_avail_name,
+                )
+                return best_avail_name, statuses, new_exhausted, new_weekly
             if active_val - best_avail_val >= margin:
                 logger.debug(
                     "Auto-selector: switching %s (weekly=%.1f%%) -> %s (weekly=%.1f%%); "
@@ -720,10 +753,19 @@ class AutoSelector:
         # Park on bedrock when an exhausted backend is decisively lower than
         # the best available so weekly quota is preserved while we wait.
         # Skip in subscription-only mode — bedrock is never used there.
+        # A best-available *peer* contributes only the fabricated
+        # _UNKNOWN_WEEKLY midpoint (its neutral status), so the gap against an
+        # exhausted backend says nothing about real headroom; parking on
+        # metered bedrock on the strength of it would make the peer
+        # unreachable exactly when it is needed (ADR-0022). Scoped to the peer
+        # by name, not by "no signal", so openrouter's existing raw-burn
+        # parking comparison is unaffected.
+        best_avail_is_peer = best_avail_name == 'peer'
         if (
             not subscription_only
             and self._fallback is not None
             and best_exhausted is not None
+            and not best_avail_is_peer
             and best_avail_val - best_exhausted[1] >= margin
         ):
             logger.debug(

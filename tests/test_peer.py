@@ -594,6 +594,158 @@ def _post(url: str, payload: dict):
     return urllib.request.urlopen(request, timeout=10)
 
 
+class _ExhaustedProviderBackend:
+    """Provider stand-in with a spent 5-hour window: every dispatch is a 429."""
+
+    def parse_credentials(self, api_key: str) -> dict:
+        return {}
+
+    def _rate_limited(self):
+        return AnthropicRequestError(
+            'rate limited', error_type='rate_limit_error', status_code=429)
+
+    def send_message(self, payload, credentials, config) -> dict:
+        raise self._rate_limited()
+
+    def send_message_stream(self, payload, credentials, config):
+        raise self._rate_limited()
+
+    def count_tokens(self, payload, credentials, config) -> dict:
+        return {'input_tokens': 0}
+
+    def five_hour_status(self, config):
+        from anthproxy._shared import FiveHourStatus
+        import time as _time
+        return FiveHourStatus(
+            available=False, resets_at=_time.time() + 3600, utilization=100.0,
+            weekly_utilization=90.0, weekly_resets_at=_time.time() + 24 * 3600,
+            weekly_window_hours=168.0,
+        )
+
+    def store_cached_credential(self, key, value):
+        pass
+
+
+@pytest.fixture
+def failover_proxies(tmp_path):
+    """Outer instance in auto mode on an exhausted provider, with a peer enabled."""
+    from anthproxy import backends_registry
+    from anthproxy.selector import AutoSelector
+    from anthproxy.server import BackendRegistry, create_server
+
+    inner_cfg = _make_config(port=0, backend='local',
+                             anthproxy_home=str(tmp_path / 'inner'))
+    inner, inner_thread, inner_port = _serve(inner_cfg, _InnerBackend())
+    try:
+        backends_registry.set_enabled_backends(frozenset({'anthropic', 'peer'}))
+        outer_cfg = _make_config(
+            port=0, backend='anthropic', auto_backend=True,
+            peer_base_url=f'http://127.0.0.1:{inner_port}',
+            anthproxy_home=str(tmp_path / 'outer'),
+        )
+        registry = BackendRegistry(outer_cfg, _ExhaustedProviderBackend())
+        selector = AutoSelector(registry, outer_cfg)
+        outer = create_server(outer_cfg, registry, selector)
+        outer_thread = threading.Thread(target=outer.serve_forever, daemon=True)
+        outer_thread.start()
+        try:
+            yield f'http://127.0.0.1:{outer.server_address[1]}', registry
+        finally:
+            _shutdown(outer, outer_thread)
+    finally:
+        _shutdown(inner, inner_thread)
+
+
+class TestPeerAutoFailover:
+    def test_exhausted_provider_falls_over_to_peer(self, failover_proxies):
+        url, registry = failover_proxies
+        with _post(f'{url}/v1/messages', {
+            'model': 'claude-sonnet-4-6', 'max_tokens': 16,
+            'messages': [{'role': 'user', 'content': 'hi'}],
+        }) as response:
+            body = json.loads(response.read())
+        assert body['content'][0]['text'] == 'from-inner'
+        assert registry.active_name() == 'peer'
+
+
+class TestPeerNeutralStatus:
+    """ADR-0022: constant neutral status, no interrogation of the peer."""
+
+    def test_reports_available_with_no_capacity_figures(self):
+        status = PeerBackend().five_hour_status(_make_config())
+        assert status.available is True
+        assert status.utilization is None
+        assert status.weekly_utilization is None
+        assert status.weekly_resets_at is None
+        assert status.weekly_window_hours is None
+
+    @patch('anthproxy.peer.backend._make_connection')
+    def test_opens_no_connection(self, mock_conn):
+        PeerBackend().five_hour_status(_make_config())
+        mock_conn.assert_not_called()
+
+    def test_status_is_constant_for_an_unconfigured_target(self):
+        status = PeerBackend().five_hour_status(_make_config(peer_base_url=''))
+        assert status.available is True
+
+
+class TestPeerNon429FailuresCarryNoExhaustionSignal:
+    """Only a 429 reaches the selector: the handler gates on ``status_code == 429``."""
+
+    @patch('anthproxy.peer.backend.time.sleep')
+    @patch('anthproxy.peer.backend._make_connection')
+    def test_persistent_5xx_surfaces_as_502_without_retry_after(self, mock_conn, _sleep):
+        mock_conn.side_effect = lambda *a, **k: _mock_conn(_fake_response(503, b'down'))
+        with pytest.raises(AnthropicRequestError) as exc_info:
+            PeerBackend().send_message({'model': 'sonnet', 'messages': []}, {}, _make_config())
+        assert exc_info.value.status_code != 429
+        assert getattr(exc_info.value, 'retry_after', None) is None
+
+    def _failing_conn(self, exc):
+        conn = MagicMock()
+        conn.request.side_effect = exc
+        return conn
+
+    @patch('anthproxy.peer.backend.time.sleep')
+    @patch('anthproxy.peer.backend._make_connection')
+    def test_refused_connection_surfaces_as_502(self, mock_conn, _sleep):
+        mock_conn.side_effect = lambda *a, **k: self._failing_conn(
+            ConnectionRefusedError('refused'))
+        with pytest.raises(AnthropicRequestError) as exc_info:
+            PeerBackend().send_message({'model': 'sonnet', 'messages': []}, {}, _make_config())
+        assert exc_info.value.status_code == 502
+        assert getattr(exc_info.value, 'retry_after', None) is None
+
+    @patch('anthproxy.peer.backend.time.sleep')
+    @patch('anthproxy.peer.backend._make_connection')
+    def test_timeout_surfaces_as_502(self, mock_conn, _sleep):
+        mock_conn.side_effect = lambda *a, **k: self._failing_conn(
+            socket.timeout('timed out'))
+        with pytest.raises(AnthropicRequestError) as exc_info:
+            PeerBackend().send_message({'model': 'sonnet', 'messages': []}, {}, _make_config())
+        assert exc_info.value.status_code == 502
+        assert getattr(exc_info.value, 'retry_after', None) is None
+
+
+class TestAutoBackendKillSwitch:
+    """A peer-only enabled set is rotatable and keeps a live selector."""
+
+    def _apply(self, enabled):
+        from anthproxy.__main__ import _disable_auto_backend_if_nothing_to_rotate
+        config = _make_config(auto_backend=True)
+        _disable_auto_backend_if_nothing_to_rotate(config, frozenset(enabled))
+        return config.auto_backend
+
+    def test_peer_only_set_keeps_auto_backend_enabled(self):
+        assert self._apply({'peer'}) is True
+
+    def test_subscription_set_keeps_auto_backend_enabled(self):
+        assert self._apply({'anthropic'}) is True
+
+    def test_set_with_nothing_rotatable_disables_auto_backend(self):
+        assert self._apply({'bedrock', 'local'}) is False
+
+
 class TestPeerEndToEnd:
     def test_non_streaming_returns_inner_response(self, chained_proxies):
         with _post(f'{chained_proxies}/v1/messages', {

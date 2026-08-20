@@ -23,7 +23,7 @@ from .backends_registry import (  # noqa: F401
     list_backends,
 )
 from .config import Config
-from .constants import SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
+from .constants import ROTATABLE_BACKENDS, SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
 from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
@@ -505,8 +505,12 @@ class BackendRegistry:
                 and prefer_backend in backend_names()
                 and not session_pinned
                 and not session_subscription
+                # The gate asks "may the selector be steered onto this target",
+                # which is ROTATABLE_BACKENDS, not SUBSCRIPTION_BACKENDS:
+                # subscription is the default mode, so testing the narrower
+                # tuple would make prefer:peer dead in every default deployment.
                 and not (self._config.auto_backend_mode == 'subscription'
-                         and prefer_backend not in SUBSCRIPTION_BACKENDS)
+                         and prefer_backend not in ROTATABLE_BACKENDS)
             ):
                 prefer_cached = self._instances.get(prefer_backend)
                 if prefer_cached is None:

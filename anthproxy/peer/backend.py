@@ -25,7 +25,7 @@ import ssl
 import time
 import urllib.parse
 
-from .._shared import Backend
+from .._shared import Backend, FiveHourStatus
 from .._shared.http_util import (
     MAX_RETRIES,
     RETRY_BASE_DELAY,
@@ -277,12 +277,39 @@ def _send_with_retries(payload: dict, config: Config, stream: bool) -> tuple:
             raise
 
 
+_NEUTRAL_STATUS = FiveHourStatus(
+    available=True,
+    resets_at=None,
+    utilization=None,
+    weekly_utilization=None,
+    weekly_resets_at=None,
+    weekly_window_hours=None,
+)
+
+
 class PeerBackend(Backend):
     """Backend that forwards requests to another anthproxy instance.
 
     Inherits only from ``Backend``: capacity participation in the selector is a
     separate concern from transport and arrives with ``five_hour_status``.
     """
+
+    def five_hour_status(self, config: Config) -> FiveHourStatus:
+        """Constant neutral status — always available, capacity unknown (ADR-0022).
+
+        Makes no network call and does not interrogate the peer: ``/admin/backends``
+        requires the peer to run ``--enable-ui``, and a probe here would put
+        network I/O on the selector tick where lock discipline is delicate.
+
+        Reporting a synthetic utilization (0%, "peer is fresh") would rank the
+        peer ahead of real backends with real headroom on a fabricated number.
+        Leaving weekly reset/window ``None`` keeps it permanently in the
+        elapsed-less ranking block, so it is chosen only when nothing with a
+        real capacity signal is available. Exhaustion is reactive only: a peer
+        429 parks it through ``AutoSelector.on_rate_limited`` like any other
+        backend, and non-429 failures leave selector state untouched.
+        """
+        return _NEUTRAL_STATUS
 
     @classmethod
     def summary_credentials(cls, snapshot) -> dict:

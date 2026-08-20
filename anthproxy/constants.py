@@ -5,7 +5,18 @@ Backend names are no longer declared here; use ``backend_names()`` from
 — it may not import from ``backends_registry``.
 """
 
+# Backends whose capacity *is* a subscription: what `/backend subscription`
+# locks onto, what the `subscription` stats filter matches, what the help text
+# names.  Not a candidate-pool declaration.
 SUBSCRIPTION_BACKENDS: tuple[str, ...] = ("anthropic", "codex", "openrouter")
+
+# Backends the auto-selector may rotate onto.  A superset of
+# SUBSCRIPTION_BACKENDS by exactly one member today, which is the condition
+# under which someone edits the wrong tuple: ask "is this a subscription"
+# (SUBSCRIPTION_BACKENDS) or "may the selector rotate onto this"
+# (ROTATABLE_BACKENDS).  bedrock stays out — it is the selector's fallback, not
+# a rotation candidate.
+ROTATABLE_BACKENDS: tuple[str, ...] = SUBSCRIPTION_BACKENDS + ("peer",)
 
 # Sentinel stored in BackendRegistry._session_overrides to represent a
 # per-session subscription lock.  Not a real backend name; backends_registry

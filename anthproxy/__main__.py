@@ -3,7 +3,7 @@ import sys
 
 from . import model_config
 from .config import parse_args
-from .constants import SUBSCRIPTION_BACKENDS
+from .constants import ROTATABLE_BACKENDS
 from .server import BackendRegistry, backend_names, build_backend, create_server, discover_backends
 
 
@@ -50,6 +50,23 @@ def _guard_peer_self_reference(config):
         sys.exit(2)
 
 
+def _disable_auto_backend_if_nothing_to_rotate(config, enabled_names) -> None:
+    """Downgrade auto mode to static when nothing in the enabled set is rotatable.
+
+    ADR-0020 §8: auto mode with nothing to rotate among is disabled rather than
+    a boot failure. The test is ``ROTATABLE_BACKENDS``, not
+    ``SUBSCRIPTION_BACKENDS`` — a peer-only set (``--backends peer``, a thin
+    forwarding front end) has something to rotate onto and keeps a live
+    selector.
+    """
+    if config.auto_backend and not (enabled_names & set(ROTATABLE_BACKENDS)):
+        logger.info(
+            'Auto-backend disabled: no rotatable backends in enabled set (%s)',
+            sorted(enabled_names),
+        )
+        config.auto_backend = False
+
+
 def main():
     # Check for migrate subcommand before parsing server config
     if len(sys.argv) > 1 and sys.argv[1] == 'migrate':
@@ -82,15 +99,8 @@ def main():
     # editable template for model aliases, pricing, etc.
     model_config.ensure_file()
 
-    # ADR-0020 §8: when the enabled set contains no subscription backend, auto
-    # mode has nothing to rotate among — disable it rather than fail to boot.
     enabled_names = frozenset(backend_names())
-    if config.auto_backend and not (enabled_names & set(SUBSCRIPTION_BACKENDS)):
-        logger.info(
-            'Auto-backend disabled: no subscription backends in enabled set (%s)',
-            sorted(enabled_names),
-        )
-        config.auto_backend = False
+    _disable_auto_backend_if_nothing_to_rotate(config, enabled_names)
 
     if config.auto_backend:
         # Auto mode: ensure credentials only for subscription backends in the
