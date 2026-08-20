@@ -1182,6 +1182,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     )
                 except Exception:
                     logger.debug('%s stats failure-record failed', self._log_tag(), exc_info=True)
+            if snapshot is not None:
+                # A 429 reaching here was not retried (oauth cooldown, a pinned
+                # session, or the selector having nowhere else to go); it keeps
+                # the status the retry path's pre-record uses so the schema's
+                # rate_limited/error distinction survives.
+                self._record_failed_request(
+                    payload, snapshot, f'{exc.status_code} — {exc.error_type}',
+                    status='rate_limited' if exc.status_code == 429 else 'error',
+                )
             self._send_error(exc)
         except _CLIENT_DISCONNECT:
             logger.info('%s client disconnected before response', self._log_tag())
@@ -1202,7 +1211,40 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     )
                 except Exception:
                     logger.debug('%s stats failure-record failed', self._log_tag(), exc_info=True)
+            if snapshot is not None:
+                self._record_failed_request(payload, snapshot, '502 — upstream_failure')
             self._send_json(502, anthropic_error_payload('api_error', 'Upstream request failed'))
+
+    def _record_failed_request(self, payload, snapshot, error: str,
+                               status: str = 'error') -> None:
+        """Persist a request row for a dispatch that failed before any usage was
+        learned (ADR-0025).
+
+        An empty ``stats_dict`` records the usage as absent rather than zero —
+        see ``SessionDB.record_request``.  Applies to every backend: recording
+        peer failures but not provider ones would be a worse inconsistency than
+        the silence it replaces.
+        """
+        if self.session_db is None or getattr(self, '_db_request_id', None):
+            return
+        try:
+            ctx_key = getattr(self, '_ctx_key', None)
+            self._db_request_id = self.session_db.record_request(
+                session_id=_session_key(payload) or '' if isinstance(payload, dict) else '',
+                conversation_anchor=(
+                    ctx_key.split('\x00', 1)[-1] if ctx_key and '\x00' in ctx_key else None
+                ),
+                routing_decision=getattr(self, '_routing', None),
+                stats_dict={},
+                duration_ms=int(
+                    (time.monotonic() - getattr(self, '_req_start', time.monotonic())) * 1000),
+                backend=snapshot.name,
+                status=status,
+                error=error,
+                **getattr(self, '_prompt_capture', {}),
+            )
+        except Exception:
+            logger.debug('%s db failure-record failed', self._log_tag(), exc_info=True)
 
     def _retry_on_new_backend(self, payload: dict):
         """Retry the current payload on the (now-active) new backend.
@@ -1561,6 +1603,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         capture_text = self.session_db is not None
         text_parts: list[str] = []
         errored = False
+        # An upstream failure raised out of the stream (during priming or
+        # mid-stream) is delivered to the client by _send_sse as an out-of-band
+        # error frame, so it never appears as an "event: error" line here.
+        # Without this, a stream that carried no response at all would be
+        # recorded as a success that cost nothing (ADR-0025).
+        upstream_error: tuple[int | None, str] | None = None
         # Rolling line buffer: accumulate the tail of the previous chunk so
         # an "event: error" header split across two chunk boundaries is still
         # detected.  We only need the last ~20 bytes from the previous chunk
@@ -1585,6 +1633,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     errored = True
                 _line_tail = chunk[-20:]
                 yield chunk
+        except AnthropicRequestError as exc:
+            upstream_error = (exc.status_code, exc.error_type)
+            raise
+        except Exception:
+            upstream_error = (502, 'upstream_failure')
+            raise
         finally:
             close = getattr(sse_gen, 'close', None)
             if close is not None:
@@ -1593,8 +1647,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 except Exception:
                     logger.debug('%s sse_gen close failed', self._log_tag(), exc_info=True)
             duration_ms = int((time.monotonic() - start_time) * 1000)
+            if upstream_error is not None:
+                errored = True
             if self.stats_collector is not None:
-                if errored:
+                if upstream_error is not None:
+                    status_kwargs = {'status': 'error', 'error': upstream_error[1],
+                                     'status_code': upstream_error[0]}
+                elif errored:
                     status_kwargs = {'status': 'error', 'error': 'sse_error', 'status_code': None}
                 else:
                     status_kwargs = {'status': 'success', 'status_code': 200}
@@ -1625,6 +1684,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             if self.session_db is not None:
                 response_text = ''.join(text_parts) or None
                 status = 'error' if errored else 'success'
+                if upstream_error is not None:
+                    # Nothing was learned about usage, so record it as absent.
+                    db_stats, db_error = {}, f'{upstream_error[0]} — {upstream_error[1]}'
+                else:
+                    db_stats, db_error = stats, ('sse_error' if errored else None)
                 db_request_id = getattr(self, '_db_request_id', None)
                 if db_request_id:
                     # Retry path: update the pre-created rate_limited row.
@@ -1655,11 +1719,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             session_id=session_id,
                             conversation_anchor=conversation_anchor,
                             routing_decision=routing_decision,
-                            stats_dict=stats,
+                            stats_dict=db_stats,
                             duration_ms=duration_ms,
                             backend=backend_name,
                             status=status,
-                            error='sse_error' if errored else None,
+                            error=db_error,
                             response_text=response_text,
                             **_economics_kwargs(econ),
                             **getattr(self, '_prompt_capture', {}),

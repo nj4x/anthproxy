@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import type { SessionsResponse, CostResponse, Config, CostRow } from '../api/types';
 import { StatusPanel } from '../components/StatusPanel';
+import { CostScopeNote } from '../components/CostScopeNote';
 import { parseSessionId } from '../utils';
 
 function formatCost(usd: number): string {
@@ -47,7 +48,7 @@ export default function Dashboard() {
       <StatusPanel />
 
       {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-2">
         <SummaryCard
           title="Active Backend"
           value={config?.active_backend ?? (configError ? 'Error' : '—')}
@@ -67,6 +68,7 @@ export default function Dashboard() {
           sub="7-day total"
         />
       </div>
+      <CostScopeNote className="mb-6" />
 
       {/* Recent sessions table */}
       <div className="bg-white shadow rounded-lg">
