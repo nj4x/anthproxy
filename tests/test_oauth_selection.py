@@ -303,18 +303,22 @@ def test_reason_oauth_wins():
     assert 'enterprise weekly 10.0% below personal 40.0%' == reason
 
 
-def test_reason_self_pace_gate_differs_from_relative_win():
+def test_reason_reports_paced_allowance():
     snap = OAuthTokenSnapshot(eligible=True, burn=5.0)
-    cred = object()
-    relative = _oauth_decision_reason(
-        cred, snap, True, 40.0, pace_on=True, oauth_delta=-7.9, personal_delta=-2.0,
+    reason = _oauth_decision_reason(
+        object(), snap, True, 40.0, pace_on=True, oauth_delta=-7.9,
+        oauth_underused=True,
     )
-    gated = _oauth_decision_reason(
-        cred, snap, True, 40.0, pace_on=True, oauth_delta=-7.9, personal_delta=-2.0,
-        self_pace=True,
+    assert reason == 'enterprise within paced allowance (delta -7.9pp)'
+
+
+def test_reason_reports_personal_unavailability():
+    snap = OAuthTokenSnapshot(eligible=True, burn=50.0)
+    reason = _oauth_decision_reason(
+        object(), snap, True, 100.0, pace_on=True, oauth_delta=20.0,
+        personal_unavailable=True,
     )
-    assert gated == 'enterprise behind its own monthly pace by 7.9pp (self-pace gate)'
-    assert gated != relative
+    assert reason == 'no confirmed available personal backend'
 
 
 def test_reason_cooldown():

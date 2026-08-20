@@ -8,6 +8,7 @@ module only reads attributes, never checks the type.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import tempfile
@@ -18,6 +19,7 @@ import pytest
 
 from anthproxy.db import (
     SessionDB,
+    _MIGRATIONS,
     _SCHEMA_VERSION,
     _apply_migration_0,
     _apply_migration_1,  # noqa: F401
@@ -2823,8 +2825,8 @@ class TestBusySecsWindow:
 class TestWeightedBlendMigration:
     """_apply_migration_7 adds 5 new columns; record_request stores them."""
 
-    def test_schema_version_is_10(self):
-        assert _SCHEMA_VERSION == 10
+    def test_migration_7_present(self):
+        assert 7 in _MIGRATIONS
 
     def test_migration_7_adds_columns(self):
         fd, path = tempfile.mkstemp(suffix='.db')
@@ -3201,4 +3203,241 @@ class TestRecordRequestEconomics:
             assert row['classifier_overhead_usd'] is None
         finally:
             db.close()
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0018: Regroup sessions collapsed by the removed 128-char key truncation
+# ---------------------------------------------------------------------------
+
+class TestSessionUngroupingMigration:
+    """Migration 10 splits truncated session keys back apart by conversation anchor."""
+
+    # A truncated key: exactly 128 chars, cut mid-JSON so it never closes its brace.
+    TRUNCATED = ('{"device_id":"' + 'a' * 64 + '","session_id":"' + 'b' * 34)[:128]
+
+    def _apply_through_migration_9(self):
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        from anthproxy.db import _MIGRATIONS
+        for i in range(10):
+            with conn:
+                _MIGRATIONS[i](conn)
+                conn.execute(f"PRAGMA user_version = {i + 1};")
+        return conn
+
+    def _insert_request(self, conn, session_id, anchor, ts='2026-08-01T00:00:00.000Z'):
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, conversation_anchor, request_ts, requested_model,
+                    backend, status
+                ) VALUES (?, ?, ?, 'sonnet', 'anthropic', 'success')""",
+                (session_id, anchor, ts),
+            )
+            conn.execute(
+                "INSERT INTO sessions (session_id, created_at, last_seen_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO NOTHING",
+                (session_id, ts, ts),
+            )
+
+    def _run(self, conn):
+        from anthproxy.db import _apply_migration_10
+        with conn:
+            _apply_migration_10(conn)
+
+    def test_schema_version_is_11(self):
+        assert _SCHEMA_VERSION == 11
+
+    def test_splits_truncated_key_by_conversation_anchor(self):
+        conn = self._apply_through_migration_9()
+        for i in range(5):
+            for _ in range(3):
+                self._insert_request(conn, self.TRUNCATED, f'anchor-{i}')
+        self._run(conn)
+        keys = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM requests")}
+        assert len(keys) == 5
+        assert self.TRUNCATED not in keys
+        assert all(k.startswith(self.TRUNCATED + '_') for k in keys)
+        counts = conn.execute(
+            "SELECT session_id, COUNT(*) c FROM requests GROUP BY session_id"
+        ).fetchall()
+        assert all(r['c'] == 3 for r in counts)
+        conn.close()
+
+    def test_synthetic_keys_are_deterministic(self):
+        expected = self.TRUNCATED + '_' + hashlib.sha256(b'anchor-x').hexdigest()[:16]
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, self.TRUNCATED, 'anchor-x')
+        self._run(conn)
+        row = conn.execute("SELECT session_id FROM requests").fetchone()
+        assert row['session_id'] == expected
+        conn.close()
+
+    def test_leaves_non_truncated_sessions_untouched(self):
+        full = '{"device_id":"abc","session_id":"def","account_uuid":"ghi"}'
+        exactly_128_valid_json = '{"device_id":"' + 'c' * 112 + '"}'
+        assert len(exactly_128_valid_json) == 128
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, full, 'anchor-1')
+        self._insert_request(conn, full, 'anchor-2')
+        self._insert_request(conn, exactly_128_valid_json, 'anchor-3')
+        self._run(conn)
+        keys = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM requests")}
+        assert keys == {full, exactly_128_valid_json}
+        conn.close()
+
+    def test_rows_without_anchor_keep_original_key(self):
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, self.TRUNCATED, None)
+        self._insert_request(conn, self.TRUNCATED, 'anchor-1')
+        self._run(conn)
+        keys = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM requests")}
+        assert self.TRUNCATED in keys
+        assert len(keys) == 2
+        # The old session row survives because it still owns the anchorless request.
+        surviving = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE session_id = ?", (self.TRUNCATED,)
+        ).fetchone()[0]
+        assert surviving == 1
+        conn.close()
+
+    def test_sessions_table_consistent_with_requests(self):
+        conn = self._apply_through_migration_9()
+        for i in range(4):
+            self._insert_request(conn, self.TRUNCATED, f'anchor-{i}', ts=f'2026-08-0{i + 1}T00:00:00.000Z')
+        self._run(conn)
+        missing = conn.execute(
+            "SELECT COUNT(*) FROM requests r "
+            "WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = r.session_id)"
+        ).fetchone()[0]
+        assert missing == 0
+        orphans = conn.execute(
+            "SELECT COUNT(*) FROM sessions s "
+            "WHERE NOT EXISTS (SELECT 1 FROM requests r WHERE r.session_id = s.session_id)"
+        ).fetchone()[0]
+        assert orphans == 0
+        conn.close()
+
+    def test_session_timestamps_derive_from_requests(self):
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, self.TRUNCATED, 'anchor-1', ts='2026-08-01T00:00:00.000Z')
+        self._insert_request(conn, self.TRUNCATED, 'anchor-1', ts='2026-08-09T00:00:00.000Z')
+        self._run(conn)
+        row = conn.execute("SELECT created_at, last_seen_at FROM sessions").fetchone()
+        assert row['created_at'] == '2026-08-01T00:00:00.000Z'
+        assert row['last_seen_at'] == '2026-08-09T00:00:00.000Z'
+        conn.close()
+
+    def test_conversation_summaries_follow_their_session(self):
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, self.TRUNCATED, 'anchor-1')
+        with conn:
+            conn.execute(
+                "INSERT INTO conversation_summaries (session_id, conversation_anchor, summary, updated_at) "
+                "VALUES (?, 'anchor-1', 'a summary', '2026-08-01T00:00:00.000Z')",
+                (self.TRUNCATED,),
+            )
+        self._run(conn)
+        row = conn.execute("SELECT session_id, summary FROM conversation_summaries").fetchone()
+        new_key = conn.execute("SELECT session_id FROM requests").fetchone()['session_id']
+        assert row['session_id'] == new_key
+        assert row['summary'] == 'a summary'
+        conn.close()
+
+    def test_stale_session_summary_removed_with_collapsed_session(self):
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, self.TRUNCATED, 'anchor-1')
+        with conn:
+            conn.execute(
+                "INSERT INTO session_summaries (session_id, summary, updated_at) "
+                "VALUES (?, 'collapsed summary', '2026-08-01T00:00:00.000Z')",
+                (self.TRUNCATED,),
+            )
+        self._run(conn)
+        assert conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0] == 0
+        conn.close()
+
+    def test_orphaned_conversation_summaries_cleaned(self):
+        """Conversation summaries with no backing requests are deleted."""
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, self.TRUNCATED, 'anchor-1')
+        # Insert an orphaned summary (no request row for this anchor).
+        with conn:
+            conn.execute(
+                "INSERT INTO conversation_summaries (session_id, conversation_anchor, summary, updated_at) "
+                "VALUES (?, 'orphan-anchor', 'orphaned', '2026-08-01T00:00:00.000Z')",
+                (self.TRUNCATED,),
+            )
+        self._run(conn)
+        orphaned = conn.execute(
+            "SELECT COUNT(*) FROM conversation_summaries WHERE conversation_anchor = 'orphan-anchor'"
+        ).fetchone()[0]
+        assert orphaned == 0
+        conn.close()
+
+    def test_migration_is_idempotent(self):
+        conn = self._apply_through_migration_9()
+        for i in range(3):
+            self._insert_request(conn, self.TRUNCATED, f'anchor-{i}')
+        self._run(conn)
+        first = sorted(r[0] for r in conn.execute("SELECT session_id FROM requests"))
+        self._run(conn)
+        assert sorted(r[0] for r in conn.execute("SELECT session_id FROM requests")) == first
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+        conn.close()
+
+    def test_regroups_at_production_scale(self):
+        """The reported corruption: 11,267 requests collapsed into 708 conversations."""
+        conn = self._apply_through_migration_9()
+        with conn:
+            conn.executemany(
+                """INSERT INTO requests (
+                    session_id, conversation_anchor, request_ts, requested_model,
+                    backend, status
+                ) VALUES (?, ?, '2026-08-01T00:00:00.000Z', 'sonnet', 'anthropic', 'success')""",
+                [(self.TRUNCATED, f'anchor-{i % 708}') for i in range(11267)],
+            )
+            conn.execute(
+                "INSERT INTO sessions (session_id) VALUES (?)", (self.TRUNCATED,)
+            )
+        self._run(conn)
+        assert conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM requests"
+        ).fetchone()[0] == 708
+        assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 11267
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 708
+        conn.close()
+
+    def test_no_op_when_no_truncated_keys(self):
+        conn = self._apply_through_migration_9()
+        self._insert_request(conn, 'plain-session', 'anchor-1')
+        self._run(conn)
+        assert conn.execute("SELECT session_id FROM requests").fetchone()[0] == 'plain-session'
+        conn.close()
+
+    def test_runs_on_startup_via_ensure_schema(self):
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            from anthproxy.db import _MIGRATIONS
+            for i in range(10):
+                with conn:
+                    _MIGRATIONS[i](conn)
+                    conn.execute(f"PRAGMA user_version = {i + 1};")
+            self._insert_request(conn, self.TRUNCATED, 'anchor-1')
+            self._insert_request(conn, self.TRUNCATED, 'anchor-2')
+            conn.close()
+
+            db = SessionDB(path)
+            try:
+                keys = {r[0] for r in db._conn.execute("SELECT DISTINCT session_id FROM requests")}
+                assert len(keys) == 2
+                assert self.TRUNCATED not in keys
+                assert db._conn.execute("PRAGMA user_version;").fetchone()[0] == _SCHEMA_VERSION
+            finally:
+                db.close()
+        finally:
             os.unlink(path)

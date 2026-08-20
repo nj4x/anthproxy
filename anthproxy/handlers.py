@@ -317,7 +317,7 @@ def _session_key(payload: dict) -> str | None:
     user_id = metadata.get('user_id')
     if not isinstance(user_id, str) or not user_id:
         return None
-    return user_id[:128]
+    return user_id
 
 
 def _economics_kwargs(econ) -> dict:
