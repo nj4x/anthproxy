@@ -1143,9 +1143,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         # path can update the same row on success.
                         if self.session_db is not None and not getattr(self, '_db_request_id', None):
                             try:
+                                from .constants import UNTRACKED_SESSION_ID
                                 _dur_ms = int((time.monotonic() - getattr(self, '_req_start', time.monotonic())) * 1000)
                                 self._db_request_id = self.session_db.record_request(
-                                    session_id=_session_key(payload) or '' if isinstance(payload, dict) else '',
+                                    session_id=_session_key(payload) or UNTRACKED_SESSION_ID if isinstance(payload, dict) else UNTRACKED_SESSION_ID,
                                     conversation_anchor=(
                                         self._ctx_key.split('\x00', 1)[-1]
                                         if getattr(self, '_ctx_key', None) and '\x00' in self._ctx_key else None
@@ -1228,9 +1229,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if self.session_db is None or getattr(self, '_db_request_id', None):
             return
         try:
+            from .constants import UNTRACKED_SESSION_ID
             ctx_key = getattr(self, '_ctx_key', None)
             self._db_request_id = self.session_db.record_request(
-                session_id=_session_key(payload) or '' if isinstance(payload, dict) else '',
+                session_id=_session_key(payload) or UNTRACKED_SESSION_ID if isinstance(payload, dict) else UNTRACKED_SESSION_ID,
                 conversation_anchor=(
                     ctx_key.split('\x00', 1)[-1] if ctx_key and '\x00' in ctx_key else None
                 ),

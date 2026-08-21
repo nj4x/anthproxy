@@ -45,10 +45,13 @@ def _parse_backends_str(
 
     Splits on commas, strips whitespace, drops empty tokens, de-duplicates
     (preserving first occurrence). Validates every token against *full_names*
-    (the unfiltered discovered set). Calls ``p.error()`` on an unknown token
-    or a resulting empty set — an allowlist with zero usable backends is
-    always a configuration mistake, never a valid intent.
+    (the unfiltered discovered set) plus internal backends. Internal backends
+    (e.g., 'oauth') are advisory tokens — they document intent but do not
+    affect enablement, which is governed by _is_enabled() exemptions.
+    Calls ``p.error()`` on an unknown token or a resulting empty set.
     """
+    from .backends_registry import _INTERNAL_BACKENDS
+
     if raw is None:
         return None
     tokens: list[str] = []
@@ -64,11 +67,12 @@ def _parse_backends_str(
             '--backends: must name at least one backend, comma-separated '
             '(e.g. --backends anthropic,codex)'
         )
-    unknown = [t for t in tokens if t not in full_names]
+    accepted = full_names | _INTERNAL_BACKENDS
+    unknown = [t for t in tokens if t not in accepted]
     if unknown:
         p.error(
             f'--backends: unknown backend(s) {unknown!r}; '
-            f'valid backends: {sorted(full_names)}'
+            f'valid backends: {sorted(accepted)}'
         )
     return frozenset(tokens)
 

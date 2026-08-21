@@ -23,6 +23,12 @@ ROTATABLE_BACKENDS: tuple[str, ...] = SUBSCRIPTION_BACKENDS + ("peer",)
 # RESERVED_NAMES ensures nothing may register under this key.
 SESSION_SUBSCRIPTION_SENTINEL = "subscription"
 
+# Sentinel for requests that arrived with no metadata.user_id (e.g., Claude Code
+# utility calls like session-title generation). These requests are recorded for
+# cost accounting but have no conversational context and should not be grouped
+# as a coherent session in the admin UI.
+UNTRACKED_SESSION_ID = "__untracked__"
+
 # Valid non-backend modes accepted by --backend and the admin API.
 # Moved here from admin.py so backends_registry can derive RESERVED_NAMES
 # without importing admin.

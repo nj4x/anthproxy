@@ -162,8 +162,18 @@ export default function SessionDetail() {
     return <div className="text-gray-500">Loading...</div>;
   }
 
+  const isUntracked = id === '__untracked__';
+
   return (
     <div className="space-y-6">
+      {isUntracked && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-900">
+          <strong>Untracked Requests</strong> — These are system utility calls that arrived with no session ID
+          (e.g., Claude Code title generation, session recaps). They have no conversational context and are
+          recorded for cost accounting only.
+        </div>
+      )}
+
       {/* Session header */}
       <div className="bg-white shadow rounded-lg p-5">
         {(() => {
@@ -185,7 +195,8 @@ export default function SessionDetail() {
         </div>
       </div>
 
-      {/* Controls */}
+      {/* Controls — hidden for untracked requests */}
+      {!isUntracked && (
       <div className="bg-white shadow rounded-lg p-5 grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1">Pinned Backend</label>
@@ -233,6 +244,7 @@ export default function SessionDetail() {
           </div>
         </div>
       </div>
+      )}
 
       {/* Anchor filter */}
       {anchors.length > 1 && (

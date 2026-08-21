@@ -1074,10 +1074,13 @@ class TestBackendsCliFlag:
         with pytest.raises(SystemExit):
             parse_args(['--backends', ''])
 
-    def test_oauth_token_rejected_as_unknown(self):
+    def test_oauth_token_accepted_as_advisory(self):
         from anthproxy.config import parse_args
-        with pytest.raises(SystemExit):
-            parse_args(['--backends', 'oauth'])
+        cfg = parse_args(['--backends', 'oauth,anthropic'])
+        assert 'oauth' in cfg.backends
+        assert 'anthropic' in cfg.backends
+        # oauth in the allowlist is a no-op; it doesn't change eligibility
+        # or affect backend_names(), which still excludes it
 
     def test_explicit_backend_outside_allowlist_errors(self):
         from anthproxy.config import parse_args

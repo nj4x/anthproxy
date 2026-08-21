@@ -48,8 +48,13 @@ function compactRawLabel(value: string): string {
 /**
  * Produces a readable, compact label without losing the persisted identifier.
  * The tooltip always retains the exact raw value for inspection and copying.
+ * Special-cases the __untracked__ sentinel for requests with no metadata.user_id.
  */
 export function parseSessionId(value: string): SessionLabel {
+  if (value === '__untracked__') {
+    return { label: '— Untracked —', tooltip: 'Requests with no session ID (e.g., system utility calls)' };
+  }
+
   const nestedSessionId = jsonSessionId(value);
   if (nestedSessionId) {
     return { label: nestedSessionId.slice(0, SESSION_PREFIX_LENGTH), tooltip: value };
