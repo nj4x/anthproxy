@@ -50,7 +50,7 @@ def _parse_backends_str(
     affect enablement, which is governed by _is_enabled() exemptions.
     Calls ``p.error()`` on an unknown token or a resulting empty set.
     """
-    from .backends_registry import _INTERNAL_BACKENDS
+    from .backends_registry import internal_backend_names
 
     if raw is None:
         return None
@@ -67,7 +67,7 @@ def _parse_backends_str(
             '--backends: must name at least one backend, comma-separated '
             '(e.g. --backends anthropic,codex)'
         )
-    accepted = full_names | _INTERNAL_BACKENDS
+    accepted = full_names | internal_backend_names()
     unknown = [t for t in tokens if t not in accepted]
     if unknown:
         p.error(

@@ -3246,8 +3246,8 @@ class TestSessionUngroupingMigration:
         with conn:
             _apply_migration_10(conn)
 
-    def test_schema_version_is_11(self):
-        assert _SCHEMA_VERSION == 11
+    def test_schema_version_is_12(self):
+        assert _SCHEMA_VERSION == 12
 
     def test_splits_truncated_key_by_conversation_anchor(self):
         conn = self._apply_through_migration_9()
@@ -3436,6 +3436,105 @@ class TestSessionUngroupingMigration:
                 keys = {r[0] for r in db._conn.execute("SELECT DISTINCT session_id FROM requests")}
                 assert len(keys) == 2
                 assert self.TRUNCATED not in keys
+                assert db._conn.execute("PRAGMA user_version;").fetchone()[0] == _SCHEMA_VERSION
+            finally:
+                db.close()
+        finally:
+            os.unlink(path)
+
+
+class TestUntrackedSessionMigration:
+    """Migration 11 renames the empty-string session key to UNTRACKED_SESSION_ID."""
+
+    def _apply_through_migration_10(self):
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        from anthproxy.db import _MIGRATIONS
+        for i in range(11):
+            with conn:
+                _MIGRATIONS[i](conn)
+                conn.execute(f"PRAGMA user_version = {i + 1};")
+        return conn
+
+    def _run(self, conn):
+        from anthproxy.db import _apply_migration_11
+        with conn:
+            _apply_migration_11(conn)
+
+    def test_renames_empty_session_id_on_requests(self):
+        from anthproxy.constants import UNTRACKED_SESSION_ID
+        conn = self._apply_through_migration_10()
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, conversation_anchor, request_ts, requested_model,
+                    backend, status
+                ) VALUES ('', 'anchor-1', '2026-08-01T00:00:00.000Z', 'sonnet',
+                    'anthropic', 'success')"""
+            )
+        self._run(conn)
+        keys = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM requests")}
+        assert keys == {UNTRACKED_SESSION_ID}
+        conn.close()
+
+    def test_merges_existing_untracked_row_on_sessions(self):
+        from anthproxy.constants import UNTRACKED_SESSION_ID
+        conn = self._apply_through_migration_10()
+        with conn:
+            conn.execute(
+                "INSERT INTO sessions (session_id, created_at, last_seen_at) "
+                "VALUES ('', '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z')"
+            )
+            conn.execute(
+                "INSERT INTO sessions (session_id, created_at, last_seen_at) "
+                "VALUES (?, '2026-08-02T00:00:00.000Z', '2026-08-02T00:00:00.000Z')",
+                (UNTRACKED_SESSION_ID,),
+            )
+        self._run(conn)
+        rows = conn.execute("SELECT session_id FROM sessions").fetchall()
+        assert [r[0] for r in rows] == [UNTRACKED_SESSION_ID]
+        conn.close()
+
+    def test_no_op_when_no_empty_session_ids(self):
+        conn = self._apply_through_migration_10()
+        with conn:
+            conn.execute(
+                """INSERT INTO requests (
+                    session_id, conversation_anchor, request_ts, requested_model,
+                    backend, status
+                ) VALUES ('plain-session', 'anchor-1', '2026-08-01T00:00:00.000Z',
+                    'sonnet', 'anthropic', 'success')"""
+            )
+        self._run(conn)
+        assert conn.execute("SELECT session_id FROM requests").fetchone()[0] == 'plain-session'
+        conn.close()
+
+    def test_runs_on_startup_via_ensure_schema(self):
+        from anthproxy.constants import UNTRACKED_SESSION_ID
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            from anthproxy.db import _MIGRATIONS
+            for i in range(11):
+                with conn:
+                    _MIGRATIONS[i](conn)
+                    conn.execute(f"PRAGMA user_version = {i + 1};")
+            with conn:
+                conn.execute(
+                    """INSERT INTO requests (
+                        session_id, conversation_anchor, request_ts, requested_model,
+                        backend, status
+                    ) VALUES ('', 'anchor-1', '2026-08-01T00:00:00.000Z', 'sonnet',
+                        'anthropic', 'success')"""
+                )
+            conn.close()
+
+            db = SessionDB(path)
+            try:
+                keys = {r[0] for r in db._conn.execute("SELECT DISTINCT session_id FROM requests")}
+                assert keys == {UNTRACKED_SESSION_ID}
                 assert db._conn.execute("PRAGMA user_version;").fetchone()[0] == _SCHEMA_VERSION
             finally:
                 db.close()

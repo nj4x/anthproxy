@@ -14,12 +14,13 @@ from collections import defaultdict
 from datetime import date as _date
 from datetime import datetime as _datetime
 
+from .constants import UNTRACKED_SESSION_ID
 from .model_tier import classify_model_tier
 from .stats import MODEL_PRICING, _classify_model
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 12
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +403,22 @@ def _apply_migration_10(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_migration_11(conn: sqlite3.Connection) -> None:
+    """Rename the empty-string session key to the named sentinel (v11 → v12).
+
+    Requests with no ``metadata.user_id`` were previously bucketed under
+    ``session_id = ''``; new rows now use ``UNTRACKED_SESSION_ID`` (see
+    ``anthproxy/constants.py``) so the admin UI can label them explicitly.
+    Existing rows are renamed here so old and new untracked requests land in
+    one bucket instead of splitting across the two sentinels.
+    """
+    for table in ('requests', 'sessions', 'session_summaries', 'conversation_summaries'):
+        conn.execute(
+            f"UPDATE OR REPLACE {table} SET session_id = ? WHERE session_id = ''",
+            (UNTRACKED_SESSION_ID,),
+        )
+
+
 _MIGRATIONS: dict[int, object] = {
     0: _apply_migration_0,
     1: _apply_migration_1,
@@ -414,6 +431,7 @@ _MIGRATIONS: dict[int, object] = {
     8: _apply_migration_8,
     9: _apply_migration_9,
     10: _apply_migration_10,
+    11: _apply_migration_11,
 }
 
 

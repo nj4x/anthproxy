@@ -15,6 +15,7 @@ from .constants import (
     SESSION_SUBSCRIPTION_SENTINEL,
     SUBSCRIPTION_BACKENDS,
     TOOLS_TO_REMOVE,
+    UNTRACKED_SESSION_ID,
 )
 from .mapper import AnthropicRequestError, anthropic_error_payload, estimate_input_tokens, sse_event
 from .model_router import ModelRoutingDecision as _ModelRoutingDecision
@@ -1143,7 +1144,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         # path can update the same row on success.
                         if self.session_db is not None and not getattr(self, '_db_request_id', None):
                             try:
-                                from .constants import UNTRACKED_SESSION_ID
                                 _dur_ms = int((time.monotonic() - getattr(self, '_req_start', time.monotonic())) * 1000)
                                 self._db_request_id = self.session_db.record_request(
                                     session_id=_session_key(payload) or UNTRACKED_SESSION_ID if isinstance(payload, dict) else UNTRACKED_SESSION_ID,
@@ -1229,7 +1229,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if self.session_db is None or getattr(self, '_db_request_id', None):
             return
         try:
-            from .constants import UNTRACKED_SESSION_ID
             ctx_key = getattr(self, '_ctx_key', None)
             self._db_request_id = self.session_db.record_request(
                 session_id=_session_key(payload) or UNTRACKED_SESSION_ID if isinstance(payload, dict) else UNTRACKED_SESSION_ID,
@@ -1366,7 +1365,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             _anchor = _anchor.split('\x00', 1)[-1] if _anchor and '\x00' in _anchor else None
             wrapped = self._usage_sse_wrapper(
                 sse_gen, None, backend_name, start_time, model,
-                session_id=_session_key(payload) or '',
+                session_id=_session_key(payload) or UNTRACKED_SESSION_ID,
                 conversation_anchor=_anchor,
                 routing_decision=getattr(self, '_routing', None),
             )
@@ -1414,7 +1413,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 try:
                     duration_ms_db = int((time.monotonic() - start_time) * 1000)
                     self._db_request_id = self.session_db.record_request(
-                        session_id=_session_key(payload) or '',
+                        session_id=_session_key(payload) or UNTRACKED_SESSION_ID,
                         conversation_anchor=(
                             self._ctx_key.split('\x00', 1)[-1]
                             if getattr(self, '_ctx_key', None) and '\x00' in self._ctx_key else None

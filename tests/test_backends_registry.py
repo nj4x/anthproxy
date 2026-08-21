@@ -1081,6 +1081,19 @@ class TestBackendsCliFlag:
         assert 'anthropic' in cfg.backends
         # oauth in the allowlist is a no-op; it doesn't change eligibility
         # or affect backend_names(), which still excludes it
+        assert set(backend_names()) == {'anthropic'}
+        assert get_backend('oauth') is not None
+
+    def test_oauth_alone_errors_as_empty_effective_set(self):
+        from anthproxy.config import parse_args
+        # 'oauth' alone validates at the token level (it's an accepted
+        # advisory token, so _parse_backends_str doesn't reject it), but
+        # backend_names() then excludes it (internal backends are never
+        # listed there), leaving no provider backend for the unset --backend
+        # default to repair onto — a distinct, later p.error() than the
+        # unknown-token error.
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'oauth'])
 
     def test_explicit_backend_outside_allowlist_errors(self):
         from anthproxy.config import parse_args

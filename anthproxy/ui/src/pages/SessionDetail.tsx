@@ -5,7 +5,7 @@ import { api } from '../api/client';
 import type { SessionDetail as SessionDetailType, TraceResponse, RequestRecord, BackendsResponse } from '../api/types';
 import { RequestDetailDrawer } from '../components/RequestDetailDrawer';
 import { ExcerptHighlight } from '../components/ExcerptHighlight';
-import { parseSessionId, parseConversationAnchor, backendLabel } from '../utils';
+import { parseSessionId, parseConversationAnchor, backendLabel, UNTRACKED_SESSION_ID } from '../utils';
 
 const TIERS = ['haiku', 'sonnet', 'opus', 'fable'];
 const TRACE_PAGE_SIZE = 100;
@@ -162,7 +162,7 @@ export default function SessionDetail() {
     return <div className="text-gray-500">Loading...</div>;
   }
 
-  const isUntracked = id === '__untracked__';
+  const isUntracked = id === UNTRACKED_SESSION_ID;
 
   return (
     <div className="space-y-6">

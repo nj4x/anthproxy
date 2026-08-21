@@ -3,6 +3,9 @@ export interface SessionLabel {
   tooltip: string;
 }
 
+/** Mirrors anthproxy/constants.py:UNTRACKED_SESSION_ID. */
+export const UNTRACKED_SESSION_ID = '__untracked__';
+
 const BACKEND_LABELS: Record<string, string> = {
   oauth: 'Anthropic-OAuth',
 };
@@ -51,7 +54,7 @@ function compactRawLabel(value: string): string {
  * Special-cases the __untracked__ sentinel for requests with no metadata.user_id.
  */
 export function parseSessionId(value: string): SessionLabel {
-  if (value === '__untracked__') {
+  if (value === UNTRACKED_SESSION_ID) {
     return { label: '— Untracked —', tooltip: 'Requests with no session ID (e.g., system utility calls)' };
   }
 

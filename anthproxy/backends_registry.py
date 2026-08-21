@@ -13,6 +13,7 @@ Public API
     get_backend(name) -> type | None
     list_backends() -> tuple[str, ...]   (sorted)
     backend_names() -> tuple[str, ...]   (declared order + discovered extras)
+    internal_backend_names() -> frozenset[str]   (always-enabled, allowlist-exempt names)
     discover_backends() -> None
     class_hook(backend_class, name) -> callable | None
     set_enabled_backends(allowed) -> None   (allowlist filter; see ADR-0020)
@@ -141,6 +142,15 @@ def backend_names() -> tuple[str, ...]:
         if n not in _DECLARED_ORDER and n not in _INTERNAL_BACKENDS and _is_enabled(n)
     )
     return tuple(declared + extras)
+
+
+def internal_backend_names() -> frozenset[str]:
+    """Return the always-enabled, allowlist-exempt internal backend names.
+
+    Public accessor for ``_INTERNAL_BACKENDS`` — no other module may import
+    the underscore-prefixed symbol directly (see module docstring).
+    """
+    return _INTERNAL_BACKENDS
 
 
 def class_hook(backend_class: type, name: str):
