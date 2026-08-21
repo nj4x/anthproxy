@@ -442,6 +442,45 @@ class TestSessionSubscription:
         assert registry.session_backend('sess-a') is None
 
 
+class TestSubscriptionAllowlistDegradation:
+    """ADR-0020 (a): subscription paths must not name/route to an excluded backend."""
+
+    def test_set_session_subscription_fails_with_typed_error_when_none_enabled(
+        self, monkeypatch,
+    ):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'bedrock', 'local'}))
+        config, registry = _registry('bedrock')
+        _patch_build_with_auth(monkeypatch)
+        result = registry.set_session_subscription('sess-a')
+        assert result.kind == 'failed'
+        assert 'no subscription backends are enabled' in result.error
+
+    def test_snapshot_fallback_never_names_excluded_backend(self, monkeypatch):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'codex', 'bedrock'}))
+        config, registry = _registry('bedrock')
+        _patch_build_with_auth(monkeypatch)
+        registry.set_session_subscription('sess-a')
+        # anthropic is excluded; the hardcoded 'anthropic' fallback must not
+        # be used. codex is the only enabled subscription backend.
+        snap = registry.snapshot('sess-a')
+        assert snap.name == 'codex'
+
+    def test_snapshot_fallback_uses_active_when_no_subscription_enabled(
+        self, monkeypatch,
+    ):
+        from anthproxy import backends_registry
+        backends_registry.set_enabled_backends(frozenset({'bedrock', 'local'}))
+        config, registry = _registry('bedrock')
+        _patch_build_with_auth(monkeypatch)
+        registry._session_overrides['sess-a'] = SESSION_SUBSCRIPTION_SENTINEL
+        snap = registry.snapshot('sess-a')
+        # No subscription backend enabled at all: name/backend stay consistent
+        # with whatever is actually active, never a fabricated/excluded name.
+        assert snap.name == registry.active_name()
+
+
 class TestCreateServerWiresResolver:
 
     def test_create_server_wires_subscription_resolver(self, monkeypatch):
@@ -787,8 +826,24 @@ class TestSnapshotPreferBackend:
         _patch_build(monkeypatch)
         config.auto_backend_mode = 'subscription'
         snap = registry.snapshot(prefer_backend='bedrock')
-        # Bedrock is not a subscription backend; preference ignored.
+        # Bedrock is not rotatable; preference ignored.
         assert snap.name == 'anthropic'
+
+    def test_prefer_local_in_subscription_mode_ignored(self, monkeypatch):
+        config, registry = _registry('anthropic')
+        _patch_build(monkeypatch)
+        config.auto_backend_mode = 'subscription'
+        snap = registry.snapshot(prefer_backend='local')
+        assert snap.name == 'anthropic'
+
+    def test_prefer_peer_honoured_in_default_subscription_mode(self, monkeypatch):
+        """The gate asks "may the selector be steered onto this", not "is this a
+        subscription" — otherwise prefer:peer is dead in every default deployment."""
+        config, registry = _registry('anthropic')
+        _patch_build(monkeypatch)
+        assert config.auto_backend_mode == 'subscription'
+        snap = registry.snapshot(prefer_backend='peer')
+        assert snap.name == 'peer'
 
     def test_prefer_construct_on_demand(self, monkeypatch):
         """When the preferred backend is configured but not cached, it is constructed."""
@@ -918,6 +973,20 @@ class TestUsageSnapshotAgeSecs:
 
         assert 'anthropic' in result
         assert result['anthropic']['age_secs'] is None
+
+    def test_peer_listed_as_a_backend_but_carries_no_usage_figures(self):
+        """The admin surface shows the peer, with its capacity unknown.
+
+        Its neutral status must not reach the UI as a usage card, which would
+        render the fabricated neutral as a real 0%/50% weekly burn.
+        """
+        config, registry = _registry('bedrock')
+        assert registry.switch('peer').kind == 'changed'
+
+        status = registry.backend_status()
+        assert 'peer' in status
+        assert status['peer']['active'] is True
+        assert 'peer' not in registry.usage_snapshot()
 
     def test_unpopulated_cache_backend_absent_from_result(self):
         """Backend with no _usage_cache dict must not appear in the snapshot."""

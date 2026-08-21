@@ -23,6 +23,9 @@ class _Registry:
     def active_name(self):
         raise AssertionError('personal_candidates must not call registry')
 
+    def list_backends(self):
+        return ('anthropic', 'bedrock', 'codex', 'local', 'openrouter')
+
 
 def test_personal_candidates_exclude_cooldown_and_use_cached_burn_only():
     selector = AutoSelector(_Registry(), SimpleNamespace(

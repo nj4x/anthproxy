@@ -3,7 +3,8 @@ import sys
 
 from . import model_config
 from .config import parse_args
-from .server import BackendRegistry, build_backend, create_server, discover_backends
+from .constants import ROTATABLE_BACKENDS
+from .server import BackendRegistry, backend_names, build_backend, create_server, discover_backends
 
 
 class _ShortNameFormatter(logging.Formatter):
@@ -28,6 +29,42 @@ class _ShortNameFormatter(logging.Formatter):
 
 
 logger = logging.getLogger('anthproxy')
+
+
+def _guard_peer_self_reference(config):
+    """Refuse to start when an *enabled* peer target points back at us (ADR-0026).
+
+    Gated on ``peer`` being enabled, not merely configured: ticket 03 case 3
+    makes "base URL set, ``peer`` excluded from --backends" a legal
+    configuration in which nothing is ever dispatched to the peer, so there is
+    no loop to prevent and refusing to boot would turn a leftover environment
+    variable into an outage.
+    """
+    if not config.peer_base_url or 'peer' not in backend_names():
+        return
+    from .peer.backend import PeerSelfReferenceError, check_self_reference
+    try:
+        check_self_reference(config)
+    except PeerSelfReferenceError as exc:
+        logger.error('%s', exc)
+        sys.exit(2)
+
+
+def _disable_auto_backend_if_nothing_to_rotate(config, enabled_names) -> None:
+    """Downgrade auto mode to static when nothing in the enabled set is rotatable.
+
+    ADR-0020 §8: auto mode with nothing to rotate among is disabled rather than
+    a boot failure. The test is ``ROTATABLE_BACKENDS``, not
+    ``SUBSCRIPTION_BACKENDS`` — a peer-only set (``--backends peer``, a thin
+    forwarding front end) has something to rotate onto and keeps a live
+    selector.
+    """
+    if config.auto_backend and not (enabled_names & set(ROTATABLE_BACKENDS)):
+        logger.info(
+            'Auto-backend disabled: no rotatable backends in enabled set (%s)',
+            sorted(enabled_names),
+        )
+        config.auto_backend = False
 
 
 def main():
@@ -56,26 +93,33 @@ def main():
         fh.setFormatter(_ShortNameFormatter(_fmt))
         root.addHandler(fh)
 
+    _guard_peer_self_reference(config)
+
     # Write default ~/.anthproxy/config.json on first run so users have an
     # editable template for model aliases, pricing, etc.
     model_config.ensure_file()
 
+    enabled_names = frozenset(backend_names())
+    _disable_auto_backend_if_nothing_to_rotate(config, enabled_names)
+
     if config.auto_backend:
-        # Auto mode: ensure credentials for both subscription backends regardless
-        # of --backend.  Interactive login may run for each.  Priority order:
-        # anthropic first so its login prompt appears before codex's.
-        from .anthropic import auth as anthropic_auth
-        from .codex import auth as codex_auth
-        try:
-            anthropic_auth.ensure_credentials(config)
-        except Exception as exc:
-            logger.warning(
-                'Anthropic credential setup failed; anthropic backend will be unavailable: %s', exc)
-        try:
-            codex_auth.ensure_credentials(config)
-        except Exception as exc:
-            logger.warning(
-                'Codex credential setup failed; codex backend will be unavailable: %s', exc)
+        # Auto mode: ensure credentials only for subscription backends in the
+        # enabled set (ADR-0020 §7). Priority order: anthropic first so its
+        # login prompt appears before codex's.
+        if 'anthropic' in enabled_names:
+            from .anthropic import auth as anthropic_auth
+            try:
+                anthropic_auth.ensure_credentials(config)
+            except Exception as exc:
+                logger.warning(
+                    'Anthropic credential setup failed; anthropic backend will be unavailable: %s', exc)
+        if 'codex' in enabled_names:
+            from .codex import auth as codex_auth
+            try:
+                codex_auth.ensure_credentials(config)
+            except Exception as exc:
+                logger.warning(
+                    'Codex credential setup failed; codex backend will be unavailable: %s', exc)
     else:
         # Static mode: only prepare the single configured backend.
         if config.backend == 'codex':

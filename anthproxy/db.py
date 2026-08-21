@@ -572,6 +572,11 @@ class SessionDB:
         ``cache_savings_usd`` is computed internally from ``routed_model`` and
         ``cache_read_tokens``; it is NOT accepted as a parameter.
 
+        An empty ``stats_dict`` records absent usage: every token column and
+        ``cost_estimate`` are NULL rather than zero.  A zero is summable and
+        reads as a request that genuinely cost nothing; a NULL says this
+        instance never learned what the request cost (ADR-0025).
+
         ``net_savings_usd`` and ``classifier_overhead_usd`` are persisted only
         for requests where routing was ``applied``; they are forced to NULL for
         unrouted requests regardless of the passed values.
@@ -585,7 +590,7 @@ class SessionDB:
 
         routed_model = routing_decision.routed_model
         model_tier = _tier_from_model(routed_model)
-        cost_estimate = compute_cost(routed_model, stats_dict)
+        cost_estimate = compute_cost(routed_model, stats_dict) if stats_dict else None
         cache_read_tokens = stats_dict.get('cache_read_tokens')
         cache_savings_usd = _compute_cache_savings(routed_model, cache_read_tokens)
         user_prompt_search = user_prompt_text.casefold() if user_prompt_text else None

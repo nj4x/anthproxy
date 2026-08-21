@@ -3,7 +3,13 @@ import time
 import unittest
 
 from anthproxy._shared import FiveHourStatus, SubscriptionBackend, UsageRateLimitError
-from anthproxy.selector import AutoSelector, _FALLBACK, _PRIORITY
+from anthproxy.constants import ROTATABLE_BACKENDS, SUBSCRIPTION_BACKENDS
+from anthproxy.selector import (
+    AutoSelector,
+    _DEFAULT_RECHECK_SECS,
+    _FALLBACK,
+    _PRIORITY,
+)
 
 
 class _TestSubscriptionBackend(SubscriptionBackend):
@@ -79,6 +85,9 @@ class _FakeRegistry:
 
     def active_name(self) -> str:
         return self._active
+
+    def list_backends(self):
+        return ('anthropic', 'bedrock', 'codex', 'local', 'openrouter')
 
     def instance(self, name: str):
         return self._instances[name]
@@ -159,7 +168,7 @@ class TestSubscriptionBackend(unittest.TestCase):
 class TestComputeBest(unittest.TestCase):
 
     def test_priority_includes_openrouter_after_codex(self):
-        self.assertEqual(_PRIORITY, ('anthropic', 'codex', 'openrouter'))
+        self.assertEqual(_PRIORITY, ('anthropic', 'codex', 'openrouter', 'peer'))
 
     def test_prefers_lower_weekly_utilization_when_backends_available(self):
         sel, reg = _make_selector({
@@ -1076,6 +1085,346 @@ class TestWeeklyNoneCachePreservation(unittest.TestCase):
             )
         # Sanity: selector still chose the only available backend.
         self.assertEqual(reg.active_name(), 'anthropic')
+
+
+class _RestrictedRegistry(_FakeRegistry):
+    """_FakeRegistry variant reporting a caller-supplied enabled backend set."""
+
+    def __init__(self, enabled: tuple, initial='bedrock'):
+        super().__init__(initial)
+        self._enabled = enabled
+
+    def list_backends(self):
+        return self._enabled
+
+
+class TestAllowlistIntersection(unittest.TestCase):
+    """ADR-0020 §8: _PRIORITY/_FALLBACK intersected with the enabled set."""
+
+    def test_priority_intersected_at_construction(self):
+        reg = _RestrictedRegistry(('anthropic', 'codex'))
+        sel = AutoSelector(reg, _FakeConfig())
+        self.assertEqual(sel._priority, ('anthropic', 'codex'))
+
+    def test_fallback_none_when_bedrock_excluded(self):
+        reg = _RestrictedRegistry(('anthropic', 'codex'))
+        sel = AutoSelector(reg, _FakeConfig())
+        self.assertIsNone(sel._fallback)
+
+    def test_fallback_present_when_bedrock_enabled(self):
+        reg = _RestrictedRegistry(('anthropic', 'bedrock'))
+        sel = AutoSelector(reg, _FakeConfig())
+        self.assertEqual(sel._fallback, 'bedrock')
+
+    def test_evaluate_does_not_crash_with_no_enabled_subscription_backends(self):
+        """Bedrock-only allowlist: no subscription candidates, no bedrock instance
+        registered either — evaluate() must not raise and must hold active."""
+        reg = _RestrictedRegistry(('bedrock', 'local'), initial='bedrock')
+        sel = AutoSelector(reg, _FakeConfig())
+        result = sel.evaluate()
+        self.assertEqual(result, 'bedrock')
+        self.assertEqual(reg._switches, [])
+
+    def test_restrict_subscription_does_not_crash_with_empty_priority(self):
+        reg = _RestrictedRegistry(('bedrock', 'local'), initial='bedrock')
+        sel = AutoSelector(reg, _FakeConfig())
+        result = sel.restrict_subscription()
+        self.assertEqual(result, 'bedrock')
+        self.assertEqual(sel._mode, 'subscription')
+
+    def test_refresh_tokens_skips_excluded_backend(self):
+        calls = []
+        reg = _RestrictedRegistry(('anthropic', 'bedrock'))
+        sel = AutoSelector(reg, _FakeConfig())
+
+        import anthproxy.codex.auth as codex_auth
+        import anthproxy.anthropic.auth as anthropic_auth
+
+        def fake_anthropic(config):
+            calls.append('anthropic')
+
+        def fake_codex(config):
+            calls.append('codex')
+
+        orig_anthropic = anthropic_auth.ensure_credentials_noninteractive
+        orig_codex = codex_auth.ensure_credentials_noninteractive
+        anthropic_auth.ensure_credentials_noninteractive = fake_anthropic
+        codex_auth.ensure_credentials_noninteractive = fake_codex
+        try:
+            sel._refresh_tokens()
+        finally:
+            anthropic_auth.ensure_credentials_noninteractive = orig_anthropic
+            codex_auth.ensure_credentials_noninteractive = orig_codex
+
+        self.assertEqual(calls, ['anthropic'])  # codex excluded, never called
+
+
+class _StatusBackend:
+    """Backend stand-in returning a caller-built FiveHourStatus verbatim."""
+
+    def __init__(self, status):
+        self._status = status
+
+    def five_hour_status(self, config) -> FiveHourStatus:
+        return self._status
+
+
+def _provider_status(available, weekly, elapsed_pct=50.0, resets_at=None):
+    """A provider-shaped status: weekly burn plus a usable elapsed signal."""
+    now = time.time()
+    return FiveHourStatus(
+        available=available,
+        resets_at=resets_at,
+        utilization=None,
+        weekly_utilization=weekly,
+        weekly_resets_at=now + (1.0 - elapsed_pct / 100.0) * 168 * 3600.0,
+        weekly_window_hours=168.0,
+    )
+
+
+class TestPeerSelection(unittest.TestCase):
+    """ADR-0022: the peer is a rotation candidate with a constant neutral status."""
+
+    def _sel(self, enabled, instances, initial='bedrock', mode='auto'):
+        reg = _RestrictedRegistry(enabled, initial=initial)
+        reg._instances = dict(instances)
+        cfg = _FakeConfig()
+        cfg.auto_backend_mode = mode
+        return AutoSelector(reg, cfg), reg
+
+    def _peer(self):
+        from anthproxy.peer.backend import PeerBackend
+        return PeerBackend()
+
+    def test_peer_is_a_candidate_when_enabled(self):
+        sel, _ = self._sel(('anthropic', 'bedrock', 'peer'), {})
+        self.assertIn('peer', sel._priority)
+
+    def test_peer_absent_from_candidates_when_not_enabled(self):
+        # Ticket 03 keeps peer out of backend_names() without --peer-base-url,
+        # so an unconfigured peer never reaches the candidate pool.
+        sel, _ = self._sel(('anthropic', 'bedrock'), {})
+        self.assertNotIn('peer', sel._priority)
+
+    def test_peer_ranks_behind_an_available_provider(self):
+        sel, _ = self._sel(
+            ('anthropic', 'bedrock', 'peer'),
+            {
+                'anthropic': _StatusBackend(_provider_status(True, 86.0)),
+                'peer': self._peer(),
+            },
+        )
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+        self.assertEqual(best, 'anthropic')
+
+    def test_peer_selected_when_no_provider_is_available(self):
+        now = time.time()
+        sel, _ = self._sel(
+            ('anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(
+                    _provider_status(False, 86.0, resets_at=now + 3600)),
+                'peer': self._peer(),
+            },
+        )
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+        self.assertEqual(best, 'peer')
+
+    def test_peer_selected_in_default_subscription_mode(self):
+        now = time.time()
+        sel, _ = self._sel(
+            ('anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(
+                    _provider_status(False, 86.0, resets_at=now + 3600)),
+                'peer': self._peer(),
+            },
+            mode='subscription',
+        )
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, True)
+        self.assertEqual(best, 'peer')
+
+    def test_peer_wins_over_bedrock_fallback(self):
+        now = time.time()
+        for exhausted_weekly in (86.0, 10.0):
+            with self.subTest(exhausted_weekly=exhausted_weekly):
+                sel, _ = self._sel(
+                    ('anthropic', 'bedrock', 'peer'),
+                    {
+                        'anthropic': _StatusBackend(_provider_status(
+                            False, exhausted_weekly, resets_at=now + 3600)),
+                        'peer': self._peer(),
+                    },
+                )
+                best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+                self.assertEqual(best, 'peer')
+
+    def test_bedrock_fallback_still_reached_without_a_peer(self):
+        now = time.time()
+        sel, _ = self._sel(
+            ('anthropic', 'bedrock'),
+            {
+                'anthropic': _StatusBackend(
+                    _provider_status(False, 86.0, resets_at=now + 3600)),
+            },
+        )
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+        self.assertEqual(best, 'bedrock')
+
+    def test_recovered_provider_displaces_incumbent_peer(self):
+        # anthropic's weekly (86) is worse than the peer's neutral 50, so the
+        # incumbent-hold margin would have pinned the peer. The block rule wins.
+        sel, _ = self._sel(
+            ('anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(_provider_status(True, 86.0)),
+                'peer': self._peer(),
+            },
+            initial='peer',
+        )
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+        self.assertEqual(best, 'anthropic')
+
+    def test_peer_429_parks_for_retry_after(self):
+        now = time.time()
+        sel, reg = self._sel(
+            ('anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(_provider_status(True, 86.0)),
+                'peer': self._peer(),
+            },
+            initial='peer',
+        )
+        sel.on_rate_limited('peer', 45.0)
+        self.assertAlmostEqual(sel._exhausted_until['peer'], now + 45.0, delta=5)
+        self.assertEqual(reg.active_name(), 'anthropic')
+
+    def test_peer_429_without_retry_after_parks_for_default_recheck(self):
+        now = time.time()
+        sel, _ = self._sel(
+            ('anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(_provider_status(True, 86.0)),
+                'peer': self._peer(),
+            },
+            initial='peer',
+        )
+        sel.on_rate_limited('peer', None)
+        self.assertAlmostEqual(
+            sel._exhausted_until['peer'], now + _DEFAULT_RECHECK_SECS, delta=5)
+
+    def test_non_429_peer_failure_leaves_selector_state_untouched(self):
+        # A 5xx / refused connection / timeout surfaces to the client without
+        # reaching the selector at all (handlers signal only on 429), so the
+        # peer must still be a candidate on the next cycle.
+        now = time.time()
+        sel, _ = self._sel(
+            ('anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(
+                    _provider_status(False, 86.0, resets_at=now + 3600)),
+                'peer': self._peer(),
+            },
+            initial='peer',
+        )
+        self.assertEqual(sel.evaluate(), 'peer')
+        self.assertNotIn('peer', sel._exhausted_until)
+        self.assertNotIn('peer', sel._last_weekly)
+        self.assertEqual(sel.evaluate(), 'peer')
+
+    def test_peer_five_hour_status_makes_no_network_call(self):
+        import anthproxy.peer.backend as peer_backend
+
+        def _boom(config):
+            raise AssertionError('peer must not be probed for capacity')
+
+        original = peer_backend._make_connection
+        peer_backend._make_connection = _boom
+        try:
+            status = self._peer().five_hour_status(_FakeConfig())
+        finally:
+            peer_backend._make_connection = original
+        self.assertTrue(status.available)
+        self.assertIsNone(status.weekly_utilization)
+        self.assertIsNone(status.weekly_resets_at)
+        self.assertIsNone(status.weekly_window_hours)
+
+    def test_refresh_tokens_never_refreshes_peer(self):
+        calls = []
+        sel, _ = self._sel(('peer',), {'peer': self._peer()})
+
+        import anthproxy.anthropic.auth as anthropic_auth
+        import anthproxy.codex.auth as codex_auth
+
+        orig_anthropic = anthropic_auth.ensure_credentials_noninteractive
+        orig_codex = codex_auth.ensure_credentials_noninteractive
+        anthropic_auth.ensure_credentials_noninteractive = lambda cfg: calls.append('anthropic')
+        codex_auth.ensure_credentials_noninteractive = lambda cfg: calls.append('codex')
+        try:
+            sel._refresh_tokens()
+        finally:
+            anthropic_auth.ensure_credentials_noninteractive = orig_anthropic
+            codex_auth.ensure_credentials_noninteractive = orig_codex
+
+        self.assertEqual(calls, [])
+
+    def test_subscription_resolver_never_returns_peer(self):
+        sel, _ = self._sel(('peer',), {'peer': self._peer()})
+        self.assertIsNone(sel.current_subscription_backend())
+
+    def test_openrouter_incumbent_with_unknown_weekly_still_held(self):
+        """The peer-only signal-less carve-out must not catch other elapsed-less
+        backends. openrouter is permanently elapsed-less (no weekly window), and
+        on a fetch gap its weekly is also momentarily unknown — the same shape
+        as the peer's constant status. It must still get the ordinary
+        neutral-value margin hold, not the peer's unconditional yield."""
+        sel, reg = self._sel(
+            ('openrouter', 'anthropic', 'peer'),
+            {
+                'anthropic': _StatusBackend(_provider_status(True, 48.0)),
+                'openrouter': _StatusBackend(FiveHourStatus(
+                    available=True, resets_at=None, weekly_utilization=None,
+                    weekly_resets_at=None, weekly_window_hours=None)),
+                'peer': self._peer(),
+            },
+            initial='openrouter',
+        )
+        # No prior snapshot for openrouter's weekly.
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+        # openrouter neutral=50, anthropic=48, delta=2 < margin 5 → hold.
+        self.assertEqual(best, 'openrouter')
+
+    def test_openrouter_best_available_still_parks_exhausted_incumbent(self):
+        """The peer-only bedrock-parking carve-out must not swallow the
+        pre-existing openrouter-vs-bedrock parking decision."""
+        now = time.time()
+        sel, reg = self._sel(
+            ('anthropic', 'openrouter', 'bedrock', 'peer'),
+            {
+                'anthropic': _StatusBackend(
+                    _provider_status(False, 10.0, resets_at=now + 3600)),
+                'openrouter': _StatusBackend(FiveHourStatus(
+                    available=True, resets_at=None, weekly_utilization=20.0,
+                    weekly_resets_at=None, weekly_window_hours=None)),
+                'peer': self._peer(),
+            },
+            initial='bedrock',
+        )
+        best, _, _, _ = sel._compute_best_unlocked({}, {}, False)
+        # openrouter (20) beats the peer's fabricated neutral (50), so it is
+        # still best-available; gap vs exhausted anthropic (10) is 10 >= margin
+        # 5 → park on bedrock, same as before peer joined the pool.
+        self.assertEqual(best, 'bedrock')
+
+
+class TestRotatableTuple(unittest.TestCase):
+    def test_subscription_tuple_excludes_peer(self):
+        self.assertEqual(SUBSCRIPTION_BACKENDS, ('anthropic', 'codex', 'openrouter'))
+        self.assertNotIn('peer', SUBSCRIPTION_BACKENDS)
+
+    def test_rotatable_tuple_is_subscription_plus_peer(self):
+        self.assertEqual(ROTATABLE_BACKENDS, SUBSCRIPTION_BACKENDS + ('peer',))
+        self.assertEqual(_PRIORITY, ROTATABLE_BACKENDS)
 
 
 if __name__ == '__main__':

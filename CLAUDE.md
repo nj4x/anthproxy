@@ -22,7 +22,7 @@ Use `README.md` for setup, run, test, and UI development commands. The Python pa
 
 ## Architecture overview
 
-`anthproxy.__main__` loads `Config`, prepares the initial backend, creates `BackendRegistry`, `StatsCollector`, and optional `SessionDB`, then starts the server. `server.py` owns backend construction, immutable dispatch snapshots, runtime switching, selector integration, and handler-class wiring. `ProxyRequestHandler` in `handlers.py` intercepts local commands, applies routing, takes one registry snapshot, dispatches to a provider backend, translates errors and streams, records usage and session data, and emits Anthropic-compatible responses.
+`anthproxy.__main__` loads `Config`, prepares the initial backend, creates `BackendRegistry`, `StatsCollector`, and optional `SessionDB`, then starts the server. `server.py` owns backend construction, immutable dispatch snapshots, runtime switching, selector integration, and handler-class wiring. `ProxyRequestHandler` in `handlers.py` intercepts local commands, takes one registry snapshot, applies routing against that resolved target, dispatches to a provider backend, translates errors and streams, records usage and session data, and emits Anthropic-compatible responses.
 
 Each provider package follows the same boundary: `backend.py` (alongside `__init__.py`) marks a directory as a discoverable backend — do not create `backend.py` inside `anthproxy/_shared/` or `anthproxy/mapper/`. `backend.py` owns transport and provider runtime behavior, `mapper.py` converts between Anthropic Messages shapes and provider protocol shapes, and `auth.py` owns credentials where needed. Shared SSE builders and content normalization live under `anthproxy/mapper/`; shared OAuth refresh and persistence live under `anthproxy/_shared/`.
 
@@ -42,7 +42,7 @@ Local-command matching order and non-interactive backend switching:
 Lock-scope discipline and selector behavior invariants:
 @docs/agents/concurrency.md
 
-Per-provider transport and mapping quirks (Codex, Anthropic, Local):
+Per-provider transport and mapping quirks (Codex, Anthropic, Local, Peer):
 @docs/agents/backend-providers.md
 
 Credential isolation/atomicity and client-facing failure shaping:

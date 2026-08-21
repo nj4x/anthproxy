@@ -3,6 +3,7 @@ import useSWR from 'swr';
 import { api } from '../api/client';
 import type { StatsResponse, StatsRow, BackendsResponse } from '../api/types';
 import { backendLabel } from '../utils';
+import { CostScopeNote } from '../components/CostScopeNote';
 
 const PERIODS = [
   { label: 'Day', value: 'day' },
@@ -165,6 +166,7 @@ export default function Stats() {
                   <div className="mt-1 text-xl font-semibold text-gray-800">{value}</div>
                 </div>
               ))}
+              <CostScopeNote className="col-span-2 md:col-span-5" />
             </div>
           )}
 

@@ -4,6 +4,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 
 import { api } from '../api/client';
 import type { CostResponse, RoutingResponse, CostRow } from '../api/types';
 import { backendLabel } from '../utils';
+import { CostScopeNote } from '../components/CostScopeNote';
 
 const TIME_RANGES = ['1d', '7d', '30d'] as const;
 type TimeRange = typeof TIME_RANGES[number];
@@ -97,7 +98,10 @@ export default function Analytics() {
 
           {/* Cost table */}
           <div className="bg-white shadow rounded-lg overflow-hidden">
-            <div className="px-5 py-3 border-b border-gray-200 text-sm font-medium text-gray-700">Cost Table</div>
+            <div className="px-5 py-3 border-b border-gray-200 text-sm font-medium text-gray-700">
+              Cost Table
+              <CostScopeNote className="mt-1 font-normal" />
+            </div>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-gray-200 text-sm">
                 <thead className="bg-gray-50">

@@ -8,6 +8,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from .backends_registry import backend_names as _backend_names
+from .backends_registry import set_enabled_backends as _set_enabled_backends
 from .constants import VALID_BACKEND_MODES
 
 
@@ -35,6 +36,72 @@ _DEFAULT_CLASSIFICATION: dict[str, str] = {
 }
 
 _VALID_CLASSIFICATION_LABELS: frozenset[str] = frozenset(_DEFAULT_CLASSIFICATION)
+
+
+def _parse_backends_str(
+    raw: str | None, p: argparse.ArgumentParser, full_names: frozenset[str]
+) -> frozenset[str] | None:
+    """Parse the ``--backends`` allowlist. ``None`` input means no filter.
+
+    Splits on commas, strips whitespace, drops empty tokens, de-duplicates
+    (preserving first occurrence). Validates every token against *full_names*
+    (the unfiltered discovered set). Calls ``p.error()`` on an unknown token
+    or a resulting empty set — an allowlist with zero usable backends is
+    always a configuration mistake, never a valid intent.
+    """
+    if raw is None:
+        return None
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for tok in raw.split(','):
+        tok = tok.strip()
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        tokens.append(tok)
+    if not tokens:
+        p.error(
+            '--backends: must name at least one backend, comma-separated '
+            '(e.g. --backends anthropic,codex)'
+        )
+    unknown = [t for t in tokens if t not in full_names]
+    if unknown:
+        p.error(
+            f'--backends: unknown backend(s) {unknown!r}; '
+            f'valid backends: {sorted(full_names)}'
+        )
+    return frozenset(tokens)
+
+
+def _apply_peer_gate(
+    enabled: frozenset[str] | None,
+    peer_base_url: str,
+    p: argparse.ArgumentParser,
+    full_names: frozenset[str],
+) -> frozenset[str] | None:
+    """Apply ADR-0021 §3's ``peer`` membership rule to the parsed allowlist.
+
+    *peer_base_url* must already be stripped by the caller, so that "configured"
+    means the same thing here as everywhere else that reads ``Config``.
+
+    ``--peer-base-url`` is what makes ``peer`` a member. With no target and no
+    allowlist, ``peer`` is filtered out and behaves as if not installed. With a
+    target, it joins the default set implicitly — but only in the branch where
+    the operator passed no ``--backends``; an allowlist is exhaustive. Naming
+    ``peer`` in an allowlist with no target is a hard error rather than a silent
+    narrowing, because the narrowed set feeds the default repair below.
+    """
+    if 'peer' not in full_names or peer_base_url:
+        return enabled
+    if enabled is None:
+        return frozenset(full_names - {'peer'})
+    if 'peer' in enabled:
+        p.error(
+            "--backends names 'peer' but --peer-base-url is unset; set "
+            '--peer-base-url to the target anthproxy instance, or drop '
+            "'peer' from --backends"
+        )
+    return enabled
 
 
 def _resolve_home(home_override: str) -> str:
@@ -88,6 +155,7 @@ class Config:
     use_inference_profile: bool = True
     use_global_inference_profile: bool = False
     backend: str = 'bedrock'
+    backends: tuple[str, ...] = ()   # Allowlist the operator stated; empty means none stated (peer is gated separately)
     log_level: str = 'INFO'
     no_prompt_translate: bool = False
     request_history_size: int = 5
@@ -99,6 +167,8 @@ class Config:
     anthropic_home: str = ''
     openrouter_api_key: str = ''
     local_base_url: str = 'http://127.0.0.1:1235'
+    peer_base_url: str = ''
+    peer_api_key: str = ''
     auto_backend: bool = True
     auto_backend_mode: str = 'subscription'
     auto_backend_interval: float = 60.0
@@ -152,9 +222,17 @@ def parse_args(argv=None) -> Config:
     p.add_argument('--global-inference-profile', dest='use_global_inference_profile',
                    action='store_true', default=False,
                    help='Use global. prefix instead of region-based prefix')
-    p.add_argument('--backend', default=os.environ.get('ANTHPROXY_BACKEND', 'bedrock'),
-                   choices=list(_backend_names()),
-                   help='LLM backend (default: bedrock)')
+    p.add_argument('--backend', default=None,
+                   help='LLM backend (default: bedrock, env: ANTHPROXY_BACKEND). '
+                        'Must be a member of the --backends allowlist if one is set; '
+                        'an unchosen default is repaired to the first enabled backend.')
+    p.add_argument('--backends', dest='backends',
+                   default=os.environ.get('ANTHPROXY_BACKENDS'),
+                   help='Comma-separated allowlist restricting which backends are '
+                        'discoverable/selectable (e.g. --backends anthropic,codex). '
+                        'Absent: all discovered backends are enabled except peer, '
+                        'which --peer-base-url enables (default,'
+                        ' env: ANTHPROXY_BACKENDS)')
     p.add_argument('--codex-home',
                    default=os.environ.get('CODEX_HOME', ''),
                    help='Path to Codex home directory (default: ~/.codex,'
@@ -181,6 +259,18 @@ def parse_args(argv=None) -> Config:
                    help='Base URL for the local (LM Studio) backend'
                         ' (default: http://127.0.0.1:1235,'
                         ' env: ANTHPROXY_LOCAL_BASE_URL)')
+    p.add_argument('--peer-base-url', dest='peer_base_url',
+                   default=os.environ.get('ANTHPROXY_PEER_BASE_URL', ''),
+                   help='Base URL of another anthproxy instance to dispatch to'
+                        ' via the peer backend. Setting it is what enables the'
+                        ' peer backend; when --backends is also passed, peer must'
+                        ' still be listed there explicitly (default: unset,'
+                        ' env: ANTHPROXY_PEER_BASE_URL)')
+    p.add_argument('--peer-api-key', dest='peer_api_key',
+                   default=os.environ.get('ANTHPROXY_PEER_API_KEY', ''),
+                   help='Credential sent to the peer as X-Anthproxy-Peer-Key for a'
+                        ' fronting access-control layer to consume; anthproxy itself'
+                        ' never checks it (default: unset, env: ANTHPROXY_PEER_API_KEY)')
     p.add_argument('--log-level',
                    default=os.environ.get('ANTHPROXY_LOG_LEVEL', 'INFO'),
                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -439,6 +529,40 @@ def parse_args(argv=None) -> Config:
                         ' (default: 100000, env: ANTHPROXY_CODEX_CONTEXT_LIMIT)')
 
     args = p.parse_args(argv)
+
+    # --backends: validate against the full discovered set, then install the
+    # filter before any subsequent backend_names() call. This is a required
+    # ordering — see ADR-0020 §4.
+    full_backend_names = frozenset(_backend_names())
+    enabled = _parse_backends_str(args.backends, p, full_backend_names)
+    args.backends = tuple(sorted(enabled)) if enabled is not None else ()
+    args.peer_base_url = (args.peer_base_url or '').strip()
+    gated = _apply_peer_gate(enabled, args.peer_base_url, p, full_backend_names)
+    _set_enabled_backends(gated)
+
+    # --backend: distinguish an explicit choice (CLI flag or env var) from the
+    # unset packaged default. An explicit value outside the enabled set is a
+    # hard error; an unchosen default is silently repaired (ADR-0020 §5, §6).
+    backend_env = os.environ.get('ANTHPROXY_BACKEND')
+    backend_explicit = args.backend is not None or bool(backend_env)
+    if args.backend is None:
+        args.backend = backend_env or 'bedrock'
+    filtered_backend_names = _backend_names()
+    if args.backend not in filtered_backend_names:
+        if backend_explicit:
+            hint = ''
+            if args.backend == 'peer' and not args.peer_base_url:
+                hint = '; --peer-base-url is unset, which is what withholds peer'
+            p.error(
+                f'--backend {args.backend!r} is not in the enabled backend set '
+                f'{list(filtered_backend_names)}; pass --backends to include it '
+                f'or choose a different --backend{hint}'
+            )
+        if not filtered_backend_names:
+            p.error('--backends: resulting enabled backend set is empty')
+        repaired = filtered_backend_names[0]
+        logger.warning('Backend default repaired: %s -> %s', args.backend, repaired)
+        args.backend = repaired
 
     args.codex_unsupported_model_fallback = (
         args.codex_unsupported_model_fallback or ''

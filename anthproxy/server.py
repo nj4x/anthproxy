@@ -23,7 +23,7 @@ from .backends_registry import (  # noqa: F401
     list_backends,
 )
 from .config import Config
-from .constants import SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
+from .constants import ROTATABLE_BACKENDS, SUBSCRIPTION_BACKENDS, SESSION_SUBSCRIPTION_SENTINEL
 from .handlers import ProxyRequestHandler
 
 logger = logging.getLogger(__name__)
@@ -464,11 +464,27 @@ class BackendRegistry:
                     name = None
                     if self._subscription_resolver is not None:
                         resolved = self._subscription_resolver()
-                        if resolved in SUBSCRIPTION_BACKENDS:
+                        if resolved in SUBSCRIPTION_BACKENDS and resolved in backend_names():
                             name = resolved
                     if name is None:
-                        name = self._active if self._active in SUBSCRIPTION_BACKENDS else 'anthropic'
-                    backend = self._instances.get(name) or self._instances[self._active]
+                        # ADR-0020 (a): prefer an enabled subscription backend
+                        # over the hardcoded 'anthropic' fallback, so an
+                        # excluded name is never recorded as the snapshot name.
+                        enabled_subs = [
+                            b for b in SUBSCRIPTION_BACKENDS if b in backend_names()
+                        ]
+                        if self._active in enabled_subs:
+                            name = self._active
+                        elif enabled_subs:
+                            name = enabled_subs[0]
+                        else:
+                            name = self._active
+                    backend = self._instances.get(name)
+                    if backend is None:
+                        # Keep name/backend consistent — never report a name
+                        # whose instance we didn't actually use.
+                        name = self._active
+                        backend = self._instances[self._active]
                     session_subscription = True
                 else:
                     name = override
@@ -489,8 +505,12 @@ class BackendRegistry:
                 and prefer_backend in backend_names()
                 and not session_pinned
                 and not session_subscription
+                # The gate asks "may the selector be steered onto this target",
+                # which is ROTATABLE_BACKENDS, not SUBSCRIPTION_BACKENDS:
+                # subscription is the default mode, so testing the narrower
+                # tuple would make prefer:peer dead in every default deployment.
                 and not (self._config.auto_backend_mode == 'subscription'
-                         and prefer_backend not in SUBSCRIPTION_BACKENDS)
+                         and prefer_backend not in ROTATABLE_BACKENDS)
             ):
                 prefer_cached = self._instances.get(prefer_backend)
                 if prefer_cached is None:
@@ -962,10 +982,14 @@ class BackendRegistry:
                 return SwitchResult(kind='unchanged', previous=previous,
                                     current=SESSION_SUBSCRIPTION_SENTINEL)
 
+        # ADR-0020 (a): iterate only enabled subscription backends. An excluded
+        # backend already fails inside _prepare_candidate via build_backend(),
+        # so this is a clarity/perf narrowing, not new error handling.
+        enabled_subs = [b for b in SUBSCRIPTION_BACKENDS if b in backend_names()]
         prepared_any = False
         last_error: str | None = None
         with self._prepare_lock:
-            for sub in SUBSCRIPTION_BACKENDS:
+            for sub in enabled_subs:
                 try:
                     self._prepare_candidate(sub)
                     prepared_any = True
@@ -974,6 +998,8 @@ class BackendRegistry:
                     last_error = str(exc)
 
         if not prepared_any:
+            if last_error is None:
+                last_error = 'no subscription backends are enabled'
             return SwitchResult(kind='failed', previous=previous,
                                 current=previous, error=last_error)
 

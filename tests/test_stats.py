@@ -606,6 +606,11 @@ class TestMatchesBackendFilter:
     def test_subscription_excludes_local(self):
         assert _matches_backend_filter('local', 'subscription') is False
 
+    def test_subscription_excludes_peer(self):
+        """The peer is rotatable but not a subscription — this filter asks the
+        latter question and must keep reading SUBSCRIPTION_BACKENDS."""
+        assert _matches_backend_filter('peer', 'subscription') is False
+
 
 # ---------------------------------------------------------------------------
 # TestRecordEnrichedFields — new observability fields on StatsCollector.record()

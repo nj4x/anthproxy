@@ -25,6 +25,7 @@ include = [
     "anthproxy.local*",
     "anthproxy.mapper*",
     "anthproxy.openrouter*",
+    "anthproxy.peer*",
     "anthproxy.oauth*",
 ]
 

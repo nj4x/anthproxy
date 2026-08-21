@@ -15,6 +15,13 @@ subscription backend has an open 5-hour window.  In subscription mode the
 fallback is the lowest-weekly subscription backend instead — bedrock is never
 used.
 
+The candidate pool is ``ROTATABLE_BACKENDS`` — the subscription backends plus
+``peer``.  An enabled peer reports a constant neutral status (always available,
+weekly unknown), so it ranks behind every candidate with an elapsed signal and
+is chosen only once local capacity is spent.  Because it is always available it
+also occupies the available pool, which makes the bedrock fallback unreachable
+for an instance running both: peer wins over bedrock by design.
+
 Selector modes
 --------------
 ``'auto'``         Normal auto-selection; bedrock is the unconditional fallback.
@@ -28,7 +35,7 @@ import logging
 import threading
 import time
 
-from .constants import SUBSCRIPTION_BACKENDS
+from .constants import ROTATABLE_BACKENDS, SUBSCRIPTION_BACKENDS
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +43,10 @@ logger = logging.getLogger(__name__)
 # when we have no resets_at from the usage endpoint.
 _DEFAULT_RECHECK_SECS = 300.0
 
-# Ordered list of subscription backends for initial iteration.
+# Ordered list of rotation candidates for initial iteration — the subscription
+# backends plus the peer, which is rotatable without being a subscription.
 # bedrock is the unconditional fallback (no 5-hour window, always available).
-_PRIORITY = SUBSCRIPTION_BACKENDS
+_PRIORITY = ROTATABLE_BACKENDS
 _FALLBACK = "bedrock"
 
 # When weekly utilization is unknown, use this neutral value for comparisons.
@@ -66,7 +74,7 @@ def _weekly_elapsed_pct(
     """Fraction of the weekly window elapsed by time, 0–100, or None.
 
     Returns None when the window size or reset timestamp is unknown (→ ranked on
-    raw burn alongside other raw-only candidates). A stale reset
+    raw burn behind every candidate that has an elapsed figure). A stale reset
     (``weekly_resets_at <= now``) yields ``0.0``: the window is about to roll, so
     under ascending pace-delta ranking (``burn - elapsed``) the backend gets the
     highest delta and is deprioritized while its burn reading is going stale.
@@ -84,16 +92,26 @@ def _weekly_elapsed_pct(
 def _pace_rank_key(burn: float, elapsed: float | None, pace_on: bool):
     """Sort key implementing the ADR-0015 split-branch ranking.
 
-    Returns a ``(block, value)`` tuple so candidates with a known elapsed (the
-    pace-delta block, ``block=0``) rank ahead of raw-only candidates
-    (``block=1``) as a group, each block preserving its own ascending order.
-    With pace off everything is one raw-burn block. Callers that need a single
-    scalar key (e.g. for ``sorted``) can use ``key=lambda c: _pace_rank_key(...)``
-    and Python's tuple comparison does the block-then-value ordering.
+    Returns a ``(block, value)`` tuple so candidates with a known elapsed
+    (``block=0``) rank ahead of the rest (``block=1``) as a group, each block
+    preserving its own ascending order. The block depends only on ``elapsed``,
+    never on ``pace_on``; only the *value* varies with the mode (``burn -
+    elapsed`` with pace on, raw ``burn`` with pace off).
+
+    ``block=1`` means "no usable elapsed signal right now", not "no weekly
+    window exists": ``elapsed`` is None whenever *either* the reset timestamp or
+    the window size is missing, including for a backend that does have a weekly
+    window whose ``resets_at`` is momentarily unparseable. Without an elapsed
+    figure there is no pace delta to compute and the candidate cannot be
+    compared on the same axis as one that has it.
+
+    Callers that need a single scalar key (e.g. for ``sorted``) can use
+    ``key=lambda c: _pace_rank_key(...)`` and Python's tuple comparison does the
+    block-then-value ordering.
     """
-    if not pace_on or elapsed is None:
+    if elapsed is None:
         return (1, burn)
-    return (0, burn - elapsed)
+    return (0, burn - elapsed if pace_on else burn)
 
 
 def _sort_personal_candidates(
@@ -101,10 +119,11 @@ def _sort_personal_candidates(
 ) -> tuple[PersonalCandidate, ...]:
     """Order personal candidates: pace-delta block then raw-only block.
 
-    With pace on, candidates that carry a known ``weekly_elapsed_pct`` sort
-    ascending by ``burn - weekly_elapsed_pct`` and rank ahead, as a group, of
-    candidates with no elapsed (OpenRouter, unknown windows) which sort ascending
-    by raw ``burn``. With pace off, all sort by raw ``burn``.
+    Candidates that carry a known ``weekly_elapsed_pct`` rank ahead, as a group,
+    of candidates with no elapsed (OpenRouter, unknown windows, stale cache
+    readings) in both pace modes. Within the leading block they sort ascending by
+    ``burn - weekly_elapsed_pct`` with pace on and by raw ``burn`` with pace off;
+    the trailing block always sorts ascending by raw ``burn``.
     """
     return tuple(
         sorted(
@@ -166,6 +185,12 @@ class AutoSelector:
         self._mode: str = config.auto_backend_mode
         # The pinned backend name; meaningful only when _mode == 'pinned'.
         self._pinned: str | None = None
+        # ADR-0020 §8: intersect the module-level candidate pools with the
+        # enabled backend set, once, at construction. Never rebind _PRIORITY/
+        # _FALLBACK themselves — those stay shared, unfiltered module state.
+        enabled = frozenset(registry.list_backends())
+        self._priority: tuple[str, ...] = tuple(n for n in _PRIORITY if n in enabled)
+        self._fallback: str | None = _FALLBACK if _FALLBACK in enabled else None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -238,7 +263,12 @@ class AutoSelector:
                     self._last_weekly_window_hours[name] = status.weekly_window_hours
 
         active = self._registry.active_name()
-        if best != active:
+        if best is None:
+            logger.debug(
+                "Auto-selector: no enabled backend available to switch to; staying on %s",
+                active,
+            )
+        elif best != active:
             reason = _format_switch_reason(
                 "periodic evaluation", active, best, statuses
             )
@@ -322,7 +352,12 @@ class AutoSelector:
         if source_status is not None:
             statuses.setdefault(name, source_status)
         active = self._registry.active_name()
-        if best != active:
+        if best is None:
+            logger.debug(
+                "Auto-selector: 429 on %s, no enabled backend available to switch to",
+                name,
+            )
+        elif best != active:
             reason = _format_switch_reason(f"429 on {name}", name, best, statuses)
             result = self._registry.switch(best, reason=reason)
             if result.kind == "failed":
@@ -395,7 +430,7 @@ class AutoSelector:
             window_hours = dict(self._last_weekly_window_hours)
         pace_on = _pace_enabled(self._config)
         candidates = []
-        for name in _PRIORITY:
+        for name in self._priority:
             if now < exhausted.get(name, 0) or available.get(name) is False:
                 continue
             fresh = now - status_at.get(name, 0.0) <= _PERSONAL_CACHE_TTL
@@ -420,15 +455,17 @@ class AutoSelector:
 
         Prefers a not-currently-exhausted sub with lowest known weekly
         utilization; falls back to the lowest-weekly subscription backend
-        overall.  Can only return a member of ``_PRIORITY`` or ``None`` —
-        never bedrock or any other non-subscription backend.
+        overall.  Can only return a member of the enabled subset of
+        ``SUBSCRIPTION_BACKENDS`` or ``None`` — never bedrock, never the peer,
+        never any other non-subscription or disabled backend.
         """
         now = time.time()
         with self._lock:
             exhausted = dict(self._exhausted_until)
             weekly = dict(self._last_weekly)
-        available = [n for n in _PRIORITY if now >= exhausted.get(n, 0)]
-        pool = available if available else list(_PRIORITY)
+        subs = [n for n in self._priority if n in SUBSCRIPTION_BACKENDS]
+        available = [n for n in subs if now >= exhausted.get(n, 0)]
+        pool = available if available else list(subs)
         pool.sort(key=lambda n: weekly.get(n, _UNKNOWN_WEEKLY))
         return pool[0] if pool else None
 
@@ -469,9 +506,16 @@ class AutoSelector:
         """Proactively refresh OAuth tokens for OAuth-backed subscription backends.
 
         OpenRouter is intentionally excluded: it authenticates with a static
-        API key, not OAuth, so there is nothing to refresh.
+        API key, not OAuth, so there is nothing to refresh. The OAuth-backed
+        pair is filtered against the enabled backend set (ADR-0020 §7) —
+        `self._priority` is the OAuth pool's superset (it also carries
+        openrouter and peer, neither of which holds an OAuth token), so
+        membership is checked directly rather than reused wholesale.  Do not
+        rewrite this loop to walk `self._priority`.
         """
         for name in ("anthropic", "codex"):
+            if name not in self._priority:
+                continue
             try:
                 if name == "anthropic":
                     from .anthropic import auth as anthropic_auth
@@ -540,7 +584,7 @@ class AutoSelector:
         # best_exhausted: (name, weekly_utilization) — exhausted, with known weekly
         best_exhausted: tuple | None = None
 
-        for name in _PRIORITY:
+        for name in self._priority:
             in_cooldown = now < exhausted_snapshot.get(name, 0)
 
             if in_cooldown:
@@ -608,8 +652,19 @@ class AutoSelector:
                 # path keeps cycling until one opens.
                 if best_exhausted is not None:
                     return best_exhausted[0], statuses, new_exhausted, new_weekly
-                return _PRIORITY[0], statuses, new_exhausted, new_weekly
-            return _FALLBACK, statuses, new_exhausted, new_weekly
+                if self._priority:
+                    return self._priority[0], statuses, new_exhausted, new_weekly
+                # No subscription backend is enabled at all (ADR-0020 Known
+                # Limitations). Nothing to route to; caller no-ops on active.
+                return None, statuses, new_exhausted, new_weekly
+            if self._fallback is not None:
+                return self._fallback, statuses, new_exhausted, new_weekly
+            # bedrock is excluded and no subscription backend is available.
+            # Prefer a known-exhausted subscription backend over returning
+            # nothing, since it will at least surface a 429 to retry against.
+            if best_exhausted is not None:
+                return best_exhausted[0], statuses, new_exhausted, new_weekly
+            return None, statuses, new_exhausted, new_weekly
 
         # Order available backends for the ranking sort key only.  The same
         # _pace_rank_key used by _sort_personal_candidates drives the split-branch
@@ -647,6 +702,28 @@ class AutoSelector:
                     active_val,
                 )
                 return active, statuses, new_exhausted, new_weekly
+            # A peer incumbent reports the constant neutral status and so has
+            # nothing for the margin to compare: its active_val is the
+            # fabricated _UNKNOWN_WEEKLY midpoint, not a real reading. Hand
+            # back to a challenger with an elapsed signal (block 0) as soon as
+            # one exists, so local capacity reclaims the request immediately
+            # rather than waiting out the margin. Scoped to `active == 'peer'`
+            # specifically (not "any signal-less incumbent"): openrouter is
+            # also permanently elapsed-less, but its weekly *is* a real
+            # reading — sometimes momentarily missing on a fetch gap, in which
+            # case it must keep the existing neutral-hold behavior below,
+            # unlike the peer whose absence of a weekly is permanent by
+            # construction.
+            if (
+                active == 'peer'
+                and available_backends[0][2] is not None
+            ):
+                logger.debug(
+                    "Auto-selector: incumbent peer carries no capacity signal; "
+                    "yielding to %s",
+                    best_avail_name,
+                )
+                return best_avail_name, statuses, new_exhausted, new_weekly
             if active_val - best_avail_val >= margin:
                 logger.debug(
                     "Auto-selector: switching %s (weekly=%.1f%%) -> %s (weekly=%.1f%%); "
@@ -676,9 +753,19 @@ class AutoSelector:
         # Park on bedrock when an exhausted backend is decisively lower than
         # the best available so weekly quota is preserved while we wait.
         # Skip in subscription-only mode — bedrock is never used there.
+        # A best-available *peer* contributes only the fabricated
+        # _UNKNOWN_WEEKLY midpoint (its neutral status), so the gap against an
+        # exhausted backend says nothing about real headroom; parking on
+        # metered bedrock on the strength of it would make the peer
+        # unreachable exactly when it is needed (ADR-0022). Scoped to the peer
+        # by name, not by "no signal", so openrouter's existing raw-burn
+        # parking comparison is unaffected.
+        best_avail_is_peer = best_avail_name == 'peer'
         if (
             not subscription_only
+            and self._fallback is not None
             and best_exhausted is not None
+            and not best_avail_is_peer
             and best_avail_val - best_exhausted[1] >= margin
         ):
             logger.debug(
@@ -691,7 +778,7 @@ class AutoSelector:
                 best_avail_val - best_exhausted[1],
                 margin,
             )
-            return _FALLBACK, statuses, new_exhausted, new_weekly
+            return self._fallback, statuses, new_exhausted, new_weekly
 
         return best_avail_name, statuses, new_exhausted, new_weekly
 

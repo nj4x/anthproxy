@@ -993,3 +993,290 @@ class TestSummaryCredentialsRegression:
         from anthproxy.config import Config
         assert not hasattr(Config(), 'gauss_ums_token')
         assert not hasattr(Config(), 'plugin_ums_token')
+
+
+class TestEnabledBackendsFilter:
+    """ADR-0020: --backends allowlist filtering at the accessor level."""
+
+    def test_no_filter_means_all_enabled(self):
+        assert backends_registry._enabled_backends is None
+        names = backend_names()
+        assert 'bedrock' in names and 'anthropic' in names
+
+    def test_filter_restricts_backend_names(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic', 'codex'}))
+        names = backend_names()
+        assert set(names) == {'anthropic', 'codex'}
+
+    def test_filter_restricts_list_backends(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        # oauth is internal and always exempt, so it survives the filter.
+        assert set(backends_registry.list_backends()) == {'anthropic', 'oauth'}
+
+    def test_filter_restricts_get_backend(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        assert get_backend('anthropic') is not None
+        assert get_backend('bedrock') is None
+
+    def test_internal_backend_exempt_from_filter(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        assert get_backend('oauth') is not None
+        assert 'oauth' not in backend_names()  # never listed, filter or not
+
+    def test_reset_to_none_restores_full_set(self):
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        assert set(backend_names()) == {'anthropic'}
+        backends_registry.set_enabled_backends(None)
+        assert set(backend_names()) == set(
+            n for n in backends_registry._BACKENDS
+            if n not in backends_registry._INTERNAL_BACKENDS
+        )
+
+    def test_rediscovery_is_idempotent_under_filter(self):
+        """A second discover_backends() call must not choke on a filtered view."""
+        backends_registry.set_enabled_backends(frozenset({'anthropic'}))
+        backends_registry.discover_backends()  # must not raise
+        assert get_backend('bedrock') is None  # filter still installed
+        assert 'bedrock' in backends_registry._BACKENDS  # but never removed internally
+
+
+class TestBackendsCliFlag:
+    """ADR-0020: --backends / ANTHPROXY_BACKENDS CLI and env parsing."""
+
+    def test_absent_flag_enables_every_configured_backend(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args([])
+        assert cfg.backends == ()
+        # Every backend but the unconfigured `peer` stays enabled (ADR-0021 §3).
+        assert set(backend_names()) == set(
+            n for n in backends_registry._BACKENDS
+            if n not in backends_registry._INTERNAL_BACKENDS and n != 'peer'
+        )
+
+    def test_valid_allowlist_installs_filter(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex'])
+        assert cfg.backends == ('anthropic', 'codex')
+        assert set(backend_names()) == {'anthropic', 'codex'}
+
+    def test_whitespace_and_dedup(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', ' anthropic , codex ,anthropic'])
+        assert cfg.backends == ('anthropic', 'codex')
+
+    def test_unknown_token_errors(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,not_a_backend'])
+
+    def test_empty_value_errors(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', ''])
+
+    def test_oauth_token_rejected_as_unknown(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'oauth'])
+
+    def test_explicit_backend_outside_allowlist_errors(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,codex', '--backend', 'bedrock'])
+
+    def test_explicit_backend_inside_allowlist_succeeds(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex', '--backend', 'codex'])
+        assert cfg.backend == 'codex'
+
+    def test_unset_backend_default_is_repaired(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex'])
+        assert cfg.backend in ('anthropic', 'codex')
+
+    def test_env_backend_is_treated_as_explicit(self, monkeypatch):
+        from anthproxy.config import parse_args
+        monkeypatch.setenv('ANTHPROXY_BACKEND', 'bedrock')
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,codex'])
+
+
+class TestPeerEnablementRules:
+    """ADR-0021 §3: `--peer-base-url` gates `peer` membership in the enabled set."""
+
+    PEER_URL = 'http://127.0.0.1:9099'
+
+    @pytest.fixture(autouse=True)
+    def _clear_peer_env(self, monkeypatch):
+        monkeypatch.delenv('ANTHPROXY_PEER_BASE_URL', raising=False)
+        monkeypatch.delenv('ANTHPROXY_BACKENDS', raising=False)
+        monkeypatch.delenv('ANTHPROXY_BACKEND', raising=False)
+
+    # -- Case 1: no target, no allowlist -----------------------------------
+
+    def test_unconfigured_peer_absent_from_backend_names(self):
+        from anthproxy.config import parse_args
+        parse_args([])
+        assert 'peer' not in backend_names()
+
+    def test_unconfigured_peer_absent_from_list_backends(self):
+        from anthproxy.config import parse_args
+        parse_args([])
+        assert 'peer' not in backends_registry.list_backends()
+
+    def test_unconfigured_peer_unresolvable_via_get_backend(self):
+        from anthproxy.config import parse_args
+        parse_args([])
+        assert get_backend('peer') is None
+
+    def test_unconfigured_peer_still_registered_internally(self):
+        """Filtered out, never removed — the package is still installed."""
+        from anthproxy.config import parse_args
+        parse_args([])
+        assert 'peer' in backends_registry._BACKENDS
+
+    # -- Case 2: target set, no allowlist ----------------------------------
+
+    def test_configured_peer_joins_default_set(self):
+        from anthproxy.config import parse_args
+        parse_args(['--peer-base-url', self.PEER_URL])
+        assert 'peer' in backend_names()
+        assert get_backend('peer') is not None
+
+    def test_configured_peer_via_env_joins_default_set(self, monkeypatch):
+        from anthproxy.config import parse_args
+        monkeypatch.setenv('ANTHPROXY_PEER_BASE_URL', self.PEER_URL)
+        parse_args([])
+        assert 'peer' in backend_names()
+
+    def test_whitespace_only_base_url_does_not_enable_peer(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--peer-base-url', '   '])
+        assert 'peer' not in backend_names()
+        # Normalised, so downstream truthiness checks agree with the gate.
+        assert cfg.peer_base_url == ''
+
+    def test_default_path_filter_still_exempts_internal_backends(self):
+        from anthproxy.config import parse_args
+        parse_args([])
+        assert get_backend('oauth') is not None
+
+    # -- Case 3: target set, allowlist passed ------------------------------
+
+    def test_allowlist_omitting_peer_excludes_it_despite_target(self):
+        from anthproxy.config import parse_args
+        parse_args([
+            '--peer-base-url', self.PEER_URL,
+            '--backends', 'anthropic,codex',
+        ])
+        assert 'peer' not in backend_names()
+
+    def test_allowlist_naming_peer_with_target_enables_it(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args([
+            '--peer-base-url', self.PEER_URL,
+            '--backends', 'anthropic,peer',
+        ])
+        assert 'peer' in backend_names()
+        assert cfg.backends == ('anthropic', 'peer')
+
+    def test_configured_but_unlisted_peer_is_a_legal_undispatchable_boot(self):
+        """The residual state tickets 04+ key on: configured target, not enabled."""
+        from anthproxy.config import parse_args
+        cfg = parse_args([
+            '--peer-base-url', self.PEER_URL,
+            '--backends', 'anthropic,codex',
+        ])
+        assert cfg.peer_base_url == self.PEER_URL
+        assert get_backend('peer') is None
+        assert 'peer' not in backends_registry.list_backends()
+
+    # -- Case 4: allowlist names peer, no target ---------------------------
+
+    def test_allowlist_naming_peer_without_target_is_a_hard_error(self, capsys):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,peer'])
+        err = capsys.readouterr().err
+        assert '--backends' in err
+        assert '--peer-base-url' in err
+
+    def test_allowlist_naming_peer_without_target_is_not_silently_narrowed(self):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,peer'])
+        # No filter was installed: the error fires before set_enabled_backends().
+        assert backends_registry._enabled_backends is None
+
+    def test_peer_is_not_reported_as_an_unknown_backends_token(self, capsys):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,peer'])
+        assert 'unknown backend' not in capsys.readouterr().err
+
+    # -- --backend peer ----------------------------------------------------
+
+    def test_explicit_backend_peer_without_target_errors_naming_the_target(self, capsys):
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backend', 'peer'])
+        err = capsys.readouterr().err
+        assert '--backend' in err
+        assert '--peer-base-url' in err
+
+    def test_explicit_backend_peer_with_target_succeeds(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backend', 'peer', '--peer-base-url', self.PEER_URL])
+        assert cfg.backend == 'peer'
+
+    # -- Ordering and declared-order properties ----------------------------
+
+    def test_peer_ranks_last_among_all_enabled_backends(self):
+        """ADR-0021 §3: peer's last position feeds ADR-0020 §6's default repair."""
+        from anthproxy.config import parse_args
+        parse_args(['--peer-base-url', self.PEER_URL])
+        assert backend_names()[-1] == 'peer'
+
+    def test_default_repair_picks_peer_only_when_it_is_the_sole_backend(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'peer', '--peer-base-url', self.PEER_URL])
+        assert cfg.backend == 'peer'
+
+    def test_default_repair_prefers_any_other_backend_over_peer(self):
+        from anthproxy.config import parse_args
+        for sibling in ('bedrock', 'codex', 'anthropic', 'local', 'openrouter'):
+            # parse_args validates against whatever filter is installed, so each
+            # iteration must start from the unfiltered registry.
+            backends_registry.set_enabled_backends(None)
+            cfg = parse_args([
+                '--backends', f'peer,{sibling}',
+                '--peer-base-url', self.PEER_URL,
+            ])
+            assert cfg.backend == sibling
+
+    def test_backends_validation_precedes_filter_install(self):
+        """An unknown token still errors before any filter is installed."""
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic,not_a_backend'])
+        assert backends_registry._enabled_backends is None
+
+    def test_backend_validation_follows_filter_install(self):
+        """--backend is checked against the filtered set, peer gate included."""
+        from anthproxy.config import parse_args
+        with pytest.raises(SystemExit):
+            parse_args(['--backends', 'anthropic', '--backend', 'codex'])
+
+    # -- Regression: non-peer allowlist behaviour is unchanged -------------
+
+    def test_unconfigured_peer_leaves_other_allowlist_behaviour_intact(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args(['--backends', 'anthropic,codex'])
+        assert cfg.backends == ('anthropic', 'codex')
+        assert set(backend_names()) == {'anthropic', 'codex'}
+        assert cfg.backend in ('anthropic', 'codex')
+
+    def test_unconfigured_peer_does_not_change_the_unfiltered_default_backend(self):
+        from anthproxy.config import parse_args
+        cfg = parse_args([])
+        assert cfg.backend == 'bedrock'
